@@ -1,0 +1,2335 @@
+use crate::tools::{ToolPolicySnapshot, ToolScope, ValidationRepairSnapshot, coding_tools};
+use crate::trace::TraceRecorder;
+use anyhow::{Context, Result};
+use futures::StreamExt;
+use mojentic::MojenticError;
+use mojentic::llm::gateway::{StreamChunk, StreamMetrics};
+use mojentic::llm::gateways::OllamaGateway;
+use mojentic::llm::models::{LlmMessage, LlmToolCall, MessageRole};
+use mojentic::llm::tools::{LlmTool, ToolRunCtx};
+use mojentic::llm::{CompletionConfig, LlmGateway};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::process::Command;
+use tokio::time::MissedTickBehavior;
+
+const APPROX_CHARS_PER_TOKEN: usize = 4;
+const ASSEMBLY_POLICY: &str = "append_summarized_tool_transcript";
+const CONTEXT_INSTRUMENTATION_VERSION: &str = "generation4.context_ledger.v1";
+const DEFAULT_THROUGHPUT_TPS: f64 = 1.0;
+const MODEL_PROGRESS_WARMUP_SECONDS: f64 = 60.0;
+const MODEL_PROGRESS_TOOL_JSON_SLACK_SECONDS: f64 = 120.0;
+const MODEL_PROGRESS_VARIANCE_MULTIPLIER: f64 = 2.0;
+const DEFAULT_PROGRESS_STATUS_INTERVAL_SECONDS: u64 = 30;
+const RUNNER_SAMPLE_TIMEOUT_SECONDS: u64 = 3;
+const STALLED_CONFIRMATION_CHECKS: usize = 2;
+const RETAIN_RAW_TOOL_RESULT_RECENT_COUNT: usize = 4;
+const RETAIN_RAW_TOOL_RESULT_MAX_CHARS: usize = 6_000;
+const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
+
+#[derive(Debug, Clone)]
+pub struct AgentRunConfig {
+    pub experiment_dir: PathBuf,
+    pub goal_file: PathBuf,
+    pub model: String,
+    pub max_iterations: usize,
+    pub max_tool_iterations: usize,
+    pub context_window_tokens: Option<usize>,
+    pub packet_type: String,
+    pub expected_output_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRunSummary {
+    pub experiment_dir: PathBuf,
+    pub tool_root: PathBuf,
+    pub goal_file: PathBuf,
+    pub trace_file: PathBuf,
+    pub model: String,
+    pub max_iterations: usize,
+    pub max_tool_iterations: usize,
+    pub context_window_tokens: Option<usize>,
+    pub packet_type: String,
+    pub expected_output_tokens: usize,
+    pub final_summary: String,
+}
+
+pub fn default_expected_output_tokens(packet_type: &str) -> usize {
+    match packet_type {
+        "diagnosis-only" => 512,
+        "narrow-patch" => 2_048,
+        "multi-file-patch" => 4_096,
+        "full-small-project" => 8_192,
+        "validation-repair" => 2_048,
+        _ => 4_096,
+    }
+}
+
+pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
+    let experiment_dir = config
+        .experiment_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", config.experiment_dir.display()))?;
+    let goal_file = canonicalize_goal(&experiment_dir, &config.goal_file)?;
+    let goal = tokio::fs::read_to_string(&goal_file)
+        .await
+        .with_context(|| format!("reading goal file {}", goal_file.display()))?;
+    let tool_root = PathBuf::from(".")
+        .canonicalize()
+        .context("canonicalizing harness cwd")?;
+
+    let trace = Arc::new(TraceRecorder::create(&experiment_dir.join("traces"))?);
+    trace.event(
+        "run.started",
+        serde_json::json!({
+            "experiment_dir": experiment_dir,
+            "tool_root": tool_root,
+            "process_cwd": std::env::current_dir().ok(),
+            "goal_file": goal_file,
+            "model": config.model,
+            "max_iterations": config.max_iterations,
+            "max_tool_iterations": config.max_tool_iterations,
+            "context_window_tokens": config.context_window_tokens,
+            "packet_type": config.packet_type,
+            "expected_output_tokens": config.expected_output_tokens,
+            "assembly_policy": ASSEMBLY_POLICY,
+            "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
+            "harness_package_version": env!("CARGO_PKG_VERSION"),
+            "harness_source_state": harness_source_state(),
+        }),
+    )?;
+
+    trace.event(
+        "packet.scope",
+        serde_json::json!({
+            "tool_root": tool_root,
+            "read_allow": ["."],
+            "write_allow": ["."],
+            "note": "Tools are rooted at the generated project workspace."
+        }),
+    )?;
+    let scope = ToolScope::new(PathBuf::from("."), Arc::clone(&trace))?;
+    let gateway = Arc::new(OllamaGateway::new());
+    let system_prompt = system_prompt();
+    let tools = coding_tools(&scope);
+    let mut messages = vec![
+        LlmMessage::system(system_prompt),
+        LlmMessage::user(run_prompt(&goal)),
+    ];
+    let completion_config = CompletionConfig {
+        temperature: 0.2,
+        max_tool_iterations: config.max_tool_iterations,
+        ..Default::default()
+    };
+
+    let mut final_summary = String::new();
+    let mut consecutive_empty_responses = 0usize;
+    for turn in 1..=config.max_iterations {
+        let policy_before_turn = scope.policy_snapshot();
+        trace.event(
+            "agent.context.estimated",
+            context_snapshot(
+                &messages,
+                &tools,
+                &policy_before_turn,
+                config.context_window_tokens,
+            ),
+        )?;
+        trace.event(
+            "agent.turn.started",
+            serde_json::json!({
+                "turn": turn,
+                "max_iterations": config.max_iterations,
+            }),
+        )?;
+        let response = match stream_response(StreamResponseRequest {
+            gateway: gateway.as_ref(),
+            model: &config.model,
+            messages: &messages,
+            tools: &tools,
+            completion_config: completion_config.clone(),
+            context_window_tokens: config.context_window_tokens,
+            packet_type: &config.packet_type,
+            expected_output_tokens: config.expected_output_tokens,
+            throughput_registry_path: experiment_dir.join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn,
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = trace_run_failed(
+                    &trace,
+                    "agent.stream",
+                    Some(turn),
+                    &error,
+                    &config,
+                    &tool_root,
+                    &goal_file,
+                );
+                return Err(error);
+            }
+        };
+        trace.event(
+            "agent.turn.finished",
+            serde_json::json!({
+                "turn": turn,
+                "response": response,
+            }),
+        )?;
+        let policy = scope.policy_snapshot();
+        let tool_calls_this_turn = policy.total_tool_calls - policy_before_turn.total_tool_calls;
+        trace.event(
+            "agent.context.turn_pressure",
+            serde_json::json!({
+                "turn": turn,
+                "tool_calls_this_turn": tool_calls_this_turn,
+                "tool_result_chars_this_turn": policy.total_tool_result_chars.saturating_sub(policy_before_turn.total_tool_result_chars),
+                "tool_result_estimated_tokens_this_turn": estimate_tokens(policy.total_tool_result_chars.saturating_sub(policy_before_turn.total_tool_result_chars)),
+                "cumulative_tool_result_chars": policy.total_tool_result_chars,
+                "cumulative_tool_result_estimated_tokens": policy.total_tool_result_estimated_tokens,
+                "max_tool_result_chars": policy.max_tool_result_chars,
+                "max_tool_result_estimated_tokens": policy.max_tool_result_estimated_tokens,
+                "max_tool_result_kind": policy.max_tool_result_kind,
+                "tool_result_chars_by_kind": policy.tool_result_chars_by_kind,
+            }),
+        )?;
+        if response.trim().is_empty() {
+            if policy.writes_since_shell_probe > 0 {
+                trace.event(
+                    "agent.validation.required_after_edit",
+                    serde_json::json!({
+                        "turn": turn,
+                        "tool_calls_this_turn": tool_calls_this_turn,
+                        "policy": policy,
+                    }),
+                )?;
+                final_summary = format!("turn {turn} modified files without follow-up validation");
+                messages.push(LlmMessage::user(
+                    "You modified files after the most recent shell probe and did not provide final text. \
+                     Do not edit again yet. Run the validation ladder now: cargo fmt --check, \
+                     then cargo clippy, then focused tests, then broad tests. Use timeout_secs 1800 \
+                     for cargo build or cargo test. Reply DONE only if validation passes.",
+                ));
+                continue;
+            }
+            if tool_calls_this_turn > 0 {
+                trace.event(
+                    "agent.turn.tool_only_response",
+                    serde_json::json!({
+                        "turn": turn,
+                        "tool_calls_this_turn": tool_calls_this_turn,
+                        "policy": policy,
+                    }),
+                )?;
+                final_summary = format!("turn {turn} used tools but produced no final text");
+                messages.push(LlmMessage::user(
+                    "You used tools but produced no final text. Continue from the current project state. \
+                     If validation passed, reply exactly DONE. If validation failed, fix the cause and validate again.",
+                ));
+                continue;
+            }
+            consecutive_empty_responses += 1;
+            trace.event(
+                "agent.turn.empty_response",
+                serde_json::json!({
+                    "turn": turn,
+                    "consecutive_empty_responses": consecutive_empty_responses,
+                }),
+            )?;
+            messages.push(LlmMessage::user(empty_response_prompt(
+                consecutive_empty_responses,
+            )));
+            continue;
+        }
+        consecutive_empty_responses = 0;
+        final_summary = response.clone();
+        messages.push(LlmMessage::assistant(response));
+        if policy.writes_since_shell_probe > 0 {
+            trace.event(
+                "agent.validation.required_after_edit",
+                serde_json::json!({
+                    "turn": turn,
+                    "tool_calls_this_turn": tool_calls_this_turn,
+                    "policy": policy,
+                }),
+            )?;
+            messages.push(LlmMessage::user(
+                "You modified files after the most recent shell probe. Do not edit again yet. \
+                 Run the validation ladder now: cargo fmt --check, then cargo clippy, \
+                 then focused tests, then broad tests. Use timeout_secs 1800 for cargo build \
+                 or cargo test. Reply DONE only if validation passes.",
+            ));
+            continue;
+        }
+        if let Some(repair) = &policy.validation_repair
+            && !is_fail_response(&final_summary)
+        {
+            trace.event(
+                "agent.validation.repair_prompted",
+                serde_json::json!({
+                    "turn": turn,
+                    "tool_calls_this_turn": tool_calls_this_turn,
+                    "policy": policy,
+                }),
+            )?;
+            messages.push(LlmMessage::user(validation_repair_prompt(repair)));
+            continue;
+        }
+        if is_terminal_response(&final_summary) {
+            break;
+        }
+        messages.push(LlmMessage::user(
+            "Continue from the current experiment state. Use tools as needed. \
+             Run deterministic validation before replying DONE. Reply FAIL only if blocked.",
+        ));
+    }
+
+    let summary = AgentRunSummary {
+        experiment_dir,
+        tool_root,
+        goal_file,
+        trace_file: trace.path().to_path_buf(),
+        model: config.model,
+        max_iterations: config.max_iterations,
+        max_tool_iterations: config.max_tool_iterations,
+        context_window_tokens: config.context_window_tokens,
+        packet_type: config.packet_type,
+        expected_output_tokens: config.expected_output_tokens,
+        final_summary,
+    };
+    trace.event("run.finished", &summary)?;
+    Ok(summary)
+}
+
+fn trace_run_failed(
+    trace: &TraceRecorder,
+    phase: &str,
+    turn: Option<usize>,
+    error: &anyhow::Error,
+    config: &AgentRunConfig,
+    tool_root: &Path,
+    goal_file: &Path,
+) -> Result<()> {
+    trace.event(
+        "run.failed",
+        serde_json::json!({
+            "phase": phase,
+            "turn": turn,
+            "error": error.to_string(),
+            "model": &config.model,
+            "experiment_dir": &config.experiment_dir,
+            "tool_root": tool_root,
+            "goal_file": goal_file,
+        }),
+    )
+}
+
+fn harness_source_state() -> serde_json::Value {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let git_head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let git_dirty = std::process::Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("status")
+        .arg("--short")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty());
+
+    serde_json::json!({
+        "manifest_dir": manifest_dir,
+        "git_head": git_head,
+        "git_dirty": git_dirty,
+        "source_state_note": if git_head.is_some() {
+            "git metadata captured"
+        } else {
+            "not a git checkout or git unavailable"
+        },
+    })
+}
+
+fn is_terminal_response(response: &str) -> bool {
+    let mut non_empty_lines = response
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first_line = non_empty_lines.next();
+    first_line.is_some_and(|line| {
+        line.eq_ignore_ascii_case("DONE")
+            || line
+                .split_once(char::is_whitespace)
+                .map(|(head, _)| head.eq_ignore_ascii_case("FAIL"))
+                .unwrap_or_else(|| line.eq_ignore_ascii_case("FAIL"))
+    }) || response
+        .lines()
+        .map(str::trim)
+        .any(|line| line.eq_ignore_ascii_case("DONE"))
+}
+
+fn is_fail_response(response: &str) -> bool {
+    response
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| {
+            line.split_once(char::is_whitespace)
+                .map(|(head, _)| head.eq_ignore_ascii_case("FAIL"))
+                .unwrap_or_else(|| line.eq_ignore_ascii_case("FAIL"))
+        })
+}
+
+fn canonicalize_goal(experiment_dir: &Path, goal_file: &Path) -> Result<PathBuf> {
+    let candidate = if goal_file.is_absolute() {
+        goal_file.to_path_buf()
+    } else {
+        experiment_dir.join(goal_file)
+    };
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("canonicalizing goal file {}", candidate.display()))?;
+    if !canonical.starts_with(experiment_dir) {
+        anyhow::bail!("goal file must be inside experiment dir");
+    }
+    Ok(canonical)
+}
+
+fn system_prompt() -> String {
+    [
+        "You are an adaptive coding harness instance built on Mojentic.",
+        "Use the provided tools to read files, write files, apply unified diffs, and run shell commands.",
+        "Use list_tree to map available files before guessing repository contents.",
+        "Use read_file line ranges and byte limits to keep context small.",
+        "All tool paths are relative to the generated project root.",
+        "Shell commands run from the generated project root by default.",
+        "Work in small steps. Verify with deterministic shell commands before claiming completion.",
+        "Create Cargo.toml, src/lib.rs, and other generated source at the tool root unless the task says otherwise.",
+        "Create a project-appropriate .gitignore unless the task explicitly forbids additional files.",
+        "Ignore generated build, dependency, cache, and virtual-environment directories such as target/, build/, dist/, node_modules/, .venv/, and __pycache__/. Do not list or inspect ignored paths unless explicitly needed.",
+        "Use timeout_secs 1800 for first cargo build, cargo test, or similarly expensive validation probes.",
+        "After a validation failure, repair narrowly: cite the failing command and failure text, inspect only relevant code, apply a focused patch or bounded write, then rerun validation.",
+        "For Rust projects after edits, prefer this validation ladder: cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings, focused tests, then cargo test.",
+        "If patch_file fails or times out for a file, retry with a smaller diff or use a bounded write_file after reading the current contents.",
+        "Never end a turn with an empty response. Continue using tools, or reply DONE/FAIL as instructed.",
+        "When you have completed the task and verified it, answer exactly DONE.",
+        "If the task cannot be completed, answer exactly FAIL with one concise reason.",
+    ]
+    .join("\n")
+}
+
+struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
+    gateway: &'a G,
+    model: &'a str,
+    messages: &'a [LlmMessage],
+    tools: &'a [Box<dyn LlmTool>],
+    completion_config: CompletionConfig,
+    context_window_tokens: Option<usize>,
+    packet_type: &'a str,
+    expected_output_tokens: usize,
+    throughput_registry_path: PathBuf,
+    progress_projection_override: Option<ModelProgressProjection>,
+    progress_status_interval_override: Option<Duration>,
+    runner_activity_override: Option<RunnerActivitySample>,
+    trace: &'a TraceRecorder,
+    turn: usize,
+}
+
+async fn stream_response<G: LlmGateway + ?Sized>(
+    request: StreamResponseRequest<'_, G>,
+) -> Result<String> {
+    let StreamResponseRequest {
+        gateway,
+        model,
+        messages,
+        tools,
+        completion_config,
+        context_window_tokens,
+        packet_type,
+        expected_output_tokens,
+        throughput_registry_path,
+        progress_projection_override,
+        progress_status_interval_override,
+        runner_activity_override,
+        trace,
+        turn,
+    } = request;
+    trace.event(
+        "agent.stream.started",
+        serde_json::json!({
+            "turn": turn,
+        }),
+    )?;
+    let mut current_messages = messages.to_vec();
+    let mut response = String::new();
+    let mut chunk_count = 0usize;
+    let mut content_chars = 0usize;
+    let mut stream_progress_frame_count = 0usize;
+    let mut tool_call_progress_frame_count = 0usize;
+    let correlation_id = format!(
+        "harness-turn-{turn}-{}",
+        chrono::Utc::now().timestamp_millis()
+    );
+    let mut previous_call_total_chars = None;
+
+    for depth in 0..=completion_config.max_tool_iterations {
+        if depth >= completion_config.max_tool_iterations {
+            return Err(MojenticError::MaxToolIterationsExceeded {
+                limit: completion_config.max_tool_iterations,
+            }
+            .into());
+        }
+
+        let ledger = context_assembly_ledger(ContextAssemblyInput {
+            model,
+            turn,
+            llm_call_depth: depth,
+            messages: &current_messages,
+            tools,
+            completion_config: &completion_config,
+            context_window_tokens,
+            previous_call_total_chars,
+        });
+        previous_call_total_chars = ledger.total_chars();
+        trace.event("llm.context_assembly.ledger", &ledger)?;
+        let projection = progress_projection_override.clone().unwrap_or_else(|| {
+            model_progress_projection(
+                model,
+                expected_output_tokens,
+                ledger.pressure_band,
+                &throughput_registry_path,
+            )
+        });
+        trace.event(
+            "llm.stream.projection",
+            serde_json::json!({
+                "turn": turn,
+                "llm_call_depth": depth,
+                "model": model,
+                "packet_type": packet_type,
+                "expected_output_tokens": expected_output_tokens,
+                "context_band": ledger.pressure_band,
+                "warmup_seconds": MODEL_PROGRESS_WARMUP_SECONDS,
+                "tool_call_json_slack_seconds": MODEL_PROGRESS_TOOL_JSON_SLACK_SECONDS,
+                "variance_multiplier": MODEL_PROGRESS_VARIANCE_MULTIPLIER,
+                "conservative_tokens_per_second": projection.conservative_tokens_per_second,
+                "throughput_sample_count": projection.sample_count,
+                "expected_max_seconds": projection.expected_max_seconds,
+                "allowed_seconds": projection.allowed_seconds,
+                "initial_progress_state": "WaitingForFirstToken",
+            }),
+        )?;
+
+        let mut call_content = String::new();
+        let mut accumulated_tool_calls = Vec::new();
+        let started = Instant::now();
+        let mut latest_progress_state = ModelProgressState::WaitingForFirstToken;
+        let mut last_observable_progress = started;
+        let mut stalled_candidate_checks = 0usize;
+        trace_model_progress_status(ModelProgressStatusInput {
+            trace,
+            turn,
+            llm_call_depth: depth,
+            model,
+            progress_state: latest_progress_state,
+            elapsed: started.elapsed(),
+            seconds_since_observable_progress: 0.0,
+            projection: &projection,
+            runner_activity: None,
+            stalled_candidate_checks,
+            automatic_interrupt: false,
+        })?;
+        let mut stream =
+            gateway.complete_stream(model, &current_messages, Some(tools), &completion_config);
+        let mut status_interval = tokio::time::interval(
+            progress_status_interval_override.unwrap_or_else(progress_status_interval),
+        );
+        status_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        status_interval.tick().await;
+
+        loop {
+            let chunk_result = tokio::select! {
+                chunk_result = stream.next() => chunk_result,
+                _ = status_interval.tick() => {
+                    let runner_activity = if let Some(sample) = &runner_activity_override {
+                        sample.clone()
+                    } else {
+                        sample_runner_activity(model).await
+                    };
+                    latest_progress_state = classify_model_progress(
+                        latest_progress_state,
+                        started.elapsed(),
+                        last_observable_progress.elapsed(),
+                        projection.allowed_seconds,
+                        Some(&runner_activity),
+                        stalled_candidate_checks,
+                    );
+                    if latest_progress_state == ModelProgressState::PossiblyStalled {
+                        stalled_candidate_checks += 1;
+                        latest_progress_state = classify_model_progress(
+                            latest_progress_state,
+                            started.elapsed(),
+                            last_observable_progress.elapsed(),
+                            projection.allowed_seconds,
+                            Some(&runner_activity),
+                            stalled_candidate_checks,
+                        );
+                    } else if latest_progress_state.has_progress_evidence() {
+                        stalled_candidate_checks = 0;
+                    }
+                    let automatic_interrupt =
+                        latest_progress_state == ModelProgressState::Stalled;
+                    trace_model_progress_status(ModelProgressStatusInput {
+                        trace,
+                        turn,
+                        llm_call_depth: depth,
+                        model,
+                        progress_state: latest_progress_state,
+                        elapsed: started.elapsed(),
+                        seconds_since_observable_progress: last_observable_progress
+                            .elapsed()
+                            .as_secs_f64(),
+                        projection: &projection,
+                        runner_activity: Some(&runner_activity),
+                        stalled_candidate_checks,
+                        automatic_interrupt,
+                    })?;
+                    if automatic_interrupt {
+                        trace.event(
+                            "llm.progress.interrupted",
+                            serde_json::json!({
+                                "turn": turn,
+                                "llm_call_depth": depth,
+                                "model": model,
+                                "progress_state": latest_progress_state.as_str(),
+                                "elapsed_seconds": started.elapsed().as_secs_f64(),
+                                "allowed_seconds": projection.allowed_seconds,
+                                "seconds_since_observable_progress": last_observable_progress
+                                    .elapsed()
+                                    .as_secs_f64(),
+                                "stalled_candidate_checks": stalled_candidate_checks,
+                                "runner_activity": &runner_activity,
+                            }),
+                        )?;
+                        anyhow::bail!(
+                            "interrupted stalled model call after {:.3}s; projected allowance was {:.3}s",
+                            started.elapsed().as_secs_f64(),
+                            projection.allowed_seconds
+                        );
+                    }
+                    continue;
+                }
+            };
+            let Some(chunk_result) = chunk_result else {
+                break;
+            };
+            match chunk_result {
+                Ok(StreamChunk::Content(chunk)) => {
+                    last_observable_progress = Instant::now();
+                    stalled_candidate_checks = 0;
+                    latest_progress_state = ModelProgressState::Generating;
+                    chunk_count += 1;
+                    content_chars += chunk.len();
+                    call_content.push_str(&chunk);
+                    response.push_str(&chunk);
+                    trace.event(
+                        "agent.stream.chunk",
+                        serde_json::json!({
+                            "turn": turn,
+                            "llm_call_depth": depth,
+                            "chunk": chunk_count,
+                            "chars": chunk.len(),
+                            "total_chars": content_chars,
+                            "preview": limit_preview(&chunk, 120),
+                        }),
+                    )?;
+                    eprint!("{}", chunk);
+                }
+                Ok(StreamChunk::ToolCalls(tool_calls)) => {
+                    last_observable_progress = Instant::now();
+                    stalled_candidate_checks = 0;
+                    latest_progress_state = ModelProgressState::GeneratingToolCall;
+                    trace.event(
+                        "llm.stream.tool_calls_completed",
+                        serde_json::json!({
+                            "turn": turn,
+                            "llm_call_depth": depth,
+                            "tool_call_count": tool_calls.len(),
+                            "tool_call_names": tool_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+                        }),
+                    )?;
+                    accumulated_tool_calls = tool_calls;
+                }
+                Ok(StreamChunk::Progress(progress)) => {
+                    last_observable_progress = Instant::now();
+                    stalled_candidate_checks = 0;
+                    stream_progress_frame_count += 1;
+                    if progress.tool_call_count > 0 || progress.accumulated_tool_call_count > 0 {
+                        tool_call_progress_frame_count += 1;
+                        latest_progress_state = ModelProgressState::GeneratingToolCall;
+                    } else if progress.content_chars > 0 {
+                        latest_progress_state = ModelProgressState::Generating;
+                    }
+                    trace.event(
+                        "llm.stream.progress",
+                        serde_json::json!({
+                            "turn": turn,
+                            "llm_call_depth": depth,
+                            "provider": progress.provider,
+                            "frame_index": progress.frame_index,
+                            "done": progress.done,
+                            "content_chars": progress.content_chars,
+                            "tool_call_count": progress.tool_call_count,
+                            "accumulated_tool_call_count": progress.accumulated_tool_call_count,
+                            "stream_progress_frame_count": stream_progress_frame_count,
+                            "tool_call_progress_frame_count": tool_call_progress_frame_count,
+                            "progress_state": if progress.done { "DoneFrame" } else { latest_progress_state.as_str() },
+                        }),
+                    )?;
+                }
+                Ok(StreamChunk::Metrics(metrics)) => {
+                    last_observable_progress = Instant::now();
+                    stalled_candidate_checks = 0;
+                    trace.event(
+                        "llm.stream.metrics",
+                        serde_json::json!({
+                            "turn": turn,
+                            "llm_call_depth": depth,
+                            "provider": &metrics.provider,
+                            "total_duration_ns": metrics.total_duration_ns,
+                            "load_duration_ns": metrics.load_duration_ns,
+                            "prompt_eval_count": metrics.prompt_eval_count,
+                            "prompt_eval_duration_ns": metrics.prompt_eval_duration_ns,
+                            "eval_count": metrics.eval_count,
+                            "eval_duration_ns": metrics.eval_duration_ns,
+                            "tokens_per_second": metrics.tokens_per_second,
+                            "packet_type": packet_type,
+                            "expected_output_tokens": expected_output_tokens,
+                            "context_band": ledger.pressure_band,
+                        }),
+                    )?;
+                    if let Some(sample) = throughput_sample(
+                        model,
+                        packet_type,
+                        expected_output_tokens,
+                        ledger.pressure_band,
+                        turn,
+                        depth,
+                        &metrics,
+                    ) {
+                        append_throughput_sample(&throughput_registry_path, &sample)?;
+                        trace.event("llm.throughput.sample", &sample)?;
+                    }
+                }
+                Err(error) => {
+                    let _ = trace.event(
+                        "agent.stream.failed",
+                        serde_json::json!({
+                            "turn": turn,
+                            "llm_call_depth": depth,
+                            "chunks": chunk_count,
+                            "chars": content_chars,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    return Err(error.into());
+                }
+            }
+        }
+        drop(stream);
+
+        trace.event(
+            "llm.context_assembly.response",
+            serde_json::json!({
+                "turn": turn,
+                "llm_call_depth": depth,
+                "duration_ms": started.elapsed().as_millis(),
+                "content_chars": call_content.len(),
+                "content_estimated_tokens": estimate_tokens(call_content.len()),
+                "stream_progress_frame_count": stream_progress_frame_count,
+                "tool_call_progress_frame_count": tool_call_progress_frame_count,
+                "final_progress_state": latest_progress_state.as_str(),
+                "tool_call_count": accumulated_tool_calls.len(),
+                "tool_call_names": accumulated_tool_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+            }),
+        )?;
+
+        if accumulated_tool_calls.is_empty() {
+            trace.event(
+                "agent.stream.finished",
+                serde_json::json!({
+                    "turn": turn,
+                    "chunks": chunk_count,
+                    "chars": content_chars,
+                    "llm_call_count": depth + 1,
+                }),
+            )?;
+            return Ok(response);
+        }
+
+        let assistant_message = LlmMessage {
+            role: MessageRole::Assistant,
+            content: Some(call_content),
+            tool_calls: Some(accumulated_tool_calls.clone()),
+            image_paths: None,
+        };
+        let assistant_chars = message_chars(&assistant_message);
+        current_messages.push(assistant_message);
+        trace.event(
+            "llm.context_assembly.appended",
+            serde_json::json!({
+                "turn": turn,
+                "llm_call_depth": depth,
+                "component": "assistant_tool_request",
+                "reason": "retained model tool request so the next LLM call can see which tools were requested",
+                "message_chars": assistant_chars,
+                "estimated_tokens": estimate_tokens(assistant_chars),
+                "message_count_after_append": current_messages.len(),
+            }),
+        )?;
+
+        for call in &accumulated_tool_calls {
+            let tool_result = run_tool_call(call, tools, &correlation_id).await;
+            let tool_message = LlmMessage {
+                role: MessageRole::Tool,
+                content: Some(tool_result.content.clone()),
+                tool_calls: Some(vec![call.clone()]),
+                image_paths: None,
+            };
+            let tool_message_chars = message_chars(&tool_message);
+            current_messages.push(tool_message);
+            trace.event(
+                "llm.context_assembly.appended",
+                serde_json::json!({
+                    "turn": turn,
+                    "llm_call_depth": depth,
+                    "component": "tool_result",
+                    "reason": "retained raw tool result for the next in-turn LLM call",
+                    "tool_call_id": &call.id,
+                    "tool_name": &call.name,
+                    "ok": tool_result.ok,
+                    "duration_ms": tool_result.duration_ms,
+                    "content_chars": tool_result.content.len(),
+                    "content_estimated_tokens": estimate_tokens(tool_result.content.len()),
+                    "message_chars": tool_message_chars,
+                    "estimated_tokens": estimate_tokens(tool_message_chars),
+                    "message_count_after_append": current_messages.len(),
+                }),
+            )?;
+        }
+        compact_retained_tool_results(&mut current_messages, trace, turn, depth)?;
+    }
+
+    unreachable!("tool iteration loop always returns or errors before exhaustion")
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextAssemblyLedger {
+    model: String,
+    turn: usize,
+    llm_call_depth: usize,
+    message_count: usize,
+    components: Vec<ContextComponentLedger>,
+    role_counts: BTreeMap<String, usize>,
+    role_chars: BTreeMap<String, usize>,
+    message_chars: usize,
+    tool_descriptor_chars: usize,
+    total_chars: usize,
+    estimated_tokens: usize,
+    context_window_tokens: Option<usize>,
+    utilization: Option<f64>,
+    pressure_band: &'static str,
+    previous_call_total_chars: Option<usize>,
+    delta_chars_from_previous_call: Option<isize>,
+    completion_temperature: f32,
+    max_tool_iterations: usize,
+    assembly_policy: &'static str,
+}
+
+impl ContextAssemblyLedger {
+    fn total_chars(&self) -> Option<usize> {
+        Some(self.total_chars)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextComponentLedger {
+    index: usize,
+    role: String,
+    inclusion_reason: &'static str,
+    content_chars: usize,
+    tool_call_chars: usize,
+    total_chars: usize,
+    estimated_tokens: usize,
+    tool_call_count: usize,
+    tool_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModelProgressProjection {
+    conservative_tokens_per_second: f64,
+    sample_count: usize,
+    expected_max_seconds: f64,
+    allowed_seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelProgressState {
+    WaitingForFirstToken,
+    Generating,
+    GeneratingToolCall,
+    ProgressUnknown,
+    PossiblyStalled,
+    Stalled,
+}
+
+impl ModelProgressState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingForFirstToken => "WaitingForFirstToken",
+            Self::Generating => "Generating",
+            Self::GeneratingToolCall => "GeneratingToolCall",
+            Self::ProgressUnknown => "ProgressUnknown",
+            Self::PossiblyStalled => "PossiblyStalled",
+            Self::Stalled => "Stalled",
+        }
+    }
+
+    fn has_progress_evidence(self) -> bool {
+        matches!(
+            self,
+            Self::Generating | Self::GeneratingToolCall | Self::ProgressUnknown
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RunnerActivitySample {
+    source: String,
+    process_active: Option<bool>,
+    model_loaded: Option<bool>,
+    accelerator_resident: Option<bool>,
+    accelerator_label: Option<String>,
+    gpu_utilization_percent: Option<f64>,
+    raw_summary: Option<String>,
+    error: Option<String>,
+}
+
+impl RunnerActivitySample {
+    fn has_activity_evidence(&self) -> bool {
+        self.process_active == Some(true)
+            || self.model_loaded == Some(true)
+            || self.accelerator_resident == Some(true)
+            || self
+                .gpu_utilization_percent
+                .is_some_and(|utilization| utilization > 0.0)
+    }
+}
+
+struct ModelProgressStatusInput<'a> {
+    trace: &'a TraceRecorder,
+    turn: usize,
+    llm_call_depth: usize,
+    model: &'a str,
+    progress_state: ModelProgressState,
+    elapsed: Duration,
+    seconds_since_observable_progress: f64,
+    projection: &'a ModelProgressProjection,
+    runner_activity: Option<&'a RunnerActivitySample>,
+    stalled_candidate_checks: usize,
+    automatic_interrupt: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ThroughputSample {
+    timestamp: chrono::DateTime<chrono::Utc>,
+    model: String,
+    provider: String,
+    host_signature: String,
+    context_band: String,
+    packet_type: String,
+    expected_output_tokens: usize,
+    turn: usize,
+    llm_call_depth: usize,
+    prompt_eval_count: Option<u64>,
+    prompt_eval_duration_ns: Option<u64>,
+    eval_count: u64,
+    eval_duration_ns: u64,
+    tokens_per_second: f64,
+}
+
+#[derive(Debug)]
+struct ToolCallRunResult {
+    ok: bool,
+    content: String,
+    duration_ms: u128,
+}
+
+struct ContextAssemblyInput<'a> {
+    model: &'a str,
+    turn: usize,
+    llm_call_depth: usize,
+    messages: &'a [LlmMessage],
+    tools: &'a [Box<dyn LlmTool>],
+    completion_config: &'a CompletionConfig,
+    context_window_tokens: Option<usize>,
+    previous_call_total_chars: Option<usize>,
+}
+
+fn context_assembly_ledger(input: ContextAssemblyInput<'_>) -> ContextAssemblyLedger {
+    let components = input
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| component_ledger(index, message))
+        .collect::<Vec<_>>();
+    let mut role_counts = BTreeMap::new();
+    let mut role_chars = BTreeMap::new();
+    for component in &components {
+        *role_counts.entry(component.role.clone()).or_insert(0) += 1;
+        *role_chars.entry(component.role.clone()).or_insert(0) += component.total_chars;
+    }
+    let message_chars = components
+        .iter()
+        .map(|component| component.total_chars)
+        .sum::<usize>();
+    let tool_descriptor_chars = input
+        .tools
+        .iter()
+        .map(|tool| {
+            serde_json::to_string(&tool.descriptor())
+                .unwrap_or_default()
+                .len()
+        })
+        .sum::<usize>();
+    let total_chars = message_chars + tool_descriptor_chars;
+    let estimated_tokens = estimate_tokens(total_chars);
+    let utilization = input
+        .context_window_tokens
+        .filter(|tokens| *tokens > 0)
+        .map(|tokens| estimated_tokens as f64 / tokens as f64);
+    let delta_chars_from_previous_call = input
+        .previous_call_total_chars
+        .map(|previous| total_chars as isize - previous as isize);
+
+    ContextAssemblyLedger {
+        model: input.model.to_string(),
+        turn: input.turn,
+        llm_call_depth: input.llm_call_depth,
+        message_count: input.messages.len(),
+        components,
+        role_counts,
+        role_chars,
+        message_chars,
+        tool_descriptor_chars,
+        total_chars,
+        estimated_tokens,
+        context_window_tokens: input.context_window_tokens,
+        utilization,
+        pressure_band: pressure_band(utilization),
+        previous_call_total_chars: input.previous_call_total_chars,
+        delta_chars_from_previous_call,
+        completion_temperature: input.completion_config.temperature,
+        max_tool_iterations: input.completion_config.max_tool_iterations,
+        assembly_policy: ASSEMBLY_POLICY,
+    }
+}
+
+fn model_progress_projection(
+    model: &str,
+    expected_output_tokens: usize,
+    context_band: &str,
+    throughput_registry_path: &Path,
+) -> ModelProgressProjection {
+    let samples = load_matching_throughput_samples(throughput_registry_path, model, context_band);
+    let conservative_tokens_per_second = percentile(
+        samples
+            .iter()
+            .map(|sample| sample.tokens_per_second)
+            .collect::<Vec<_>>(),
+        0.05,
+    )
+    .unwrap_or(DEFAULT_THROUGHPUT_TPS);
+    let expected_max_seconds = MODEL_PROGRESS_WARMUP_SECONDS
+        + (expected_output_tokens as f64 / conservative_tokens_per_second)
+        + MODEL_PROGRESS_TOOL_JSON_SLACK_SECONDS;
+    let allowed_seconds = expected_max_seconds * MODEL_PROGRESS_VARIANCE_MULTIPLIER;
+    ModelProgressProjection {
+        conservative_tokens_per_second,
+        sample_count: samples.len(),
+        expected_max_seconds,
+        allowed_seconds,
+    }
+}
+
+fn trace_model_progress_status(input: ModelProgressStatusInput<'_>) -> Result<()> {
+    let runner_activity_evidence = input
+        .runner_activity
+        .is_some_and(RunnerActivitySample::has_activity_evidence);
+    input.trace.event(
+        "llm.progress.status",
+        serde_json::json!({
+            "turn": input.turn,
+            "llm_call_depth": input.llm_call_depth,
+            "model": input.model,
+            "progress_state": input.progress_state.as_str(),
+            "elapsed_seconds": input.elapsed.as_secs_f64(),
+            "seconds_since_observable_progress": input.seconds_since_observable_progress,
+            "allowed_seconds": input.projection.allowed_seconds,
+            "projected_allowance_exceeded": input.elapsed.as_secs_f64() > input.projection.allowed_seconds,
+            "runner_activity_evidence": runner_activity_evidence,
+            "runner_activity": input.runner_activity,
+            "stalled_candidate_checks": input.stalled_candidate_checks,
+            "automatic_interrupt": input.automatic_interrupt,
+        }),
+    )
+}
+
+fn compact_retained_tool_results(
+    messages: &mut [LlmMessage],
+    trace: &TraceRecorder,
+    turn: usize,
+    llm_call_depth: usize,
+) -> Result<()> {
+    let retained_tool_indices = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message.role == MessageRole::Tool).then_some(index))
+        .collect::<Vec<_>>();
+    let retain_raw_from = retained_tool_indices
+        .len()
+        .saturating_sub(RETAIN_RAW_TOOL_RESULT_RECENT_COUNT);
+
+    for (ordinal, message_index) in retained_tool_indices.into_iter().enumerate() {
+        if ordinal >= retain_raw_from {
+            continue;
+        }
+        let message = &mut messages[message_index];
+        let Some(content) = message.content.as_ref() else {
+            continue;
+        };
+        if content.len() <= RETAIN_RAW_TOOL_RESULT_MAX_CHARS
+            || content.starts_with(TOOL_RESULT_SUMMARY_PREFIX)
+        {
+            continue;
+        }
+
+        let original_chars = content.len();
+        let original_estimated_tokens = estimate_tokens(original_chars);
+        let tool_name = message
+            .tool_calls
+            .as_ref()
+            .and_then(|calls| calls.first())
+            .map(|call| call.name.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let preview = limit_preview(content, 1_200);
+        let summary = format!(
+            "{TOOL_RESULT_SUMMARY_PREFIX}\n\
+             Tool result summary retained in prompt to reduce context pressure.\n\
+             Tool: {tool_name}\n\
+             Original chars: {original_chars}\n\
+             Original estimated tokens: {original_estimated_tokens}\n\
+             Raw result remains available in earlier trace tool events.\n\
+             Preview:\n{preview}"
+        );
+        let retained_chars = summary.len();
+        message.content = Some(summary);
+        trace.event(
+            "llm.context_assembly.tool_result_compacted",
+            serde_json::json!({
+                "turn": turn,
+                "llm_call_depth": llm_call_depth,
+                "message_index": message_index,
+                "tool_name": tool_name,
+                "original_chars": original_chars,
+                "original_estimated_tokens": original_estimated_tokens,
+                "retained_chars": retained_chars,
+                "retained_estimated_tokens": estimate_tokens(retained_chars),
+                "raw_recent_tool_results_retained": RETAIN_RAW_TOOL_RESULT_RECENT_COUNT,
+                "max_raw_tool_result_chars": RETAIN_RAW_TOOL_RESULT_MAX_CHARS,
+            }),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn classify_model_progress(
+    latest_visible_state: ModelProgressState,
+    elapsed: Duration,
+    _since_observable_progress: Duration,
+    allowed_seconds: f64,
+    runner_activity: Option<&RunnerActivitySample>,
+    stalled_candidate_checks: usize,
+) -> ModelProgressState {
+    if runner_activity.is_some_and(RunnerActivitySample::has_activity_evidence) {
+        return match latest_visible_state {
+            ModelProgressState::Generating | ModelProgressState::GeneratingToolCall => {
+                latest_visible_state
+            }
+            _ => ModelProgressState::ProgressUnknown,
+        };
+    }
+
+    if elapsed.as_secs_f64() <= allowed_seconds {
+        return latest_visible_state;
+    }
+
+    if stalled_candidate_checks + 1 >= STALLED_CONFIRMATION_CHECKS {
+        ModelProgressState::Stalled
+    } else {
+        ModelProgressState::PossiblyStalled
+    }
+}
+
+fn progress_status_interval() -> Duration {
+    std::env::var("HARNESS_PROGRESS_STATUS_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_PROGRESS_STATUS_INTERVAL_SECONDS))
+}
+
+async fn sample_runner_activity(model: &str) -> RunnerActivitySample {
+    let mut sample = sample_ollama_activity(model).await;
+    sample.process_active = sample_process_active().await;
+    if sample.gpu_utilization_percent.is_none() {
+        if let Some(utilization) = sample_nvidia_gpu_utilization().await {
+            sample.source.push_str("+nvidia-smi");
+            sample.gpu_utilization_percent = Some(utilization);
+        } else if let Some(utilization) = sample_rocm_gpu_utilization().await {
+            sample.source.push_str("+rocm-smi");
+            sample.gpu_utilization_percent = Some(utilization);
+        } else if let Some(utilization) = sample_powermetrics_gpu_utilization().await {
+            sample.source.push_str("+powermetrics");
+            sample.gpu_utilization_percent = Some(utilization);
+        }
+    }
+    sample
+}
+
+async fn sample_ollama_activity(model: &str) -> RunnerActivitySample {
+    match command_output("ollama", &["ps"]).await {
+        Ok(output) => {
+            let parsed = parse_ollama_ps(model, &output);
+            RunnerActivitySample {
+                source: "ollama ps".to_string(),
+                process_active: None,
+                model_loaded: Some(parsed.model_loaded),
+                accelerator_resident: parsed.accelerator_resident,
+                accelerator_label: parsed.accelerator_label,
+                gpu_utilization_percent: None,
+                raw_summary: parsed.raw_summary,
+                error: None,
+            }
+        }
+        Err(error) => RunnerActivitySample {
+            source: "ollama ps".to_string(),
+            process_active: None,
+            model_loaded: None,
+            accelerator_resident: None,
+            accelerator_label: None,
+            gpu_utilization_percent: None,
+            raw_summary: None,
+            error: Some(error),
+        },
+    }
+}
+
+async fn sample_process_active() -> Option<bool> {
+    command_output("pgrep", &["-fl", "ollama"])
+        .await
+        .ok()
+        .map(|output| !output.trim().is_empty())
+}
+
+async fn sample_nvidia_gpu_utilization() -> Option<f64> {
+    command_output(
+        "nvidia-smi",
+        &[
+            "--query-gpu=utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+    .await
+    .ok()
+    .and_then(|output| parse_max_number(&output))
+}
+
+async fn sample_rocm_gpu_utilization() -> Option<f64> {
+    command_output("rocm-smi", &["--showuse"])
+        .await
+        .ok()
+        .and_then(|output| parse_first_percent_for_keyword(&output, "GPU"))
+}
+
+async fn sample_powermetrics_gpu_utilization() -> Option<f64> {
+    if std::env::consts::OS != "macos" || command_output("id", &["-u"]).await.ok()?.trim() != "0" {
+        return None;
+    }
+    command_output(
+        "powermetrics",
+        &["--samplers", "gpu_power", "-n", "1", "-i", "1000"],
+    )
+    .await
+    .ok()
+    .and_then(|output| parse_first_percent_for_keyword(&output, "GPU"))
+}
+
+async fn command_output(program: &str, args: &[&str]) -> std::result::Result<String, String> {
+    let mut command = Command::new(program);
+    command.args(args).kill_on_drop(true);
+    match tokio::time::timeout(
+        Duration::from_secs(RUNNER_SAMPLE_TIMEOUT_SECONDS),
+        command.output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+        Ok(Ok(output)) => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!(
+            "{program} timed out after {RUNNER_SAMPLE_TIMEOUT_SECONDS}s"
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedOllamaPs {
+    model_loaded: bool,
+    accelerator_resident: Option<bool>,
+    accelerator_label: Option<String>,
+    raw_summary: Option<String>,
+}
+
+fn parse_ollama_ps(model: &str, output: &str) -> ParsedOllamaPs {
+    let model_line = output.lines().find(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|name| name == model || name.starts_with(model))
+    });
+    let Some(line) = model_line else {
+        return ParsedOllamaPs {
+            model_loaded: false,
+            accelerator_resident: Some(false),
+            accelerator_label: None,
+            raw_summary: None,
+        };
+    };
+
+    let uppercase = line.to_ascii_uppercase();
+    let accelerator_resident = Some(uppercase.contains("GPU") || uppercase.contains("NPU"));
+    ParsedOllamaPs {
+        model_loaded: true,
+        accelerator_resident,
+        accelerator_label: processor_label_from_ollama_line(line),
+        raw_summary: Some(line.to_string()),
+    }
+}
+
+fn processor_label_from_ollama_line(line: &str) -> Option<String> {
+    let uppercase = line.to_ascii_uppercase();
+    if uppercase.contains("GPU") || uppercase.contains("NPU") {
+        return line
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|window| {
+                window[0].ends_with('%')
+                    && matches!(window[1].to_ascii_uppercase().as_str(), "GPU" | "NPU")
+            })
+            .map(|window| format!("{} {}", window[0], window[1]));
+    }
+    if uppercase.contains("CPU") {
+        return Some("CPU".to_string());
+    }
+    None
+}
+
+fn parse_first_percent_for_keyword(output: &str, keyword: &str) -> Option<f64> {
+    output
+        .lines()
+        .filter(|line| {
+            line.to_ascii_uppercase()
+                .contains(&keyword.to_ascii_uppercase())
+        })
+        .find_map(parse_percent_from_line)
+}
+
+fn parse_percent_from_line(line: &str) -> Option<f64> {
+    line.split(|character: char| {
+        character.is_whitespace() || matches!(character, ':' | ',' | '(' | ')')
+    })
+    .find_map(|token| token.strip_suffix('%').unwrap_or(token).parse::<f64>().ok())
+}
+
+fn parse_max_number(output: &str) -> Option<f64> {
+    output
+        .split(|character: char| {
+            character.is_whitespace() || matches!(character, '%' | ',' | ':' | '(' | ')')
+        })
+        .filter_map(|token| token.parse::<f64>().ok())
+        .max_by(f64::total_cmp)
+}
+
+fn throughput_sample(
+    model: &str,
+    packet_type: &str,
+    expected_output_tokens: usize,
+    context_band: &str,
+    turn: usize,
+    llm_call_depth: usize,
+    metrics: &StreamMetrics,
+) -> Option<ThroughputSample> {
+    Some(ThroughputSample {
+        timestamp: chrono::Utc::now(),
+        model: model.to_string(),
+        provider: metrics.provider.clone(),
+        host_signature: host_signature(),
+        context_band: context_band.to_string(),
+        packet_type: packet_type.to_string(),
+        expected_output_tokens,
+        turn,
+        llm_call_depth,
+        prompt_eval_count: metrics.prompt_eval_count,
+        prompt_eval_duration_ns: metrics.prompt_eval_duration_ns,
+        eval_count: metrics.eval_count?,
+        eval_duration_ns: metrics.eval_duration_ns?,
+        tokens_per_second: metrics.tokens_per_second?,
+    })
+}
+
+fn append_throughput_sample(path: &Path, sample: &ThroughputSample) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening throughput registry {}", path.display()))?;
+    serde_json::to_writer(&mut file, sample)?;
+    use std::io::Write;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn load_matching_throughput_samples(
+    path: &Path,
+    model: &str,
+    context_band: &str,
+) -> Vec<ThroughputSample> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let host_signature = host_signature();
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ThroughputSample>(line).ok())
+        .filter(|sample| {
+            sample.model == model
+                && sample.provider == "ollama"
+                && sample.host_signature == host_signature
+                && sample.context_band == context_band
+        })
+        .collect()
+}
+
+fn percentile(mut values: Vec<f64>, quantile: f64) -> Option<f64> {
+    values.retain(|value| value.is_finite() && *value > 0.0);
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.total_cmp(right));
+    let index = ((values.len() - 1) as f64 * quantile.clamp(0.0, 1.0)).floor() as usize;
+    values.get(index).copied()
+}
+
+fn host_signature() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn component_ledger(index: usize, message: &LlmMessage) -> ContextComponentLedger {
+    let content_chars = message.content.as_deref().unwrap_or_default().len();
+    let tool_call_chars = message
+        .tool_calls
+        .as_ref()
+        .map(|calls| serde_json::to_string(calls).unwrap_or_default().len())
+        .unwrap_or_default();
+    let tool_names = message
+        .tool_calls
+        .as_ref()
+        .map(|calls| calls.iter().map(|call| call.name.clone()).collect())
+        .unwrap_or_default();
+    let total_chars = content_chars + tool_call_chars;
+    ContextComponentLedger {
+        index,
+        role: role_label(message.role).to_string(),
+        inclusion_reason: inclusion_reason(index, message),
+        content_chars,
+        tool_call_chars,
+        total_chars,
+        estimated_tokens: estimate_tokens(total_chars),
+        tool_call_count: message
+            .tool_calls
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        tool_names,
+    }
+}
+
+fn inclusion_reason(index: usize, message: &LlmMessage) -> &'static str {
+    match message.role {
+        MessageRole::System => "base_system_prompt",
+        MessageRole::User if index == 1 => "benchmark_task_and_run_instructions",
+        MessageRole::User => "agent_loop_instruction_or_repair_prompt",
+        MessageRole::Assistant
+            if message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty()) =>
+        {
+            "retained_assistant_tool_request"
+        }
+        MessageRole::Assistant => "retained_assistant_text",
+        MessageRole::Tool
+            if message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.starts_with(TOOL_RESULT_SUMMARY_PREFIX)) =>
+        {
+            "retained_summarized_tool_result"
+        }
+        MessageRole::Tool => "retained_raw_tool_result",
+    }
+}
+
+fn role_label(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    }
+}
+
+fn pressure_band(utilization: Option<f64>) -> &'static str {
+    match utilization {
+        None => "unknown",
+        Some(value) if value < 0.15 => "green",
+        Some(value) if value < 0.25 => "yellow",
+        Some(value) if value < 0.40 => "orange",
+        Some(_) => "red",
+    }
+}
+
+fn message_chars(message: &LlmMessage) -> usize {
+    message.content.as_deref().unwrap_or_default().len()
+        + message
+            .tool_calls
+            .as_ref()
+            .map(|calls| serde_json::to_string(calls).unwrap_or_default().len())
+            .unwrap_or_default()
+}
+
+async fn run_tool_call(
+    call: &LlmToolCall,
+    tools: &[Box<dyn LlmTool>],
+    correlation_id: &str,
+) -> ToolCallRunResult {
+    let started = Instant::now();
+    let ctx = ToolRunCtx {
+        correlation_id: Some(correlation_id.to_string()),
+        source: Some("adaptive-agent-harness".to_string()),
+        ..Default::default()
+    };
+    let Some(tool) = tools.iter().find(|tool| tool.matches(&call.name)) else {
+        return ToolCallRunResult {
+            ok: false,
+            content: serde_json::json!({
+                "error": format!("Tool {:?} not found", call.name)
+            })
+            .to_string(),
+            duration_ms: started.elapsed().as_millis(),
+        };
+    };
+
+    match tool.run(&call.arguments, &ctx).await {
+        Ok(value) => ToolCallRunResult {
+            ok: true,
+            content: serde_json::to_string(&value).unwrap_or_else(|error| {
+                serde_json::json!({ "error": error.to_string() }).to_string()
+            }),
+            duration_ms: started.elapsed().as_millis(),
+        },
+        Err(error) => ToolCallRunResult {
+            ok: false,
+            content: serde_json::json!({ "error": error.to_string() }).to_string(),
+            duration_ms: started.elapsed().as_millis(),
+        },
+    }
+}
+
+fn limit_preview(content: &str, max_chars: usize) -> String {
+    content.chars().take(max_chars).collect()
+}
+
+fn context_snapshot(
+    messages: &[LlmMessage],
+    tools: &[Box<dyn LlmTool>],
+    policy: &ToolPolicySnapshot,
+    context_window_tokens: Option<usize>,
+) -> serde_json::Value {
+    let message_chars: usize = messages
+        .iter()
+        .map(|message| {
+            message.content.as_deref().unwrap_or_default().len()
+                + message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| serde_json::to_string(calls).unwrap_or_default().len())
+                    .unwrap_or_default()
+        })
+        .sum();
+    let tool_descriptor_chars: usize = tools
+        .iter()
+        .map(|tool| {
+            serde_json::to_string(&tool.descriptor())
+                .unwrap_or_default()
+                .len()
+        })
+        .sum();
+    let outer_chars = message_chars + tool_descriptor_chars;
+    let estimated_tokens = estimate_tokens(outer_chars);
+    let utilization = context_window_tokens
+        .filter(|tokens| *tokens > 0)
+        .map(|tokens| estimated_tokens as f64 / tokens as f64);
+    let inferred_effective_chars = outer_chars;
+    let inferred_effective_tokens = estimate_tokens(inferred_effective_chars);
+    let inferred_effective_utilization = context_window_tokens
+        .filter(|tokens| *tokens > 0)
+        .map(|tokens| inferred_effective_tokens as f64 / tokens as f64);
+
+    serde_json::json!({
+        "message_count": messages.len(),
+        "role_counts": role_counts(messages),
+        "message_chars": message_chars,
+        "tool_descriptor_chars": tool_descriptor_chars,
+        "estimated_total_chars": outer_chars,
+        "approx_chars_per_token": APPROX_CHARS_PER_TOKEN,
+        "estimated_tokens": estimated_tokens,
+        "context_window_tokens": context_window_tokens,
+        "utilization": utilization,
+        "cumulative_tool_result_chars": policy.total_tool_result_chars,
+        "cumulative_tool_result_estimated_tokens": policy.total_tool_result_estimated_tokens,
+        "max_tool_result_chars": policy.max_tool_result_chars,
+        "max_tool_result_estimated_tokens": policy.max_tool_result_estimated_tokens,
+        "max_tool_result_kind": policy.max_tool_result_kind,
+        "tool_result_chars_by_kind": policy.tool_result_chars_by_kind,
+        "inferred_effective_chars": inferred_effective_chars,
+        "inferred_effective_tokens": inferred_effective_tokens,
+        "inferred_effective_utilization": inferred_effective_utilization,
+        "note": "estimated_tokens and inferred_effective_tokens estimate retained prompt content. Cumulative tool-result fields track raw evidence observed in traces, not necessarily prompt-retained content after summarization."
+    })
+}
+
+fn estimate_tokens(chars: usize) -> usize {
+    chars.div_ceil(APPROX_CHARS_PER_TOKEN)
+}
+
+fn role_counts(messages: &[LlmMessage]) -> serde_json::Value {
+    let mut system = 0usize;
+    let mut user = 0usize;
+    let mut assistant = 0usize;
+    let mut tool = 0usize;
+    for message in messages {
+        match message.role {
+            MessageRole::System => system += 1,
+            MessageRole::User => user += 1,
+            MessageRole::Assistant => assistant += 1,
+            MessageRole::Tool => tool += 1,
+        }
+    }
+    serde_json::json!({
+        "system": system,
+        "user": user,
+        "assistant": assistant,
+        "tool": tool,
+    })
+}
+
+fn run_prompt(goal: &str) -> String {
+    format!(
+        "Complete this benchmark task inside the generated project workspace.\n\n{goal}\n\n\
+         Required harness behavior:\n\
+         - You are already operating inside the generated project's workspace directory.\n\
+         - Inspect the project root first.\n\
+         - Create a project-appropriate .gitignore early unless this task explicitly forbids additional files.\n\
+         - Build or update the Rust project at the current tool root, not in a nested workspace/ directory.\n\
+         - Run at least one deterministic validation command.\n\
+         - Leave generated project files at the tool root and use DONE only after validation."
+    )
+}
+
+fn empty_response_prompt(consecutive_empty_responses: usize) -> String {
+    let pressure = if consecutive_empty_responses >= 2 {
+        "You have returned multiple empty responses. Narrow the next action to the smallest missing artifact or failing validation signal."
+    } else {
+        "Your previous turn ended without a DONE or FAIL response."
+    };
+    format!(
+        "{pressure}\n\
+         Continue from the current experiment state. Do not repeat state inspection already performed unless necessary. \
+         If required files are missing, write the next missing file now. \
+         Run deterministic validation before replying DONE. Reply FAIL only if blocked."
+    )
+}
+
+fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
+    format!(
+        "Validation repair mode is active.\n\
+         Failing command: {command}\n\
+         Failure text: {failure_text}\n\
+         Command family failure count: {command_count}\n\
+         Failure-summary repeat count: {summary_count}\n\
+         Your next action must reference that exact failing command and failure text. \
+         Prefer one focused diagnostic or a narrow patch before any broad rewrite. \
+         If you discuss the same failure again without a probe or edit, run a deterministic probe next. \
+         After editing, run the validation ladder: cargo fmt --check, cargo clippy, focused tests, then broad tests.",
+        command = repair.command,
+        failure_text = repair.failure_text,
+        command_count = repair.repeated_command_family_count,
+        summary_count = repair.repeated_failure_summary_count,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use futures::stream;
+    use mojentic::llm::models::LlmGatewayResponse;
+    use mojentic::llm::tools::{FunctionDescriptor, ToolDescriptor};
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::pin::Pin;
+
+    #[test]
+    fn estimates_tokens_with_ceil_division() {
+        assert_eq!(estimate_tokens(0), 0);
+        assert_eq!(estimate_tokens(1), 1);
+        assert_eq!(estimate_tokens(4), 1);
+        assert_eq!(estimate_tokens(5), 2);
+    }
+
+    #[test]
+    fn counts_message_roles() {
+        let counts = role_counts(&[
+            LlmMessage::system("system"),
+            LlmMessage::user("user"),
+            LlmMessage::assistant("assistant"),
+        ]);
+        assert_eq!(counts["system"], 1);
+        assert_eq!(counts["user"], 1);
+        assert_eq!(counts["assistant"], 1);
+        assert_eq!(counts["tool"], 0);
+    }
+
+    #[test]
+    fn context_snapshot_includes_inferred_tool_pressure() {
+        let policy = ToolPolicySnapshot {
+            total_tool_calls: 3,
+            consecutive_writes_without_shell: 0,
+            writes_since_shell_probe: 0,
+            total_write_operations: 0,
+            total_shell_probes: 1,
+            validation_repair: None,
+            patch_fallbacks: vec![],
+            total_tool_result_chars: 4_000,
+            total_tool_result_estimated_tokens: 1_000,
+            max_tool_result_chars: 2_000,
+            max_tool_result_estimated_tokens: 500,
+            max_tool_result_kind: Some("tool.read_file".to_string()),
+            tool_result_chars_by_kind: std::collections::BTreeMap::from([(
+                "tool.read_file".to_string(),
+                4_000,
+            )]),
+        };
+        let snapshot = context_snapshot(
+            &[LlmMessage::system("system"), LlmMessage::user("task")],
+            &[],
+            &policy,
+            Some(8_000),
+        );
+
+        assert_eq!(snapshot["cumulative_tool_result_chars"], 4_000);
+        assert_eq!(snapshot["cumulative_tool_result_estimated_tokens"], 1_000);
+        assert_eq!(snapshot["max_tool_result_kind"], "tool.read_file");
+        assert_eq!(
+            snapshot["inferred_effective_tokens"],
+            snapshot["estimated_tokens"]
+        );
+        assert!(
+            snapshot["note"]
+                .as_str()
+                .unwrap()
+                .contains("raw evidence observed in traces")
+        );
+    }
+
+    #[test]
+    fn context_assembly_ledger_explains_components_and_deltas() {
+        let messages = vec![
+            LlmMessage::system("system"),
+            LlmMessage::user("task"),
+            LlmMessage {
+                role: MessageRole::Assistant,
+                content: Some("reading".to_string()),
+                tool_calls: Some(vec![LlmToolCall {
+                    id: Some("call-1".to_string()),
+                    name: "read_file".to_string(),
+                    arguments: std::collections::HashMap::new(),
+                }]),
+                image_paths: None,
+            },
+            LlmMessage {
+                role: MessageRole::Tool,
+                content: Some("{\"content\":\"file\"}".to_string()),
+                tool_calls: None,
+                image_paths: None,
+            },
+        ];
+        let config = CompletionConfig {
+            temperature: 0.2,
+            max_tool_iterations: 50,
+            ..Default::default()
+        };
+
+        let ledger = context_assembly_ledger(ContextAssemblyInput {
+            model: "qwen-test",
+            turn: 3,
+            llm_call_depth: 1,
+            messages: &messages,
+            tools: &[],
+            completion_config: &config,
+            context_window_tokens: Some(100),
+            previous_call_total_chars: Some(10),
+        });
+
+        assert_eq!(ledger.turn, 3);
+        assert_eq!(ledger.llm_call_depth, 1);
+        assert_eq!(ledger.components[0].inclusion_reason, "base_system_prompt");
+        assert_eq!(
+            ledger.components[1].inclusion_reason,
+            "benchmark_task_and_run_instructions"
+        );
+        assert_eq!(
+            ledger.components[2].inclusion_reason,
+            "retained_assistant_tool_request"
+        );
+        assert_eq!(
+            ledger.components[3].inclusion_reason,
+            "retained_raw_tool_result"
+        );
+        assert!(ledger.delta_chars_from_previous_call.unwrap() > 0);
+        assert_ne!(ledger.pressure_band, "unknown");
+    }
+
+    #[test]
+    fn compact_retained_tool_results_summarizes_old_large_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let mut messages = vec![LlmMessage::system("system"), LlmMessage::user("task")];
+        for index in 0..=RETAIN_RAW_TOOL_RESULT_RECENT_COUNT {
+            messages.push(LlmMessage {
+                role: MessageRole::Tool,
+                content: Some("x".repeat(RETAIN_RAW_TOOL_RESULT_MAX_CHARS + 100 + index)),
+                tool_calls: Some(vec![LlmToolCall {
+                    id: Some(format!("call-{index}")),
+                    name: "read_file".to_string(),
+                    arguments: HashMap::new(),
+                }]),
+                image_paths: None,
+            });
+        }
+
+        compact_retained_tool_results(&mut messages, &trace, 1, 2).unwrap();
+
+        let first_tool = messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap();
+        assert!(
+            first_tool
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with(TOOL_RESULT_SUMMARY_PREFIX)
+        );
+        let raw_tool_count = messages
+            .iter()
+            .filter(|message| {
+                message.role == MessageRole::Tool
+                    && !message
+                        .content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .starts_with(TOOL_RESULT_SUMMARY_PREFIX)
+            })
+            .count();
+        assert_eq!(raw_tool_count, RETAIN_RAW_TOOL_RESULT_RECENT_COUNT);
+        let ledger = context_assembly_ledger(ContextAssemblyInput {
+            model: "test",
+            turn: 1,
+            llm_call_depth: 3,
+            messages: &messages,
+            tools: &[],
+            completion_config: &CompletionConfig::default(),
+            context_window_tokens: Some(1_000),
+            previous_call_total_chars: None,
+        });
+        assert!(
+            ledger
+                .components
+                .iter()
+                .any(|component| component.inclusion_reason == "retained_summarized_tool_result")
+        );
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"llm.context_assembly.tool_result_compacted\""));
+        assert!(content.contains("\"tool_name\":\"read_file\""));
+    }
+
+    #[test]
+    fn pressure_bands_are_trace_visible() {
+        assert_eq!(pressure_band(None), "unknown");
+        assert_eq!(pressure_band(Some(0.10)), "green");
+        assert_eq!(pressure_band(Some(0.20)), "yellow");
+        assert_eq!(pressure_band(Some(0.30)), "orange");
+        assert_eq!(pressure_band(Some(0.50)), "red");
+    }
+
+    #[test]
+    fn gpu_activity_keeps_quiet_runner_progress_unknown() {
+        let activity = RunnerActivitySample {
+            source: "test".to_string(),
+            process_active: Some(true),
+            model_loaded: Some(true),
+            accelerator_resident: Some(true),
+            accelerator_label: Some("100% GPU".to_string()),
+            gpu_utilization_percent: None,
+            raw_summary: Some("model 100% GPU".to_string()),
+            error: None,
+        };
+
+        let state = classify_model_progress(
+            ModelProgressState::WaitingForFirstToken,
+            Duration::from_secs(10_000),
+            Duration::from_secs(10_000),
+            30.0,
+            Some(&activity),
+            STALLED_CONFIRMATION_CHECKS,
+        );
+
+        assert_eq!(state, ModelProgressState::ProgressUnknown);
+    }
+
+    #[test]
+    fn quiet_runner_requires_repeated_checks_before_stalled() {
+        let first_check = classify_model_progress(
+            ModelProgressState::WaitingForFirstToken,
+            Duration::from_secs(90),
+            Duration::from_secs(90),
+            30.0,
+            None,
+            0,
+        );
+        let second_check = classify_model_progress(
+            first_check,
+            Duration::from_secs(120),
+            Duration::from_secs(120),
+            30.0,
+            None,
+            1,
+        );
+
+        assert_eq!(first_check, ModelProgressState::PossiblyStalled);
+        assert_eq!(second_check, ModelProgressState::Stalled);
+    }
+
+    #[test]
+    fn progress_status_records_automatic_interrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let projection = ModelProgressProjection {
+            conservative_tokens_per_second: 1.0,
+            sample_count: 0,
+            expected_max_seconds: 30.0,
+            allowed_seconds: 60.0,
+        };
+
+        trace_model_progress_status(ModelProgressStatusInput {
+            trace: &trace,
+            turn: 1,
+            llm_call_depth: 2,
+            model: "test-model",
+            progress_state: ModelProgressState::Stalled,
+            elapsed: Duration::from_secs(61),
+            seconds_since_observable_progress: 61.0,
+            projection: &projection,
+            runner_activity: None,
+            stalled_candidate_checks: STALLED_CONFIRMATION_CHECKS,
+            automatic_interrupt: true,
+        })
+        .unwrap();
+
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"progress_state\":\"Stalled\""));
+        assert!(content.contains("\"automatic_interrupt\":true"));
+        assert!(content.contains("\"projected_allowance_exceeded\":true"));
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_interrupts_after_confirmed_stalled() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let config = CompletionConfig {
+            temperature: 0.2,
+            max_tool_iterations: 1,
+            ..Default::default()
+        };
+        let error = stream_response(StreamResponseRequest {
+            gateway: &NeverYieldGateway,
+            model: "fake-stalled-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &[],
+            completion_config: config,
+            context_window_tokens: Some(1_000),
+            packet_type: "diagnosis-only",
+            expected_output_tokens: 1,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: Some(ModelProgressProjection {
+                conservative_tokens_per_second: 1000.0,
+                sample_count: 1,
+                expected_max_seconds: 0.01,
+                allowed_seconds: 0.01,
+            }),
+            progress_status_interval_override: Some(Duration::from_millis(50)),
+            runner_activity_override: Some(RunnerActivitySample {
+                source: "test".to_string(),
+                process_active: Some(false),
+                model_loaded: Some(false),
+                accelerator_resident: Some(false),
+                accelerator_label: None,
+                gpu_utilization_percent: None,
+                raw_summary: None,
+                error: None,
+            }),
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("interrupted stalled model call"));
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"llm.progress.interrupted\""));
+        assert!(content.contains("\"progress_state\":\"Stalled\""));
+        assert!(content.contains("\"automatic_interrupt\":true"));
+    }
+
+    #[test]
+    fn parses_ollama_gpu_residency() {
+        let parsed = parse_ollama_ps(
+            "qwen3.6:27b-coding-mxfp8",
+            "NAME ID SIZE PROCESSOR UNTIL\nqwen3.6:27b-coding-mxfp8 abc 27 GB 100% GPU 4 minutes from now\n",
+        );
+
+        assert!(parsed.model_loaded);
+        assert_eq!(parsed.accelerator_resident, Some(true));
+        assert_eq!(parsed.accelerator_label.as_deref(), Some("100% GPU"));
+    }
+
+    #[tokio::test]
+    async fn stream_response_emits_per_llm_call_context_ledger() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let gateway = FakeToolGateway;
+        let tools: Vec<Box<dyn LlmTool>> = vec![Box::new(EchoTool)];
+        let messages = vec![LlmMessage::system("system"), LlmMessage::user("task")];
+        let config = CompletionConfig {
+            temperature: 0.2,
+            max_tool_iterations: 5,
+            ..Default::default()
+        };
+
+        let response = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &messages,
+            tools: &tools,
+            completion_config: config,
+            context_window_tokens: Some(1_000),
+            packet_type: "narrow-patch",
+            expected_output_tokens: 2_048,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+
+        assert_eq!(response, "DONE");
+        assert_eq!(
+            content
+                .matches("\"kind\":\"llm.context_assembly.ledger\"")
+                .count(),
+            2
+        );
+        assert!(content.contains("\"kind\":\"llm.context_assembly.appended\""));
+        assert!(content.contains("\"component\":\"tool_result\""));
+        assert!(content.contains("\"kind\":\"llm.context_assembly.response\""));
+        assert!(content.contains("\"kind\":\"llm.progress.status\""));
+        assert!(content.contains("\"progress_state\":\"WaitingForFirstToken\""));
+        assert!(content.contains("\"assembly_policy\":\"append_summarized_tool_transcript\""));
+    }
+
+    #[test]
+    fn terminal_response_detection_requires_status_token() {
+        assert!(is_terminal_response("DONE"));
+        assert!(is_terminal_response(" done \n"));
+        assert!(is_terminal_response("All tests pass.\n\nDONE"));
+        assert!(is_terminal_response(
+            "FAIL compiler cannot resolve dependency"
+        ));
+        assert!(!is_terminal_response(
+            "Several tests are failing; let me inspect them."
+        ));
+        assert!(!is_terminal_response(
+            "I am done editing, now I will validate."
+        ));
+    }
+
+    #[test]
+    fn fail_response_detection_only_checks_first_status_token() {
+        assert!(is_fail_response("FAIL compiler cannot resolve dependency"));
+        assert!(is_fail_response(" fail \n"));
+        assert!(!is_fail_response("Tests still fail; I will inspect."));
+        assert!(!is_fail_response("DONE"));
+    }
+
+    #[test]
+    fn validation_repair_prompt_carries_failure_evidence() {
+        let prompt = validation_repair_prompt(&ValidationRepairSnapshot {
+            active: true,
+            command: "cargo test".to_string(),
+            command_family: "cargo test".to_string(),
+            status: Some(101),
+            failure_text: "error[E0425]: cannot find value".to_string(),
+            repeated_command_family_count: 2,
+            repeated_failure_summary_count: 1,
+        });
+
+        assert!(prompt.contains("Failing command: cargo test"));
+        assert!(prompt.contains("Failure text: error[E0425]: cannot find value"));
+        assert!(prompt.contains("Command family failure count: 2"));
+    }
+
+    #[test]
+    fn run_failed_trace_records_transport_error_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let config = AgentRunConfig {
+            experiment_dir: temp.path().join("experiment"),
+            goal_file: PathBuf::from("task.md"),
+            model: "qwen3.6:27b-coding-mxfp8".to_string(),
+            max_iterations: 10,
+            max_tool_iterations: 50,
+            context_window_tokens: Some(131_072),
+            packet_type: "multi-file-patch".to_string(),
+            expected_output_tokens: 4_096,
+        };
+        let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
+
+        trace_run_failed(
+            &trace,
+            "agent.stream",
+            Some(1),
+            &error,
+            &config,
+            &temp.path().join("workspace"),
+            &temp.path().join("experiment/task.md"),
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"run.failed\""));
+        assert!(content.contains("agent.stream"));
+        assert!(content.contains("unexpected EOF during chunk size line"));
+        assert!(content.contains("qwen3.6:27b-coding-mxfp8"));
+    }
+
+    struct FakeToolGateway;
+
+    #[async_trait]
+    impl LlmGateway for FakeToolGateway {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _tools: Option<&[Box<dyn LlmTool>]>,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<LlmGatewayResponse> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn complete_json(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _schema: Value,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<Value> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn get_available_models(&self) -> mojentic::Result<Vec<String>> {
+            Ok(vec!["fake-model".to_string()])
+        }
+
+        async fn calculate_embeddings(
+            &self,
+            _text: &str,
+            _model: Option<&str>,
+        ) -> mojentic::Result<Vec<f32>> {
+            Ok(vec![])
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _model: &'a str,
+            messages: &'a [LlmMessage],
+            _tools: Option<&'a [Box<dyn LlmTool>]>,
+            _config: &'a CompletionConfig,
+        ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
+        {
+            if messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool)
+            {
+                Box::pin(stream::iter(vec![Ok(StreamChunk::Content(
+                    "DONE".to_string(),
+                ))]))
+            } else {
+                Box::pin(stream::iter(vec![Ok(StreamChunk::ToolCalls(vec![
+                    LlmToolCall {
+                        id: Some("call-1".to_string()),
+                        name: "echo".to_string(),
+                        arguments: HashMap::from([("value".to_string(), json!("hello"))]),
+                    },
+                ]))]))
+            }
+        }
+    }
+
+    struct NeverYieldGateway;
+
+    #[async_trait]
+    impl LlmGateway for NeverYieldGateway {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _tools: Option<&[Box<dyn LlmTool>]>,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<LlmGatewayResponse> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn complete_json(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _schema: Value,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<Value> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn get_available_models(&self) -> mojentic::Result<Vec<String>> {
+            Ok(vec!["fake-stalled-model".to_string()])
+        }
+
+        async fn calculate_embeddings(
+            &self,
+            _text: &str,
+            _model: Option<&str>,
+        ) -> mojentic::Result<Vec<f32>> {
+            Ok(vec![])
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _model: &'a str,
+            _messages: &'a [LlmMessage],
+            _tools: Option<&'a [Box<dyn LlmTool>]>,
+            _config: &'a CompletionConfig,
+        ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
+        {
+            Box::pin(stream::pending())
+        }
+    }
+
+    #[derive(Clone)]
+    struct EchoTool;
+
+    #[async_trait]
+    impl LlmTool for EchoTool {
+        async fn run(
+            &self,
+            args: &HashMap<String, Value>,
+            _ctx: &ToolRunCtx,
+        ) -> mojentic::Result<Value> {
+            Ok(json!({ "echo": args.get("value").cloned().unwrap_or(Value::Null) }))
+        }
+
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                r#type: "function".to_string(),
+                function: FunctionDescriptor {
+                    name: "echo".to_string(),
+                    description: "Echo a value.".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "value": { "type": "string" }
+                        }
+                    }),
+                },
+            }
+        }
+
+        fn clone_box(&self) -> Box<dyn LlmTool> {
+            Box::new(self.clone())
+        }
+    }
+}
