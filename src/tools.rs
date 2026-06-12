@@ -36,9 +36,11 @@ struct ToolPolicyState {
     total_tool_calls: usize,
     consecutive_writes_without_shell: usize,
     writes_since_shell_probe: usize,
+    writes_since_shell_probe_paths: BTreeMap<String, usize>,
     total_write_operations: usize,
     total_shell_probes: usize,
     validation_repair: Option<ValidationRepairState>,
+    validation_repair_read_paths: BTreeMap<String, usize>,
     repeated_command_failures: HashMap<String, usize>,
     repeated_failure_summaries: HashMap<String, usize>,
     patch_fallbacks_by_file: BTreeMap<String, PatchFallbackState>,
@@ -53,9 +55,12 @@ pub struct ToolPolicySnapshot {
     pub total_tool_calls: usize,
     pub consecutive_writes_without_shell: usize,
     pub writes_since_shell_probe: usize,
+    pub writes_since_shell_probe_paths: BTreeMap<String, usize>,
+    pub validation_required_after_write: bool,
     pub total_write_operations: usize,
     pub total_shell_probes: usize,
     pub validation_repair: Option<ValidationRepairSnapshot>,
+    pub validation_repair_read_paths: BTreeMap<String, usize>,
     pub patch_fallbacks: Vec<PatchFallbackSnapshot>,
     pub total_tool_result_chars: usize,
     pub total_tool_result_estimated_tokens: usize,
@@ -306,15 +311,36 @@ impl ToolScope {
             .to_string()
     }
 
-    fn note_write_intent(&self) -> Result<()> {
+    fn note_write_intent(&self, paths: &[PathBuf]) -> Result<()> {
+        let relative_paths = paths
+            .iter()
+            .map(|path| self.relative_display(path))
+            .collect::<Vec<_>>();
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         if policy.consecutive_writes_without_shell >= MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
             bail!("write budget exhausted: run a shell validation probe before editing again");
         }
         policy.consecutive_writes_without_shell += 1;
         policy.writes_since_shell_probe += 1;
+        for relative in relative_paths {
+            *policy
+                .writes_since_shell_probe_paths
+                .entry(relative)
+                .or_insert(0) += 1;
+        }
         policy.total_write_operations += 1;
         Ok(())
+    }
+
+    fn note_read_target(&self, path: &Path) {
+        let relative = self.relative_display(path);
+        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
+        if policy.validation_repair.is_some() {
+            *policy
+                .validation_repair_read_paths
+                .entry(relative)
+                .or_insert(0) += 1;
+        }
     }
 
     #[cfg(test)]
@@ -322,6 +348,7 @@ impl ToolScope {
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         policy.consecutive_writes_without_shell = 0;
         policy.writes_since_shell_probe = 0;
+        policy.writes_since_shell_probe_paths.clear();
         policy.total_shell_probes += 1;
     }
 
@@ -337,10 +364,12 @@ impl ToolScope {
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         policy.consecutive_writes_without_shell = 0;
         policy.writes_since_shell_probe = 0;
+        policy.writes_since_shell_probe_paths.clear();
         policy.total_shell_probes += 1;
 
         if output.status.success() {
             let previous = policy.validation_repair.take();
+            policy.validation_repair_read_paths.clear();
             drop(policy);
             if previous.is_some() {
                 self.trace.event(
@@ -380,6 +409,7 @@ impl ToolScope {
         };
         let snapshot = ValidationRepairSnapshot::from(&repair);
         policy.validation_repair = Some(repair);
+        policy.validation_repair_read_paths.clear();
         drop(policy);
         self.trace
             .event("agent.validation.repair_required", &snapshot)?;
@@ -427,12 +457,18 @@ impl ToolScope {
             total_tool_calls: policy.total_tool_calls,
             consecutive_writes_without_shell: policy.consecutive_writes_without_shell,
             writes_since_shell_probe: policy.writes_since_shell_probe,
+            writes_since_shell_probe_paths: policy.writes_since_shell_probe_paths.clone(),
+            validation_required_after_write: policy
+                .writes_since_shell_probe_paths
+                .keys()
+                .any(|path| path_requires_validation_after_write(path)),
             total_write_operations: policy.total_write_operations,
             total_shell_probes: policy.total_shell_probes,
             validation_repair: policy
                 .validation_repair
                 .as_ref()
                 .map(ValidationRepairSnapshot::from),
+            validation_repair_read_paths: policy.validation_repair_read_paths.clone(),
             patch_fallbacks: policy
                 .patch_fallbacks_by_file
                 .iter()
@@ -617,6 +653,7 @@ impl ReadFileTool {
         validate_line_range(line_start, line_end)?;
         let path = self.scope.resolve_existing_or_new(path_arg)?;
         self.scope.check_read(&path)?;
+        self.scope.note_read_target(&path);
         let content = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("reading {}", path.display()))?;
@@ -793,6 +830,38 @@ fn collect_tree(
     Ok(())
 }
 
+fn path_requires_validation_after_write(path: &str) -> bool {
+    let path = Path::new(path);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        file_name.as_str(),
+        ".gitignore"
+            | ".ignore"
+            | "readme"
+            | "license"
+            | "licence"
+            | "changelog"
+            | "contributors"
+            | "authors"
+    ) {
+        return false;
+    }
+    if matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("md" | "markdown" | "txt" | "rst" | "adoc")
+    ) {
+        return false;
+    }
+    true
+}
+
 fn load_gitignore(root: &Path) -> Result<Gitignore> {
     let mut builder = GitignoreBuilder::new(root);
     let gitignore_path = root.join(".gitignore");
@@ -854,11 +923,11 @@ impl LlmTool for WriteFileTool {
 
 impl WriteFileTool {
     async fn write(&self, args: &HashMap<String, Value>) -> Result<Value> {
-        self.scope.note_write_intent()?;
         let path_arg = required_str(args, "path")?;
         let content = required_str(args, "content")?;
         let path = self.scope.resolve_existing_or_new(path_arg)?;
         self.scope.check_write(&path)?;
+        self.scope.note_write_intent(std::slice::from_ref(&path))?;
         self.scope
             .note_patch_fallback_choice(std::slice::from_ref(&path), "write_file", None)?;
         if let Some(parent) = path.parent() {
@@ -923,10 +992,10 @@ impl LlmTool for PatchFileTool {
 
 impl PatchFileTool {
     async fn patch(&self, args: &HashMap<String, Value>) -> Result<Value> {
-        self.scope.note_write_intent()?;
         let patch = required_str(args, "patch")?;
         let touched_paths = patch_paths(&self.scope, patch)?;
         validate_patch_paths(&self.scope, patch)?;
+        self.scope.note_write_intent(&touched_paths)?;
         self.scope.note_patch_fallback_choice(
             &touched_paths,
             "patch_file_retry",
@@ -1873,34 +1942,70 @@ mod tests {
     fn requires_shell_probe_after_write_budget() {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
+        let source_path = scope.root.join("src/main.rs");
         for _ in 0..MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
-            assert!(scope.note_write_intent().is_ok());
+            assert!(
+                scope
+                    .note_write_intent(std::slice::from_ref(&source_path))
+                    .is_ok()
+            );
         }
-        assert!(scope.note_write_intent().is_err());
+        assert!(
+            scope
+                .note_write_intent(std::slice::from_ref(&source_path))
+                .is_err()
+        );
         scope.note_validation_probe();
-        assert!(scope.note_write_intent().is_ok());
+        assert!(
+            scope
+                .note_write_intent(std::slice::from_ref(&source_path))
+                .is_ok()
+        );
     }
 
     #[test]
     fn tracks_writes_since_last_shell_probe() {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
+        let source_path = scope.root.join("src/main.rs");
 
         assert_eq!(scope.policy_snapshot().writes_since_shell_probe, 0);
         assert_eq!(scope.policy_snapshot().total_tool_calls, 0);
-        scope.note_write_intent().unwrap();
+        scope
+            .note_write_intent(std::slice::from_ref(&source_path))
+            .unwrap();
         scope.note_tool_call();
         let dirty = scope.policy_snapshot();
         assert_eq!(dirty.total_tool_calls, 1);
         assert_eq!(dirty.writes_since_shell_probe, 1);
+        assert_eq!(dirty.writes_since_shell_probe_paths["src/main.rs"], 1);
+        assert!(dirty.validation_required_after_write);
         assert_eq!(dirty.total_write_operations, 1);
         assert_eq!(dirty.total_shell_probes, 0);
 
         scope.note_validation_probe();
         let clean = scope.policy_snapshot();
         assert_eq!(clean.writes_since_shell_probe, 0);
+        assert!(clean.writes_since_shell_probe_paths.is_empty());
+        assert!(!clean.validation_required_after_write);
         assert_eq!(clean.total_write_operations, 1);
         assert_eq!(clean.total_shell_probes, 1);
+    }
+
+    #[test]
+    fn docs_only_writes_do_not_require_validation_after_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let readme_path = scope.root.join("README.md");
+
+        scope
+            .note_write_intent(std::slice::from_ref(&readme_path))
+            .unwrap();
+        let snapshot = scope.policy_snapshot();
+
+        assert_eq!(snapshot.writes_since_shell_probe, 1);
+        assert_eq!(snapshot.writes_since_shell_probe_paths["README.md"], 1);
+        assert!(!snapshot.validation_required_after_write);
     }
 
     #[test]
@@ -1954,10 +2059,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_repair_tracks_read_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let shell = ShellCommandTool {
+            scope: scope.clone(),
+        };
+        shell
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("cargo clippy --manifest-path missing/Cargo.toml"),
+            )]))
+            .await
+            .unwrap();
+
+        let reader = ReadFileTool {
+            scope: scope.clone(),
+        };
+        reader
+            .read(&HashMap::from([("path".to_string(), json!("src/main.rs"))]))
+            .await
+            .unwrap();
+
+        let snapshot = scope.policy_snapshot();
+        assert_eq!(snapshot.validation_repair_read_paths["src/main.rs"], 1);
+    }
+
+    #[tokio::test]
     async fn observation_shell_command_does_not_reset_write_budget() {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
-        scope.note_write_intent().unwrap();
+        scope
+            .note_write_intent(std::slice::from_ref(&scope.root.join("src/main.rs")))
+            .unwrap();
         let tool = ShellCommandTool {
             scope: scope.clone(),
         };

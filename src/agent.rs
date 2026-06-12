@@ -25,10 +25,12 @@ const MODEL_PROGRESS_TOOL_JSON_SLACK_SECONDS: f64 = 120.0;
 const MODEL_PROGRESS_VARIANCE_MULTIPLIER: f64 = 2.0;
 const DEFAULT_PROGRESS_STATUS_INTERVAL_SECONDS: u64 = 30;
 const RUNNER_SAMPLE_TIMEOUT_SECONDS: u64 = 3;
+const MACMON_SAMPLE_TIMEOUT_SECONDS: u64 = 5;
 const STALLED_CONFIRMATION_CHECKS: usize = 2;
 const RETAIN_RAW_TOOL_RESULT_RECENT_COUNT: usize = 4;
 const RETAIN_RAW_TOOL_RESULT_MAX_CHARS: usize = 6_000;
 const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
+const MAX_REPAIR_NO_ACTION_TURNS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -127,6 +129,7 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
 
     let mut final_summary = String::new();
     let mut consecutive_empty_responses = 0usize;
+    let mut repair_no_action_tracker = RepairNoActionTracker::default();
     for turn in 1..=config.max_iterations {
         let policy_before_turn = scope.policy_snapshot();
         trace.event(
@@ -145,7 +148,7 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
                 "max_iterations": config.max_iterations,
             }),
         )?;
-        let response = match stream_response(StreamResponseRequest {
+        let turn_result = match stream_response(StreamResponseRequest {
             gateway: gateway.as_ref(),
             model: &config.model,
             messages: &messages,
@@ -163,7 +166,7 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
         })
         .await
         {
-            Ok(response) => response,
+            Ok(turn_result) => turn_result,
             Err(error) => {
                 let _ = trace_run_failed(
                     &trace,
@@ -177,6 +180,8 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
                 return Err(error);
             }
         };
+        let response = turn_result.response;
+        messages = turn_result.messages;
         trace.event(
             "agent.turn.finished",
             serde_json::json!({
@@ -201,8 +206,20 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
                 "tool_result_chars_by_kind": policy.tool_result_chars_by_kind,
             }),
         )?;
+        let repair_no_action = repair_no_action_tracker.observe(
+            turn,
+            tool_calls_this_turn,
+            &policy_before_turn,
+            &policy,
+        );
+        if let Some(decision) = &repair_no_action {
+            trace.event("agent.validation.repair_no_action", decision)?;
+            if decision.escalation_required {
+                trace.event("agent.validation.repair_escalated", decision)?;
+            }
+        }
         if response.trim().is_empty() {
-            if policy.writes_since_shell_probe > 0 {
+            if policy.validation_required_after_write {
                 trace.event(
                     "agent.validation.required_after_edit",
                     serde_json::json!({
@@ -218,6 +235,15 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
                      then cargo clippy, then focused tests, then broad tests. Use timeout_secs 1800 \
                      for cargo build or cargo test. Reply DONE only if validation passes.",
                 ));
+                continue;
+            }
+            if let Some(decision) = &repair_no_action {
+                final_summary = format!(
+                    "turn {turn} made no validation-repair edit or probe after validation failure"
+                );
+                messages.push(LlmMessage::user(validation_repair_no_action_prompt(
+                    decision,
+                )));
                 continue;
             }
             if tool_calls_this_turn > 0 {
@@ -252,7 +278,7 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
         consecutive_empty_responses = 0;
         final_summary = response.clone();
         messages.push(LlmMessage::assistant(response));
-        if policy.writes_since_shell_probe > 0 {
+        if policy.validation_required_after_write {
             trace.event(
                 "agent.validation.required_after_edit",
                 serde_json::json!({
@@ -280,7 +306,13 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
                     "policy": policy,
                 }),
             )?;
-            messages.push(LlmMessage::user(validation_repair_prompt(repair)));
+            if let Some(decision) = &repair_no_action {
+                messages.push(LlmMessage::user(validation_repair_no_action_prompt(
+                    decision,
+                )));
+            } else {
+                messages.push(LlmMessage::user(validation_repair_prompt(repair)));
+            }
             continue;
         }
         if is_terminal_response(&final_summary) {
@@ -450,9 +482,95 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     turn: usize,
 }
 
+#[derive(Debug)]
+struct StreamResponseResult {
+    response: String,
+    messages: Vec<LlmMessage>,
+}
+
+#[derive(Debug, Default)]
+struct RepairNoActionTracker {
+    active_failure_key: Option<String>,
+    consecutive_no_action_turns: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepairNoActionDecision {
+    turn: usize,
+    tool_calls_this_turn: usize,
+    consecutive_no_action_turns: usize,
+    escalation_required: bool,
+    active_repair: ValidationRepairSnapshot,
+    validation_repair_read_paths: BTreeMap<String, usize>,
+    total_write_operations_before_turn: usize,
+    total_write_operations_after_turn: usize,
+    total_shell_probes_before_turn: usize,
+    total_shell_probes_after_turn: usize,
+}
+
+impl RepairNoActionTracker {
+    fn observe(
+        &mut self,
+        turn: usize,
+        tool_calls_this_turn: usize,
+        before: &ToolPolicySnapshot,
+        after: &ToolPolicySnapshot,
+    ) -> Option<RepairNoActionDecision> {
+        let Some(active_repair) = after.validation_repair.clone() else {
+            self.reset();
+            return None;
+        };
+        let active_key = repair_failure_key(&active_repair);
+        if self.active_failure_key.as_deref() != Some(active_key.as_str()) {
+            self.active_failure_key = Some(active_key.clone());
+            self.consecutive_no_action_turns = 0;
+        }
+
+        let repair_was_active_before = before
+            .validation_repair
+            .as_ref()
+            .map(repair_failure_key)
+            .is_some_and(|before_key| before_key == active_key);
+        let wrote_this_turn = after.total_write_operations > before.total_write_operations;
+        let probed_this_turn = after.total_shell_probes > before.total_shell_probes;
+
+        if !repair_was_active_before || wrote_this_turn || probed_this_turn {
+            self.consecutive_no_action_turns = 0;
+            return None;
+        }
+
+        self.consecutive_no_action_turns += 1;
+        Some(RepairNoActionDecision {
+            turn,
+            tool_calls_this_turn,
+            consecutive_no_action_turns: self.consecutive_no_action_turns,
+            escalation_required: self.consecutive_no_action_turns >= MAX_REPAIR_NO_ACTION_TURNS,
+            active_repair,
+            validation_repair_read_paths: after.validation_repair_read_paths.clone(),
+            total_write_operations_before_turn: before.total_write_operations,
+            total_write_operations_after_turn: after.total_write_operations,
+            total_shell_probes_before_turn: before.total_shell_probes,
+            total_shell_probes_after_turn: after.total_shell_probes,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.active_failure_key = None;
+        self.consecutive_no_action_turns = 0;
+    }
+}
+
+fn repair_failure_key(repair: &ValidationRepairSnapshot) -> String {
+    format!(
+        "{}\n{}",
+        repair.command_family.trim(),
+        repair.failure_text.trim()
+    )
+}
+
 async fn stream_response<G: LlmGateway + ?Sized>(
     request: StreamResponseRequest<'_, G>,
-) -> Result<String> {
+) -> Result<StreamResponseResult> {
     let StreamResponseRequest {
         gateway,
         model,
@@ -779,7 +897,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     "llm_call_count": depth + 1,
                 }),
             )?;
-            return Ok(response);
+            return Ok(StreamResponseResult {
+                response,
+                messages: current_messages,
+            });
         }
 
         let assistant_message = LlmMessage {
@@ -1216,6 +1337,9 @@ async fn sample_runner_activity(model: &str) -> RunnerActivitySample {
         } else if let Some(utilization) = sample_rocm_gpu_utilization().await {
             sample.source.push_str("+rocm-smi");
             sample.gpu_utilization_percent = Some(utilization);
+        } else if let Some(utilization) = sample_macmon_gpu_utilization().await {
+            sample.source.push_str("+macmon");
+            sample.gpu_utilization_percent = Some(utilization);
         } else if let Some(utilization) = sample_powermetrics_gpu_utilization().await {
             sample.source.push_str("+powermetrics");
             sample.gpu_utilization_percent = Some(utilization);
@@ -1279,6 +1403,20 @@ async fn sample_rocm_gpu_utilization() -> Option<f64> {
         .and_then(|output| parse_first_percent_for_keyword(&output, "GPU"))
 }
 
+async fn sample_macmon_gpu_utilization() -> Option<f64> {
+    if std::env::consts::OS != "macos" {
+        return None;
+    }
+    command_output_with_timeout(
+        "macmon",
+        &["pipe", "-s", "1"],
+        MACMON_SAMPLE_TIMEOUT_SECONDS,
+    )
+    .await
+    .ok()
+    .and_then(|output| parse_macmon_gpu_utilization(&output))
+}
+
 async fn sample_powermetrics_gpu_utilization() -> Option<f64> {
     if std::env::consts::OS != "macos" || command_output("id", &["-u"]).await.ok()?.trim() != "0" {
         return None;
@@ -1293,22 +1431,23 @@ async fn sample_powermetrics_gpu_utilization() -> Option<f64> {
 }
 
 async fn command_output(program: &str, args: &[&str]) -> std::result::Result<String, String> {
+    command_output_with_timeout(program, args, RUNNER_SAMPLE_TIMEOUT_SECONDS).await
+}
+
+async fn command_output_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout_seconds: u64,
+) -> std::result::Result<String, String> {
     let mut command = Command::new(program);
     command.args(args).kill_on_drop(true);
-    match tokio::time::timeout(
-        Duration::from_secs(RUNNER_SAMPLE_TIMEOUT_SECONDS),
-        command.output(),
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_secs(timeout_seconds), command.output()).await {
         Ok(Ok(output)) if output.status.success() => {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
         Ok(Ok(output)) => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
         Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err(format!(
-            "{program} timed out after {RUNNER_SAMPLE_TIMEOUT_SECONDS}s"
-        )),
+        Err(_) => Err(format!("{program} timed out after {timeout_seconds}s")),
     }
 }
 
@@ -1388,6 +1527,32 @@ fn parse_max_number(output: &str) -> Option<f64> {
         })
         .filter_map(|token| token.parse::<f64>().ok())
         .max_by(f64::total_cmp)
+}
+
+fn parse_macmon_gpu_utilization(output: &str) -> Option<f64> {
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|sample| {
+            let raw = sample
+                .get("gpu_usage")
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.get(1))
+                .and_then(|value| value.as_f64())
+                .or_else(|| sample.get("gpu_usage_pct").and_then(|value| value.as_f64()))?;
+            normalize_utilization_percent(raw)
+        })
+}
+
+fn normalize_utilization_percent(value: f64) -> Option<f64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    if value <= 1.0 {
+        Some(value * 100.0)
+    } else {
+        Some(value.min(100.0))
+    }
 }
 
 fn throughput_sample(
@@ -1719,6 +1884,39 @@ fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
     )
 }
 
+fn validation_repair_no_action_prompt(decision: &RepairNoActionDecision) -> String {
+    let repair = &decision.active_repair;
+    let read_targets = if decision.validation_repair_read_paths.is_empty() {
+        "none recorded".to_string()
+    } else {
+        decision
+            .validation_repair_read_paths
+            .iter()
+            .map(|(path, count)| format!("{path} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let pressure = if decision.escalation_required {
+        format!(
+            "Validation repair escalation is active. You have spent {} consecutive repair turns without an edit or validation probe.",
+            decision.consecutive_no_action_turns
+        )
+    } else {
+        "Validation repair mode remains active. The last repair turn made no edit and ran no validation probe.".to_string()
+    };
+    format!(
+        "{pressure}\n\
+         Failing command: {command}\n\
+         Failure text: {failure_text}\n\
+         Repair read targets since the latest failed validation: {read_targets}\n\
+         Your next action must be exactly one of these: apply one focused patch/write_file to the relevant source, \
+         run one deterministic probe that narrows the failure, or reply FAIL with a concrete blocker. \
+         Do not restate the repair plan without taking one of those actions.",
+        command = repair.command,
+        failure_text = repair.failure_text,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1757,9 +1955,12 @@ mod tests {
             total_tool_calls: 3,
             consecutive_writes_without_shell: 0,
             writes_since_shell_probe: 0,
+            writes_since_shell_probe_paths: BTreeMap::new(),
+            validation_required_after_write: false,
             total_write_operations: 0,
             total_shell_probes: 1,
             validation_repair: None,
+            validation_repair_read_paths: BTreeMap::new(),
             patch_fallbacks: vec![],
             total_tool_result_chars: 4_000,
             total_tool_result_estimated_tokens: 1_000,
@@ -2065,6 +2266,24 @@ mod tests {
         assert_eq!(parsed.accelerator_label.as_deref(), Some("100% GPU"));
     }
 
+    #[test]
+    fn parses_macmon_gpu_usage_fraction_as_percent() {
+        let output = r#"{"gpu_usage":[338,0.08696959912776947],"gpu_power":0.4}"#;
+
+        let utilization = parse_macmon_gpu_utilization(output);
+
+        assert!(matches!(utilization, Some(value) if (value - 8.696959912776947).abs() < 0.0001));
+    }
+
+    #[test]
+    fn parses_macmon_gpu_usage_percent_without_scaling() {
+        let output = r#"{"gpu_usage":[338,42.5],"gpu_power":0.4}"#;
+
+        let utilization = parse_macmon_gpu_utilization(output);
+
+        assert_eq!(utilization, Some(42.5));
+    }
+
     #[tokio::test]
     async fn stream_response_emits_per_llm_call_context_ledger() {
         let temp = tempfile::tempdir().unwrap();
@@ -2078,7 +2297,7 @@ mod tests {
             ..Default::default()
         };
 
-        let response = stream_response(StreamResponseRequest {
+        let result = stream_response(StreamResponseRequest {
             gateway: &gateway,
             model: "fake-model",
             messages: &messages,
@@ -2098,7 +2317,13 @@ mod tests {
         .unwrap();
         let content = std::fs::read_to_string(trace.path()).unwrap();
 
-        assert_eq!(response, "DONE");
+        assert_eq!(result.response, "DONE");
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool)
+        );
         assert_eq!(
             content
                 .matches("\"kind\":\"llm.context_assembly.ledger\"")
@@ -2111,6 +2336,50 @@ mod tests {
         assert!(content.contains("\"kind\":\"llm.progress.status\""));
         assert!(content.contains("\"progress_state\":\"WaitingForFirstToken\""));
         assert!(content.contains("\"assembly_policy\":\"append_summarized_tool_transcript\""));
+    }
+
+    #[tokio::test]
+    async fn stream_response_returns_tool_transcript_for_tool_only_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let gateway = ToolOnlyGateway;
+        let tools: Vec<Box<dyn LlmTool>> = vec![Box::new(EchoTool)];
+        let messages = vec![LlmMessage::system("system"), LlmMessage::user("task")];
+
+        let result = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &messages,
+            tools: &tools,
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 5,
+                ..Default::default()
+            },
+            context_window_tokens: Some(1_000),
+            packet_type: "narrow-patch",
+            expected_output_tokens: 2_048,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "");
+        assert_eq!(result.messages.len(), 4);
+        assert_eq!(result.messages[2].role, MessageRole::Assistant);
+        assert_eq!(result.messages[3].role, MessageRole::Tool);
+        assert!(
+            result.messages[3]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("hello")
+        );
     }
 
     #[test]
@@ -2152,6 +2421,78 @@ mod tests {
         assert!(prompt.contains("Failing command: cargo test"));
         assert!(prompt.contains("Failure text: error[E0425]: cannot find value"));
         assert!(prompt.contains("Command family failure count: 2"));
+    }
+
+    #[test]
+    fn repair_no_action_tracker_escalates_after_repeated_no_write_turns() {
+        let repair = ValidationRepairSnapshot {
+            active: true,
+            command: "cargo clippy --all-targets".to_string(),
+            command_family: "cargo clippy".to_string(),
+            status: Some(101),
+            failure_text: "error[E0422]: cannot find struct `TextStyle`".to_string(),
+            repeated_command_family_count: 1,
+            repeated_failure_summary_count: 1,
+        };
+        let mut tracker = RepairNoActionTracker::default();
+        let before = repair_policy_snapshot(3, 2, Some(repair.clone()), BTreeMap::new());
+        let after_first = repair_policy_snapshot(
+            3,
+            2,
+            Some(repair.clone()),
+            BTreeMap::from([("src/main.rs".to_string(), 1)]),
+        );
+
+        let first = tracker.observe(6, 1, &before, &after_first).unwrap();
+
+        assert_eq!(first.consecutive_no_action_turns, 1);
+        assert!(!first.escalation_required);
+
+        let after_second = repair_policy_snapshot(
+            3,
+            2,
+            Some(repair.clone()),
+            BTreeMap::from([("src/main.rs".to_string(), 3)]),
+        );
+        let second = tracker.observe(7, 1, &after_first, &after_second).unwrap();
+
+        assert_eq!(second.consecutive_no_action_turns, 2);
+        assert!(second.escalation_required);
+        assert_eq!(second.validation_repair_read_paths["src/main.rs"], 3);
+
+        let prompt = validation_repair_no_action_prompt(&second);
+        assert!(prompt.contains("Validation repair escalation is active"));
+        assert!(prompt.contains("src/main.rs (3)"));
+        assert!(prompt.contains("Do not restate the repair plan"));
+
+        let after_write = repair_policy_snapshot(4, 2, Some(repair), BTreeMap::new());
+        assert!(tracker.observe(8, 1, &after_second, &after_write).is_none());
+    }
+
+    fn repair_policy_snapshot(
+        total_write_operations: usize,
+        total_shell_probes: usize,
+        validation_repair: Option<ValidationRepairSnapshot>,
+        validation_repair_read_paths: BTreeMap<String, usize>,
+    ) -> ToolPolicySnapshot {
+        ToolPolicySnapshot {
+            total_tool_calls: 0,
+            consecutive_writes_without_shell: 0,
+            writes_since_shell_probe: 0,
+            writes_since_shell_probe_paths: BTreeMap::new(),
+            validation_required_after_write: false,
+            total_write_operations,
+            total_shell_probes,
+            validation_repair,
+            validation_repair_read_paths,
+            patch_fallbacks: vec![],
+            total_tool_result_chars: 0,
+            total_tool_result_estimated_tokens: 0,
+            max_tool_result_chars: 0,
+            max_tool_result_estimated_tokens: 0,
+            max_tool_result_kind: None,
+            tool_result_chars_by_kind: BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -2239,6 +2580,67 @@ mod tests {
                 Box::pin(stream::iter(vec![Ok(StreamChunk::Content(
                     "DONE".to_string(),
                 ))]))
+            } else {
+                Box::pin(stream::iter(vec![Ok(StreamChunk::ToolCalls(vec![
+                    LlmToolCall {
+                        id: Some("call-1".to_string()),
+                        name: "echo".to_string(),
+                        arguments: HashMap::from([("value".to_string(), json!("hello"))]),
+                    },
+                ]))]))
+            }
+        }
+    }
+
+    struct ToolOnlyGateway;
+
+    #[async_trait]
+    impl LlmGateway for ToolOnlyGateway {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _tools: Option<&[Box<dyn LlmTool>]>,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<LlmGatewayResponse> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn complete_json(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _schema: Value,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<Value> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn get_available_models(&self) -> mojentic::Result<Vec<String>> {
+            Ok(vec!["fake-model".to_string()])
+        }
+
+        async fn calculate_embeddings(
+            &self,
+            _text: &str,
+            _model: Option<&str>,
+        ) -> mojentic::Result<Vec<f32>> {
+            Ok(vec![])
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _model: &'a str,
+            messages: &'a [LlmMessage],
+            _tools: Option<&'a [Box<dyn LlmTool>]>,
+            _config: &'a CompletionConfig,
+        ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
+        {
+            if messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool)
+            {
+                Box::pin(stream::empty())
             } else {
                 Box::pin(stream::iter(vec![Ok(StreamChunk::ToolCalls(vec![
                     LlmToolCall {
