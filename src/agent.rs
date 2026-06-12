@@ -31,6 +31,7 @@ const RETAIN_RAW_TOOL_RESULT_RECENT_COUNT: usize = 4;
 const RETAIN_RAW_TOOL_RESULT_MAX_CHARS: usize = 6_000;
 const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
 const MAX_REPAIR_NO_ACTION_TURNS: usize = 2;
+const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -263,16 +264,25 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
                 continue;
             }
             consecutive_empty_responses += 1;
+            let empty_response_decision = empty_response_decision(consecutive_empty_responses);
             trace.event(
                 "agent.turn.empty_response",
                 serde_json::json!({
                     "turn": turn,
                     "consecutive_empty_responses": consecutive_empty_responses,
+                    "escalation_required": empty_response_decision.escalation_required,
                 }),
             )?;
-            messages.push(LlmMessage::user(empty_response_prompt(
-                consecutive_empty_responses,
-            )));
+            if empty_response_decision.escalation_required {
+                trace.event(
+                    "agent.turn.empty_response_escalated",
+                    serde_json::json!({
+                        "turn": turn,
+                        "consecutive_empty_responses": consecutive_empty_responses,
+                    }),
+                )?;
+            }
+            messages.push(LlmMessage::user(empty_response_decision.prompt));
             continue;
         }
         consecutive_empty_responses = 0;
@@ -295,8 +305,11 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
             ));
             continue;
         }
+        if is_terminal_response(&final_summary) {
+            break;
+        }
         if let Some(repair) = &policy.validation_repair
-            && !is_fail_response(&final_summary)
+            && should_prompt_validation_repair(&policy, &final_summary)
         {
             trace.event(
                 "agent.validation.repair_prompted",
@@ -314,9 +327,6 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
                 messages.push(LlmMessage::user(validation_repair_prompt(repair)));
             }
             continue;
-        }
-        if is_terminal_response(&final_summary) {
-            break;
         }
         messages.push(LlmMessage::user(
             "Continue from the current experiment state. Use tools as needed. \
@@ -398,21 +408,11 @@ fn harness_source_state() -> serde_json::Value {
 }
 
 fn is_terminal_response(response: &str) -> bool {
-    let mut non_empty_lines = response
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-    let first_line = non_empty_lines.next();
-    first_line.is_some_and(|line| {
-        line.eq_ignore_ascii_case("DONE")
-            || line
-                .split_once(char::is_whitespace)
-                .map(|(head, _)| head.eq_ignore_ascii_case("FAIL"))
-                .unwrap_or_else(|| line.eq_ignore_ascii_case("FAIL"))
-    }) || response
-        .lines()
-        .map(str::trim)
-        .any(|line| line.eq_ignore_ascii_case("DONE"))
+    is_fail_response(response)
+        || response
+            .lines()
+            .map(str::trim)
+            .any(|line| line.eq_ignore_ascii_case("DONE"))
 }
 
 fn is_fail_response(response: &str) -> bool {
@@ -425,6 +425,10 @@ fn is_fail_response(response: &str) -> bool {
                 .map(|(head, _)| head.eq_ignore_ascii_case("FAIL"))
                 .unwrap_or_else(|| line.eq_ignore_ascii_case("FAIL"))
         })
+}
+
+fn should_prompt_validation_repair(policy: &ToolPolicySnapshot, response: &str) -> bool {
+    policy.validation_repair.is_some() && !is_terminal_response(response)
 }
 
 fn canonicalize_goal(experiment_dir: &Path, goal_file: &Path) -> Result<PathBuf> {
@@ -763,6 +767,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     latest_progress_state = ModelProgressState::Generating;
                     chunk_count += 1;
                     content_chars += chunk.len();
+                    if call_content.is_empty() && !response.is_empty() && !response.ends_with('\n')
+                    {
+                        response.push('\n');
+                    }
                     call_content.push_str(&chunk);
                     response.push_str(&chunk);
                     trace.event(
@@ -1853,7 +1861,11 @@ fn run_prompt(goal: &str) -> String {
 }
 
 fn empty_response_prompt(consecutive_empty_responses: usize) -> String {
-    let pressure = if consecutive_empty_responses >= 2 {
+    let pressure = if consecutive_empty_responses >= EMPTY_RESPONSE_ESCALATION_TURNS {
+        "Empty-response escalation is active. Your next turn must take exactly one bounded step: \
+         use tools for one concrete missing artifact or one deterministic validation/probe, \
+         reply DONE only if validation has already passed, or reply FAIL with a concrete blocker."
+    } else if consecutive_empty_responses >= 2 {
         "You have returned multiple empty responses. Narrow the next action to the smallest missing artifact or failing validation signal."
     } else {
         "Your previous turn ended without a DONE or FAIL response."
@@ -1864,6 +1876,19 @@ fn empty_response_prompt(consecutive_empty_responses: usize) -> String {
          If required files are missing, write the next missing file now. \
          Run deterministic validation before replying DONE. Reply FAIL only if blocked."
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmptyResponseDecision {
+    escalation_required: bool,
+    prompt: String,
+}
+
+fn empty_response_decision(consecutive_empty_responses: usize) -> EmptyResponseDecision {
+    EmptyResponseDecision {
+        escalation_required: consecutive_empty_responses >= EMPTY_RESPONSE_ESCALATION_TURNS,
+        prompt: empty_response_prompt(consecutive_empty_responses),
+    }
 }
 
 fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
@@ -2382,6 +2407,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stream_response_preserves_call_boundary_before_final_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let gateway = ContentThenToolGateway;
+        let tools: Vec<Box<dyn LlmTool>> = vec![Box::new(EchoTool)];
+        let messages = vec![LlmMessage::system("system"), LlmMessage::user("task")];
+
+        let result = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &messages,
+            tools: &tools,
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 5,
+                ..Default::default()
+            },
+            context_window_tokens: Some(1_000),
+            packet_type: "narrow-patch",
+            expected_output_tokens: 2_048,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "Validation passed: ok\nDONE");
+        assert!(is_terminal_response(&result.response));
+    }
+
     #[test]
     fn terminal_response_detection_requires_status_token() {
         assert!(is_terminal_response("DONE"));
@@ -2404,6 +2464,45 @@ mod tests {
         assert!(is_fail_response(" fail \n"));
         assert!(!is_fail_response("Tests still fail; I will inspect."));
         assert!(!is_fail_response("DONE"));
+    }
+
+    #[test]
+    fn validation_repair_prompt_is_skipped_for_terminal_status() {
+        let repair = ValidationRepairSnapshot {
+            active: true,
+            command: "cargo clippy --all-targets".to_string(),
+            command_family: "cargo clippy".to_string(),
+            status: Some(101),
+            failure_text: "warning: length comparison to zero".to_string(),
+            repeated_command_family_count: 1,
+            repeated_failure_summary_count: 1,
+        };
+        let policy = repair_policy_snapshot(3, 3, Some(repair), BTreeMap::new());
+
+        assert!(!should_prompt_validation_repair(
+            &policy,
+            "All validation passed.\nDONE"
+        ));
+        assert!(!should_prompt_validation_repair(
+            &policy,
+            "FAIL dependency unavailable"
+        ));
+        assert!(should_prompt_validation_repair(
+            &policy,
+            "I will inspect the failing clippy warning."
+        ));
+    }
+
+    #[test]
+    fn empty_response_decision_escalates_after_repeated_true_empty_turns() {
+        let first = empty_response_decision(1);
+        let third = empty_response_decision(EMPTY_RESPONSE_ESCALATION_TURNS);
+
+        assert!(!first.escalation_required);
+        assert!(first.prompt.contains("previous turn ended"));
+        assert!(third.escalation_required);
+        assert!(third.prompt.contains("Empty-response escalation is active"));
+        assert!(third.prompt.contains("one bounded step"));
     }
 
     #[test]
@@ -2588,6 +2687,70 @@ mod tests {
                         arguments: HashMap::from([("value".to_string(), json!("hello"))]),
                     },
                 ]))]))
+            }
+        }
+    }
+
+    struct ContentThenToolGateway;
+
+    #[async_trait]
+    impl LlmGateway for ContentThenToolGateway {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _tools: Option<&[Box<dyn LlmTool>]>,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<LlmGatewayResponse> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn complete_json(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _schema: Value,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<Value> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn get_available_models(&self) -> mojentic::Result<Vec<String>> {
+            Ok(vec!["fake-model".to_string()])
+        }
+
+        async fn calculate_embeddings(
+            &self,
+            _text: &str,
+            _model: Option<&str>,
+        ) -> mojentic::Result<Vec<f32>> {
+            Ok(vec![])
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _model: &'a str,
+            messages: &'a [LlmMessage],
+            _tools: Option<&'a [Box<dyn LlmTool>]>,
+            _config: &'a CompletionConfig,
+        ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
+        {
+            if messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool)
+            {
+                Box::pin(stream::iter(vec![Ok(StreamChunk::Content(
+                    "DONE".to_string(),
+                ))]))
+            } else {
+                Box::pin(stream::iter(vec![
+                    Ok(StreamChunk::Content("Validation passed: ok".to_string())),
+                    Ok(StreamChunk::ToolCalls(vec![LlmToolCall {
+                        id: Some("call-1".to_string()),
+                        name: "echo".to_string(),
+                        arguments: HashMap::from([("value".to_string(), json!("hello"))]),
+                    }])),
+                ]))
             }
         }
     }
