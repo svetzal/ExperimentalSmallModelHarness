@@ -2323,15 +2323,15 @@ fn empty_response_decision(consecutive_empty_responses: usize) -> EmptyResponseD
 
 fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
     format!(
-        "Validation repair mode is active.\n\
+        "Validation repair action contract is active.\n\
          Failing command: {command}\n\
          Failure text: {failure_text}\n\
          Command family failure count: {command_count}\n\
          Failure-summary repeat count: {summary_count}\n\
-         Your next action must reference that exact failing command and failure text. \
-         Prefer one focused diagnostic or a narrow patch before any broad rewrite. \
-         If you discuss the same failure again without a probe or edit, run a deterministic probe next. \
-         After editing, run the validation ladder: cargo fmt --check, cargo clippy, focused tests, then broad tests.",
+         Your next turn must take exactly one repair action: apply one focused source edit, \
+         run one deterministic diagnostic probe that narrows this failure, or reply FAIL with a concrete blocker. \
+         Do not emit a text-only repair plan. Do not repeat broad inspection unless it is the diagnostic probe. \
+         If you edit, run the validation ladder immediately afterward: cargo fmt --check, cargo clippy, focused tests, then broad tests.",
         command = repair.command,
         failure_text = repair.failure_text,
         command_count = repair.repeated_command_family_count,
@@ -2357,16 +2357,16 @@ fn validation_repair_no_action_prompt(decision: &RepairNoActionDecision) -> Stri
             decision.consecutive_no_action_turns
         )
     } else {
-        "Validation repair mode remains active. The last repair turn made no edit and ran no validation probe.".to_string()
+        "Validation repair action contract remains active. The last repair turn made no edit and ran no validation probe.".to_string()
     };
     format!(
         "{pressure}\n\
          Failing command: {command}\n\
          Failure text: {failure_text}\n\
          Repair read targets since the latest failed validation: {read_targets}\n\
-         Your next action must be exactly one of these: apply one focused patch/write_file to the relevant source, \
+         Your next turn must take exactly one repair action: apply one focused patch/write_file to the relevant source, \
          run one deterministic probe that narrows the failure, or reply FAIL with a concrete blocker. \
-         Do not restate the repair plan without taking one of those actions.",
+         Do not emit a text-only repair plan or restate the plan without taking one of those actions.",
         command = repair.command,
         failure_text = repair.failure_text,
     )
@@ -3286,6 +3286,12 @@ mod tests {
         assert!(prompt.contains("Failing command: cargo test"));
         assert!(prompt.contains("Failure text: error[E0425]: cannot find value"));
         assert!(prompt.contains("Command family failure count: 2"));
+        assert!(prompt.contains("Validation repair action contract is active"));
+        assert!(prompt.contains("exactly one repair action"));
+        assert!(prompt.contains("one focused source edit"));
+        assert!(prompt.contains("one deterministic diagnostic probe"));
+        assert!(prompt.contains("reply FAIL with a concrete blocker"));
+        assert!(prompt.contains("Do not emit a text-only repair plan"));
     }
 
     #[test]
@@ -3328,7 +3334,8 @@ mod tests {
         let prompt = validation_repair_no_action_prompt(&second);
         assert!(prompt.contains("Validation repair escalation is active"));
         assert!(prompt.contains("src/main.rs (3)"));
-        assert!(prompt.contains("Do not restate the repair plan"));
+        assert!(prompt.contains("exactly one repair action"));
+        assert!(prompt.contains("Do not emit a text-only repair plan"));
 
         let after_write = repair_policy_snapshot(4, 2, Some(repair), BTreeMap::new());
         assert!(tracker.observe(8, 1, &after_second, &after_write).is_none());
