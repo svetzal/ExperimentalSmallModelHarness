@@ -72,6 +72,18 @@ pub fn default_expected_output_tokens(packet_type: &str) -> usize {
 }
 
 pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
+    let gateway = OllamaGateway::new();
+    let tool_root = PathBuf::from(".")
+        .canonicalize()
+        .context("canonicalizing harness cwd")?;
+    run_coding_agent_with_gateway(config, &gateway, tool_root).await
+}
+
+async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
+    config: AgentRunConfig,
+    gateway: &G,
+    tool_root: PathBuf,
+) -> Result<AgentRunSummary> {
     let experiment_dir = config
         .experiment_dir
         .canonicalize()
@@ -80,9 +92,9 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
     let goal = tokio::fs::read_to_string(&goal_file)
         .await
         .with_context(|| format!("reading goal file {}", goal_file.display()))?;
-    let tool_root = PathBuf::from(".")
+    let tool_root = tool_root
         .canonicalize()
-        .context("canonicalizing harness cwd")?;
+        .with_context(|| format!("canonicalizing tool root {}", tool_root.display()))?;
 
     let trace = Arc::new(TraceRecorder::create(&experiment_dir.join("traces"))?);
     trace.event(
@@ -114,8 +126,7 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
             "note": "Tools are rooted at the generated project workspace."
         }),
     )?;
-    let scope = ToolScope::new(PathBuf::from("."), Arc::clone(&trace))?;
-    let gateway = Arc::new(OllamaGateway::new());
+    let scope = ToolScope::new(tool_root.clone(), Arc::clone(&trace))?;
     let system_prompt = system_prompt();
     let tools = coding_tools(&scope);
     let mut messages = vec![
@@ -150,7 +161,7 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
             }),
         )?;
         let turn_result = match stream_response(StreamResponseRequest {
-            gateway: gateway.as_ref(),
+            gateway,
             model: &config.model,
             messages: &messages,
             tools: &tools,
@@ -1962,8 +1973,9 @@ mod tests {
     use mojentic::llm::models::LlmGatewayResponse;
     use mojentic::llm::tools::{FunctionDescriptor, ToolDescriptor};
     use serde_json::{Value, json};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn estimates_tokens_with_ceil_division() {
@@ -2648,6 +2660,248 @@ mod tests {
         assert!(content.contains("agent.stream"));
         assert!(content.contains("unexpected EOF during chunk size line"));
         assert!(content.contains("qwen3.6:27b-coding-mxfp8"));
+    }
+
+    #[tokio::test]
+    async fn fixture_retains_tool_only_turn_context_across_outer_turns() {
+        let fixture = AgentFixture::new("Map the workspace and finish.");
+        std::fs::write(fixture.workspace.join("src.txt"), "hello").unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk("list_tree", HashMap::new())],
+            vec![],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 3).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.turn.tool_only_response\""));
+        let turn_two_ledgers = trace_payloads(&trace, "llm.context_assembly.ledger")
+            .into_iter()
+            .filter(|payload| payload["turn"] == 2 && payload["llm_call_depth"] == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(turn_two_ledgers.len(), 1, "{turn_two_ledgers:?}");
+        assert_eq!(turn_two_ledgers[0]["message_count"], 5);
+        assert_eq!(turn_two_ledgers[0]["role_counts"]["tool"], 1);
+    }
+
+    #[tokio::test]
+    async fn fixture_escalates_repeated_true_empty_responses() {
+        let fixture = AgentFixture::new("Finish without tools.");
+        let gateway = ScriptedGateway::new(vec![
+            vec![],
+            vec![],
+            vec![],
+            vec![StreamChunk::Content("FAIL blocked".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 4).await;
+
+        assert_eq!(summary.final_summary, "FAIL blocked");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.turn.empty_response_escalated\""));
+        assert!(trace.contains("\"consecutive_empty_responses\":3"));
+    }
+
+    #[tokio::test]
+    async fn fixture_accepts_done_after_docs_only_write_following_validation() {
+        let fixture = AgentFixture::new("Validate, write a README, and finish.");
+        fixture.write_fake_cargo(0, "ok");
+        let gateway = ScriptedGateway::new(vec![
+            vec![StreamChunk::ToolCalls(vec![
+                tool_call(
+                    "shell_command",
+                    HashMap::from([("command".to_string(), json!("./cargo test"))]),
+                ),
+                tool_call(
+                    "write_file",
+                    HashMap::from([
+                        ("path".to_string(), json!("README.md")),
+                        ("content".to_string(), json!("# Done\n")),
+                    ]),
+                ),
+            ])],
+            vec![StreamChunk::Content("Validation passed.\nDONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 3).await;
+
+        assert_eq!(summary.final_summary, "Validation passed.\nDONE");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"command\":\"./cargo test\""));
+        assert!(trace.contains("\"validation_probe\":true"));
+        assert!(!trace.contains("\"kind\":\"agent.validation.required_after_edit\""));
+        assert!(!trace.contains("\"turn\":2,\"max_iterations\""));
+    }
+
+    #[tokio::test]
+    async fn fixture_hard_stops_repeated_validation_repair_no_action() {
+        let fixture = AgentFixture::new("Run validation and repair failures.");
+        fixture.write_fake_cargo(1, "unit failed");
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+            )],
+            vec![StreamChunk::Content(
+                "I will repair the failing test.".to_string(),
+            )],
+            vec![],
+            vec![],
+        ]);
+
+        let summary = fixture.run(&gateway, 5).await;
+
+        assert_eq!(
+            summary.final_summary,
+            "turn 3 made no validation-repair edit or probe after validation failure"
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_required\""));
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_no_action\""));
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_escalated\""));
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_hard_failed\""));
+        assert!(!trace.contains("\"turn\":4,\"max_iterations\""));
+    }
+
+    struct AgentFixture {
+        _temp: tempfile::TempDir,
+        experiment: PathBuf,
+        workspace: PathBuf,
+    }
+
+    impl AgentFixture {
+        fn new(task: &str) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let experiment = temp.path().join("experiment");
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir_all(&experiment).unwrap();
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(experiment.join("task.md"), task).unwrap();
+            Self {
+                _temp: temp,
+                experiment,
+                workspace,
+            }
+        }
+
+        fn write_fake_cargo(&self, status: i32, output: &str) {
+            let script = format!("#!/bin/sh\necho {output:?}\nexit {status}\n");
+            let path = self.workspace.join("cargo");
+            std::fs::write(&path, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        async fn run(&self, gateway: &ScriptedGateway, max_iterations: usize) -> AgentRunSummary {
+            run_coding_agent_with_gateway(
+                AgentRunConfig {
+                    experiment_dir: self.experiment.clone(),
+                    goal_file: PathBuf::from("task.md"),
+                    model: "fake-model".to_string(),
+                    max_iterations,
+                    max_tool_iterations: 10,
+                    context_window_tokens: Some(131_072),
+                    packet_type: "narrow-patch".to_string(),
+                    expected_output_tokens: 2_048,
+                },
+                gateway,
+                self.workspace.clone(),
+            )
+            .await
+            .unwrap()
+        }
+    }
+
+    fn tool_call_chunk(name: &str, arguments: HashMap<String, Value>) -> StreamChunk {
+        StreamChunk::ToolCalls(vec![tool_call(name, arguments)])
+    }
+
+    fn tool_call(name: &str, arguments: HashMap<String, Value>) -> LlmToolCall {
+        LlmToolCall {
+            id: Some(format!("call-{name}")),
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    fn trace_payloads(content: &str, kind: &str) -> Vec<Value> {
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["kind"] == kind)
+            .filter_map(|event| event.get("payload").cloned())
+            .collect()
+    }
+
+    struct ScriptedGateway {
+        streams: StdMutex<VecDeque<Vec<StreamChunk>>>,
+    }
+
+    impl ScriptedGateway {
+        fn new(streams: Vec<Vec<StreamChunk>>) -> Self {
+            Self {
+                streams: StdMutex::new(VecDeque::from(streams)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmGateway for ScriptedGateway {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _tools: Option<&[Box<dyn LlmTool>]>,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<LlmGatewayResponse> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn complete_json(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _schema: Value,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<Value> {
+            unimplemented!("streaming path only")
+        }
+
+        async fn get_available_models(&self) -> mojentic::Result<Vec<String>> {
+            Ok(vec!["fake-model".to_string()])
+        }
+
+        async fn calculate_embeddings(
+            &self,
+            _text: &str,
+            _model: Option<&str>,
+        ) -> mojentic::Result<Vec<f32>> {
+            Ok(vec![])
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _model: &'a str,
+            _messages: &'a [LlmMessage],
+            _tools: Option<&'a [Box<dyn LlmTool>]>,
+            _config: &'a CompletionConfig,
+        ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
+        {
+            let chunks = self
+                .streams
+                .lock()
+                .expect("scripted gateway mutex poisoned")
+                .pop_front()
+                .unwrap_or_default();
+            Box::pin(stream::iter(chunks.into_iter().map(Ok)))
+        }
     }
 
     struct FakeToolGateway;
