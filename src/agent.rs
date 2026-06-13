@@ -223,6 +223,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     let mut final_summary = String::new();
     let mut consecutive_empty_responses = 0usize;
     let mut repair_no_action_tracker = RepairNoActionTracker::default();
+    let mut exhausted_iterations = true;
     for turn in 1..=config.max_iterations {
         let policy_before_turn = scope.policy_snapshot();
         trace.event(
@@ -276,6 +277,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 return Err(error);
             }
         };
+        let repair_no_content_interrupted = turn_result.repair_no_content_interrupted;
         let response = turn_result.response;
         messages = turn_result.messages;
         trace.event(
@@ -307,6 +309,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             tool_calls_this_turn,
             &policy_before_turn,
             &policy,
+            repair_no_content_interrupted,
         );
         if let Some(decision) = &repair_no_action {
             trace.event("agent.validation.repair_no_action", decision)?;
@@ -318,8 +321,9 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             && decision.escalation_required
             && !is_fail_response(&response)
         {
-            final_summary = repair_no_action_failure_summary(turn);
+            final_summary = repair_hard_failure_summary(decision);
             trace.event("agent.validation.repair_hard_failed", decision)?;
+            exhausted_iterations = false;
             break;
         }
         if response.trim().is_empty() {
@@ -409,6 +413,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             continue;
         }
         if is_terminal_response(&final_summary) {
+            exhausted_iterations = false;
             break;
         }
         if let Some(repair) = &policy.validation_repair
@@ -435,6 +440,20 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             "Continue from the current experiment state. Use tools as needed. \
              Run deterministic validation before replying DONE. Reply FAIL only if blocked.",
         ));
+    }
+
+    if exhausted_iterations {
+        let final_policy = scope.policy_snapshot();
+        if final_policy.validation_required_after_write {
+            trace.event(
+                "agent.validation.required_after_edit_at_max_iterations",
+                serde_json::json!({
+                    "max_iterations": config.max_iterations,
+                    "policy": final_policy,
+                    "final_summary": final_summary,
+                }),
+            )?;
+        }
     }
 
     let summary = AgentRunSummary {
@@ -539,6 +558,16 @@ fn repair_no_action_failure_summary(turn: usize) -> String {
     format!("turn {turn} made no validation-repair edit or probe after validation failure")
 }
 
+fn repair_hard_failure_summary(decision: &RepairNoActionDecision) -> String {
+    match decision.reason {
+        RepairNoActionReason::NoRepairAction => repair_no_action_failure_summary(decision.turn),
+        RepairNoActionReason::NoContentInterrupted => format!(
+            "turn {} validation repair produced no content or tool call after repeated interrupts",
+            decision.turn
+        ),
+    }
+}
+
 fn canonicalize_goal(experiment_dir: &Path, goal_file: &Path) -> Result<PathBuf> {
     let candidate = if goal_file.is_absolute() {
         goal_file.to_path_buf()
@@ -600,6 +629,7 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
 struct StreamResponseResult {
     response: String,
     messages: Vec<LlmMessage>,
+    repair_no_content_interrupted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -612,6 +642,7 @@ struct RepairNoActionTracker {
 struct RepairNoActionDecision {
     turn: usize,
     tool_calls_this_turn: usize,
+    reason: RepairNoActionReason,
     consecutive_no_action_turns: usize,
     escalation_required: bool,
     active_repair: ValidationRepairSnapshot,
@@ -622,6 +653,13 @@ struct RepairNoActionDecision {
     total_shell_probes_after_turn: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RepairNoActionReason {
+    NoRepairAction,
+    NoContentInterrupted,
+}
+
 impl RepairNoActionTracker {
     fn observe(
         &mut self,
@@ -629,6 +667,7 @@ impl RepairNoActionTracker {
         tool_calls_this_turn: usize,
         before: &ToolPolicySnapshot,
         after: &ToolPolicySnapshot,
+        repair_no_content_interrupted: bool,
     ) -> Option<RepairNoActionDecision> {
         let Some(active_repair) = after.validation_repair.clone() else {
             self.reset();
@@ -647,8 +686,15 @@ impl RepairNoActionTracker {
             .is_some_and(|before_key| before_key == active_key);
         let wrote_this_turn = after.total_write_operations > before.total_write_operations;
         let probed_this_turn = after.total_shell_probes > before.total_shell_probes;
+        let reason = if repair_no_content_interrupted && repair_was_active_before {
+            RepairNoActionReason::NoContentInterrupted
+        } else {
+            RepairNoActionReason::NoRepairAction
+        };
 
-        if !repair_was_active_before || wrote_this_turn || probed_this_turn {
+        if !repair_was_active_before
+            || (!repair_no_content_interrupted && (wrote_this_turn || probed_this_turn))
+        {
             self.consecutive_no_action_turns = 0;
             return None;
         }
@@ -657,6 +703,7 @@ impl RepairNoActionTracker {
         Some(RepairNoActionDecision {
             turn,
             tool_calls_this_turn,
+            reason,
             consecutive_no_action_turns: self.consecutive_no_action_turns,
             escalation_required: self.consecutive_no_action_turns >= MAX_REPAIR_NO_ACTION_TURNS,
             active_repair,
@@ -716,6 +763,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let mut stream_progress_frame_count = 0usize;
     let mut tool_call_progress_frame_count = 0usize;
     let mut no_content_segment_eval_count = 0usize;
+    let mut repair_no_content_interrupted = false;
     let no_assistant_content_limit =
         expected_output_tokens.saturating_mul(NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER);
     let mut inspection_loop_tracker = InspectionLoopTracker::default();
@@ -963,6 +1011,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         && call_stream_progress_frame_count
                             >= REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT
                     {
+                        repair_no_content_interrupted = true;
                         trace.event(
                             "agent.validation.repair_no_content_interrupted",
                             serde_json::json!({
@@ -1092,6 +1141,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             return Ok(StreamResponseResult {
                 response,
                 messages: current_messages,
+                repair_no_content_interrupted,
             });
         }
 
@@ -3071,6 +3121,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.response, "");
+        assert!(result.repair_no_content_interrupted);
         let content = std::fs::read_to_string(trace.path()).unwrap();
         assert!(content.contains("\"kind\":\"agent.validation.repair_no_content_interrupted\""));
         assert!(content.contains("\"validation_repair_active\":true"));
@@ -3404,10 +3455,11 @@ mod tests {
             BTreeMap::from([("src/main.rs".to_string(), 1)]),
         );
 
-        let first = tracker.observe(6, 1, &before, &after_first).unwrap();
+        let first = tracker.observe(6, 1, &before, &after_first, false).unwrap();
 
         assert_eq!(first.consecutive_no_action_turns, 1);
         assert!(!first.escalation_required);
+        assert!(matches!(first.reason, RepairNoActionReason::NoRepairAction));
 
         let after_second = repair_policy_snapshot(
             3,
@@ -3415,10 +3467,16 @@ mod tests {
             Some(repair.clone()),
             BTreeMap::from([("src/main.rs".to_string(), 3)]),
         );
-        let second = tracker.observe(7, 1, &after_first, &after_second).unwrap();
+        let second = tracker
+            .observe(7, 1, &after_first, &after_second, false)
+            .unwrap();
 
         assert_eq!(second.consecutive_no_action_turns, 2);
         assert!(second.escalation_required);
+        assert!(matches!(
+            second.reason,
+            RepairNoActionReason::NoRepairAction
+        ));
         assert_eq!(second.validation_repair_read_paths["src/main.rs"], 3);
 
         let prompt = validation_repair_no_action_prompt(&second);
@@ -3428,7 +3486,57 @@ mod tests {
         assert!(prompt.contains("Do not emit a text-only repair plan"));
 
         let after_write = repair_policy_snapshot(4, 2, Some(repair), BTreeMap::new());
-        assert!(tracker.observe(8, 1, &after_second, &after_write).is_none());
+        assert!(
+            tracker
+                .observe(8, 1, &after_second, &after_write, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repair_no_action_tracker_counts_repair_no_content_interrupts() {
+        let repair = ValidationRepairSnapshot {
+            active: true,
+            command: "cargo clippy --all-targets".to_string(),
+            command_family: "cargo clippy".to_string(),
+            status: Some(101),
+            failure_text: "error[E0422]: cannot find struct `TextStyle`".to_string(),
+            repeated_command_family_count: 1,
+            repeated_failure_summary_count: 1,
+        };
+        let mut tracker = RepairNoActionTracker::default();
+        let before = repair_policy_snapshot(3, 2, Some(repair.clone()), BTreeMap::new());
+        let after_action_with_interrupt =
+            repair_policy_snapshot(4, 3, Some(repair.clone()), BTreeMap::new());
+
+        let first = tracker
+            .observe(6, 4, &before, &after_action_with_interrupt, true)
+            .unwrap();
+
+        assert_eq!(first.consecutive_no_action_turns, 1);
+        assert!(!first.escalation_required);
+        assert!(matches!(
+            first.reason,
+            RepairNoActionReason::NoContentInterrupted
+        ));
+
+        let after_second_interrupt = repair_policy_snapshot(4, 3, Some(repair), BTreeMap::new());
+        let second = tracker
+            .observe(
+                7,
+                0,
+                &after_action_with_interrupt,
+                &after_second_interrupt,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(second.consecutive_no_action_turns, 2);
+        assert!(second.escalation_required);
+        assert!(matches!(
+            second.reason,
+            RepairNoActionReason::NoContentInterrupted
+        ));
     }
 
     #[test]
@@ -3603,6 +3711,71 @@ mod tests {
         assert!(trace.contains("\"kind\":\"agent.validation.repair_escalated\""));
         assert!(trace.contains("\"kind\":\"agent.validation.repair_hard_failed\""));
         assert!(!trace.contains("\"turn\":4,\"max_iterations\""));
+    }
+
+    #[tokio::test]
+    async fn fixture_hard_stops_repeated_validation_repair_no_content_interrupts() {
+        let fixture = AgentFixture::new("Run validation and repair no-content failures.");
+        fixture.write_fake_cargo(1, "compile failed");
+        let first_interrupt_frames = (0..REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT)
+            .map(|index| StreamChunk::Progress(stream_progress(index, 0, 0, 0)))
+            .collect::<Vec<_>>();
+        let second_interrupt_frames = (0..REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT)
+            .map(|index| StreamChunk::Progress(stream_progress(index, 0, 0, 0)))
+            .collect::<Vec<_>>();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+            )],
+            vec![StreamChunk::Content(
+                "I will repair the failing validation.".to_string(),
+            )],
+            first_interrupt_frames,
+            second_interrupt_frames,
+        ]);
+
+        let summary = fixture.run(&gateway, 5).await;
+
+        assert_eq!(
+            summary.final_summary,
+            "turn 3 validation repair produced no content or tool call after repeated interrupts"
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_no_content_interrupted\""));
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_no_action\""));
+        assert!(trace.contains("\"reason\":\"no_content_interrupted\""));
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_hard_failed\""));
+        assert!(!trace.contains("\"turn\":4,\"max_iterations\""));
+    }
+
+    #[tokio::test]
+    async fn fixture_records_pending_validation_when_max_iterations_exhausted() {
+        let fixture = AgentFixture::new("Edit source once and stop.");
+        std::fs::create_dir_all(fixture.workspace.join("src")).unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "write_file",
+                HashMap::from([
+                    ("path".to_string(), json!("src/lib.rs")),
+                    (
+                        "content".to_string(),
+                        json!("pub fn answer() -> u32 { 42 }\n"),
+                    ),
+                ]),
+            )],
+            vec![StreamChunk::Content("I changed the source.".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 1).await;
+
+        assert_eq!(summary.final_summary, "I changed the source.");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.validation.required_after_edit\""));
+        assert!(
+            trace.contains("\"kind\":\"agent.validation.required_after_edit_at_max_iterations\"")
+        );
+        assert!(trace.contains("\"kind\":\"run.finished\""));
     }
 
     struct AgentFixture {
