@@ -7,8 +7,10 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
@@ -22,6 +24,7 @@ const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
 const MAX_SHELL_TIMEOUT_SECS: u64 = 1800;
 const PATCH_TIMEOUT_SECS: u64 = 300;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
+const MAX_SHELL_MUTATION_HASH_BYTES: u64 = 2_000_000;
 
 #[derive(Debug, Clone)]
 pub struct ToolScope {
@@ -130,6 +133,13 @@ struct ToolPayloadMeasurement {
     max_tool_result_chars: usize,
     max_tool_result_estimated_tokens: usize,
     max_tool_result_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified_nanos: Option<u128>,
+    content_hash: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -330,6 +340,29 @@ impl ToolScope {
         }
         policy.total_write_operations += 1;
         Ok(())
+    }
+
+    fn note_sensed_shell_mutation(&self, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
+        policy.consecutive_writes_without_shell += 1;
+        policy.writes_since_shell_probe += 1;
+        for relative in paths {
+            *policy
+                .writes_since_shell_probe_paths
+                .entry(relative.clone())
+                .or_insert(0) += 1;
+        }
+        policy.total_write_operations += 1;
+    }
+
+    fn shell_mutation_snapshot(&self) -> Result<BTreeMap<String, FileFingerprint>> {
+        let gitignore = load_gitignore(&self.root)?;
+        let mut snapshot = BTreeMap::new();
+        collect_shell_mutation_snapshot(self, &self.root, &gitignore, &mut snapshot)?;
+        Ok(snapshot)
     }
 
     fn note_read_target(&self, path: &Path) {
@@ -875,6 +908,103 @@ fn load_gitignore(root: &Path) -> Result<Gitignore> {
         .with_context(|| format!("loading gitignore rules from {}", root.display()))
 }
 
+fn collect_shell_mutation_snapshot(
+    scope: &ToolScope,
+    dir: &Path,
+    gitignore: &Gitignore,
+    snapshot: &mut BTreeMap<String, FileFingerprint>,
+) -> Result<()> {
+    let mut children = fs::read_dir(dir)
+        .with_context(|| format!("reading directory {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("collecting directory {}", dir.display()))?;
+    children.sort_by_key(|entry| entry.path());
+    for child in children {
+        let path = child.path();
+        let metadata = child
+            .metadata()
+            .with_context(|| format!("reading metadata {}", path.display()))?;
+        let relative = scope.relative_path(&path)?;
+        if is_shell_mutation_snapshot_excluded(&relative) {
+            continue;
+        }
+        if gitignore.matched(&path, metadata.is_dir()).is_ignore() {
+            continue;
+        }
+        if !scope.is_read_visible(&path) {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_shell_mutation_snapshot(scope, &path, gitignore, snapshot)?;
+        } else if metadata.is_file() {
+            let relative = scope.relative_display(&path);
+            if path_requires_validation_after_write(&relative) {
+                snapshot.insert(relative, file_fingerprint(&path, &metadata)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_shell_mutation_snapshot_excluded(relative: &Path) -> bool {
+    relative.components().any(|component| {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        matches!(
+            name.to_string_lossy().as_ref(),
+            ".git"
+                | ".hg"
+                | ".jj"
+                | ".svn"
+                | ".venv"
+                | "venv"
+                | "target"
+                | "node_modules"
+                | ".next"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | "coverage"
+                | "dist"
+        )
+    })
+}
+
+fn file_fingerprint(path: &Path, metadata: &fs::Metadata) -> Result<FileFingerprint> {
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    let content_hash = if metadata.len() <= MAX_SHELL_MUTATION_HASH_BYTES {
+        let bytes = fs::read(path).with_context(|| format!("hashing {}", path.display()))?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Some(hasher.finish())
+    } else {
+        None
+    };
+    Ok(FileFingerprint {
+        len: metadata.len(),
+        modified_nanos,
+        content_hash,
+    })
+}
+
+fn changed_shell_mutation_paths(
+    before: &BTreeMap<String, FileFingerprint>,
+    after: &BTreeMap<String, FileFingerprint>,
+) -> Vec<String> {
+    let mut paths = before.keys().chain(after.keys()).collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct WriteFileTool {
     scope: ToolScope,
@@ -1158,6 +1288,26 @@ impl ShellCommandTool {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
+        let validation_probe = is_validation_probe(command);
+        let before_mutation_snapshot = if validation_probe {
+            None
+        } else {
+            match self.scope.shell_mutation_snapshot() {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    let _ = self.scope.trace.event(
+                        "agent.shell.mutation_snapshot_failed",
+                        json!({
+                            "command": command,
+                            "cwd": self.scope.relative_display(&cwd),
+                            "phase": "before",
+                            "error": error.to_string(),
+                        }),
+                    );
+                    None
+                }
+            }
+        };
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let shell_command = format!("set -o pipefail; {command}");
         let output = timeout(
@@ -1173,9 +1323,45 @@ impl ShellCommandTool {
         .await
         .with_context(|| format!("command timed out after {timeout_secs}s"))?
         .with_context(|| format!("running command {command:?}"))?;
-        let validation_probe = is_validation_probe(command);
         let stdout = capture_output(&output.stdout);
         let stderr = capture_output(&output.stderr);
+        let (shell_mutation_paths, shell_mutation_snapshot_error) =
+            if let Some(before_snapshot) = before_mutation_snapshot {
+                match self.scope.shell_mutation_snapshot() {
+                    Ok(after_snapshot) => {
+                        let paths = changed_shell_mutation_paths(&before_snapshot, &after_snapshot);
+                        self.scope.note_sensed_shell_mutation(&paths);
+                        if !paths.is_empty() {
+                            let _ = self.scope.trace.event(
+                                "agent.shell.mutation_sensed",
+                                json!({
+                                    "command": command,
+                                    "cwd": self.scope.relative_display(&cwd),
+                                    "paths": paths.clone(),
+                                    "validation_required_after_write": true,
+                                }),
+                            );
+                        }
+                        (paths, None)
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        let _ = self.scope.trace.event(
+                            "agent.shell.mutation_snapshot_failed",
+                            json!({
+                                "command": command,
+                                "cwd": self.scope.relative_display(&cwd),
+                                "phase": "after",
+                                "error": error.clone(),
+                            }),
+                        );
+                        (Vec::new(), Some(error))
+                    }
+                }
+            } else {
+                (Vec::new(), None)
+            };
+        let shell_mutation_sensed = !shell_mutation_paths.is_empty();
         let repair_required = if validation_probe {
             self.scope
                 .note_validation_probe_result(command, &output, &stdout, &stderr)?
@@ -1192,6 +1378,10 @@ impl ShellCommandTool {
             "stdout_truncated": stdout.truncated,
             "stderr": stderr.content,
             "stderr_truncated": stderr.truncated,
+            "shell_mutation_sensed": shell_mutation_sensed,
+            "shell_mutation_paths": shell_mutation_paths,
+            "shell_mutation_requires_validation": shell_mutation_sensed,
+            "shell_mutation_snapshot_error": shell_mutation_snapshot_error,
             "repair_required": repair_required
         }))
     }
@@ -2104,6 +2294,38 @@ mod tests {
 
         assert_eq!(result["validation_probe"], false);
         assert_eq!(scope.policy_snapshot().writes_since_shell_probe, 1);
+    }
+
+    #[tokio::test]
+    async fn source_mutating_shell_command_counts_as_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+        let mut args = HashMap::new();
+        args.insert(
+            "command".to_string(),
+            json!("printf 'pub fn value() -> i32 { 2 }\\n' > src/lib.rs"),
+        );
+
+        let result = tool.shell(&args).await.unwrap();
+        let snapshot = scope.policy_snapshot();
+
+        assert_eq!(result["validation_probe"], false);
+        assert_eq!(result["success"], true);
+        assert_eq!(result["shell_mutation_sensed"], true);
+        assert_eq!(result["shell_mutation_paths"], json!(["src/lib.rs"]));
+        assert_eq!(snapshot.total_write_operations, 1);
+        assert_eq!(snapshot.writes_since_shell_probe, 1);
+        assert_eq!(snapshot.writes_since_shell_probe_paths["src/lib.rs"], 1);
+        assert!(snapshot.validation_required_after_write);
     }
 
     #[tokio::test]
