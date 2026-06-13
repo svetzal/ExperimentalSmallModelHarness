@@ -696,7 +696,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let mut content_chars = 0usize;
     let mut stream_progress_frame_count = 0usize;
     let mut tool_call_progress_frame_count = 0usize;
-    let mut no_assistant_content_eval_count = 0usize;
+    let mut no_content_segment_eval_count = 0usize;
     let no_assistant_content_limit =
         expected_output_tokens.saturating_mul(NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER);
     let mut inspection_loop_tracker = InspectionLoopTracker::default();
@@ -863,7 +863,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
                     latest_progress_state = ModelProgressState::Generating;
-                    no_assistant_content_eval_count = 0;
+                    no_content_segment_eval_count = 0;
                     chunk_count += 1;
                     content_chars += chunk.len();
                     if call_content.is_empty() && !response.is_empty() && !response.ends_with('\n')
@@ -889,6 +889,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
                     latest_progress_state = ModelProgressState::GeneratingToolCall;
+                    no_content_segment_eval_count = 0;
                     trace.event(
                         "llm.stream.tool_calls_completed",
                         serde_json::json!({
@@ -930,8 +931,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 Ok(StreamChunk::Metrics(metrics)) => {
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
-                    if content_chars == 0 {
-                        no_assistant_content_eval_count = no_assistant_content_eval_count
+                    if call_content.is_empty() && accumulated_tool_calls.is_empty() {
+                        no_content_segment_eval_count = no_content_segment_eval_count
                             .saturating_add(metrics.eval_count.unwrap_or_default() as usize);
                     }
                     trace.event(
@@ -964,26 +965,28 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         append_throughput_sample(&throughput_registry_path, &sample)?;
                         trace.event("llm.throughput.sample", &sample)?;
                     }
-                    if content_chars == 0
+                    if call_content.is_empty()
+                        && accumulated_tool_calls.is_empty()
                         && no_assistant_content_limit > 0
-                        && no_assistant_content_eval_count > no_assistant_content_limit
+                        && no_content_segment_eval_count > no_assistant_content_limit
                     {
                         trace.event(
                             "llm.no_content_stream.hard_failed",
                             serde_json::json!({
                                 "turn": turn,
                                 "llm_call_depth": depth,
-                                "observed_output_tokens_without_assistant_content": no_assistant_content_eval_count,
+                                "observed_output_tokens_without_assistant_content": no_content_segment_eval_count,
                                 "expected_output_tokens": expected_output_tokens,
                                 "multiplier": NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER,
                                 "limit": no_assistant_content_limit,
-                                "content_chars": content_chars,
+                                "turn_content_chars": content_chars,
+                                "call_content_chars": call_content.len(),
                                 "tool_call_progress_frame_count": tool_call_progress_frame_count,
                                 "stream_progress_frame_count": stream_progress_frame_count,
                             }),
                         )?;
                         anyhow::bail!(
-                            "no assistant content after {no_assistant_content_eval_count} observed output tokens; expected output budget was {expected_output_tokens}"
+                            "no assistant content after {no_content_segment_eval_count} observed output tokens since the latest content or tool call; expected output budget was {expected_output_tokens}"
                         );
                     }
                 }
@@ -2809,6 +2812,56 @@ mod tests {
         assert!(error.to_string().contains("no assistant content"));
         let content = std::fs::read_to_string(trace.path()).unwrap();
         assert!(content.contains("\"kind\":\"llm.no_content_stream.hard_failed\""));
+    }
+
+    #[tokio::test]
+    async fn stream_response_hard_stops_later_no_content_segment_after_tool_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let tools: Vec<Box<dyn LlmTool>> = vec![Box::new(EchoTool)];
+        let gateway = ScriptedGateway::new(vec![
+            vec![
+                StreamChunk::Content("I will inspect first.".to_string()),
+                tool_call_chunk("echo", HashMap::from([("value".to_string(), json!("ok"))])),
+            ],
+            vec![StreamChunk::Metrics(stream_metrics(
+                (NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER + 1) as u64,
+            ))],
+        ]);
+
+        let error = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &tools,
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 5,
+                ..Default::default()
+            },
+            context_window_tokens: Some(8_000),
+            packet_type: "multi-file-patch",
+            expected_output_tokens: 1,
+            transcript_policy: TranscriptPolicy::FullTranscript,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("since the latest content or tool call")
+        );
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"llm.no_content_stream.hard_failed\""));
+        assert!(content.contains("\"turn_content_chars\":21"));
+        assert!(content.contains("\"call_content_chars\":0"));
     }
 
     #[test]
