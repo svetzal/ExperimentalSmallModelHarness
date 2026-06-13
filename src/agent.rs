@@ -31,6 +31,8 @@ const RETAIN_RAW_TOOL_RESULT_MAX_CHARS: usize = 6_000;
 const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
 const MAX_REPAIR_NO_ACTION_TURNS: usize = 2;
 const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
+const MAX_PRE_VALIDATION_REPEATED_INSPECTIONS: usize = 4;
+const NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER: usize = 20;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -694,6 +696,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let mut content_chars = 0usize;
     let mut stream_progress_frame_count = 0usize;
     let mut tool_call_progress_frame_count = 0usize;
+    let mut no_assistant_content_eval_count = 0usize;
+    let no_assistant_content_limit =
+        expected_output_tokens.saturating_mul(NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER);
+    let mut inspection_loop_tracker = InspectionLoopTracker::default();
     let correlation_id = format!(
         "harness-turn-{turn}-{}",
         chrono::Utc::now().timestamp_millis()
@@ -857,6 +863,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
                     latest_progress_state = ModelProgressState::Generating;
+                    no_assistant_content_eval_count = 0;
                     chunk_count += 1;
                     content_chars += chunk.len();
                     if call_content.is_empty() && !response.is_empty() && !response.ends_with('\n')
@@ -923,6 +930,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 Ok(StreamChunk::Metrics(metrics)) => {
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
+                    if content_chars == 0 {
+                        no_assistant_content_eval_count = no_assistant_content_eval_count
+                            .saturating_add(metrics.eval_count.unwrap_or_default() as usize);
+                    }
                     trace.event(
                         "llm.stream.metrics",
                         serde_json::json!({
@@ -952,6 +963,28 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     ) {
                         append_throughput_sample(&throughput_registry_path, &sample)?;
                         trace.event("llm.throughput.sample", &sample)?;
+                    }
+                    if content_chars == 0
+                        && no_assistant_content_limit > 0
+                        && no_assistant_content_eval_count > no_assistant_content_limit
+                    {
+                        trace.event(
+                            "llm.no_content_stream.hard_failed",
+                            serde_json::json!({
+                                "turn": turn,
+                                "llm_call_depth": depth,
+                                "observed_output_tokens_without_assistant_content": no_assistant_content_eval_count,
+                                "expected_output_tokens": expected_output_tokens,
+                                "multiplier": NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER,
+                                "limit": no_assistant_content_limit,
+                                "content_chars": content_chars,
+                                "tool_call_progress_frame_count": tool_call_progress_frame_count,
+                                "stream_progress_frame_count": stream_progress_frame_count,
+                            }),
+                        )?;
+                        anyhow::bail!(
+                            "no assistant content after {no_assistant_content_eval_count} observed output tokens; expected output budget was {expected_output_tokens}"
+                        );
                     }
                 }
                 Err(error) => {
@@ -1052,6 +1085,11 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     "message_count_after_append": current_messages.len(),
                 }),
             )?;
+            if let Some(decision) = inspection_loop_tracker.observe(turn, depth, call, &tool_result)
+            {
+                trace.event("agent.inspection_loop.hard_failed", &decision)?;
+                anyhow::bail!("{}", inspection_loop_failure_summary(&decision));
+            }
         }
         compact_retained_tool_results(
             &mut current_messages,
@@ -1206,6 +1244,51 @@ struct ToolCallRunResult {
     ok: bool,
     content: String,
     duration_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InspectionLoopDecision {
+    signature: String,
+    repeated_count: usize,
+    limit: usize,
+    turn: usize,
+    llm_call_depth: usize,
+}
+
+#[derive(Debug, Default)]
+struct InspectionLoopTracker {
+    meaningful_action_seen: bool,
+    signatures: BTreeMap<String, usize>,
+}
+
+impl InspectionLoopTracker {
+    fn observe(
+        &mut self,
+        turn: usize,
+        llm_call_depth: usize,
+        call: &LlmToolCall,
+        result: &ToolCallRunResult,
+    ) -> Option<InspectionLoopDecision> {
+        if self.meaningful_action_seen {
+            return None;
+        }
+        if is_meaningful_source_edit(call, result) || is_validation_probe_result(result) {
+            self.meaningful_action_seen = true;
+            self.signatures.clear();
+            return None;
+        }
+
+        let signature = inspection_signature(call)?;
+        let count = self.signatures.entry(signature.clone()).or_insert(0);
+        *count += 1;
+        (*count >= MAX_PRE_VALIDATION_REPEATED_INSPECTIONS).then_some(InspectionLoopDecision {
+            signature,
+            repeated_count: *count,
+            limit: MAX_PRE_VALIDATION_REPEATED_INSPECTIONS,
+            turn,
+            llm_call_depth,
+        })
+    }
 }
 
 struct ContextAssemblyInput<'a> {
@@ -1892,6 +1975,111 @@ async fn run_tool_call(
     }
 }
 
+fn inspection_loop_failure_summary(decision: &InspectionLoopDecision) -> String {
+    format!(
+        "pre-validation inspection loop detected: {} repeated {} times before a source edit or validation probe",
+        decision.signature, decision.repeated_count
+    )
+}
+
+fn inspection_signature(call: &LlmToolCall) -> Option<String> {
+    match call.name.as_str() {
+        "read_file" => {
+            let path = call.arguments.get("path")?.as_str()?.trim();
+            let line_start = call
+                .arguments
+                .get("line_start")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "*".to_string());
+            let line_end = call
+                .arguments
+                .get("line_end")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "*".to_string());
+            Some(format!("read_file:{path}:{line_start}-{line_end}"))
+        }
+        "shell_command" => {
+            let command = call.arguments.get("command")?.as_str()?;
+            is_inspection_shell_command(command)
+                .then(|| format!("shell_command:{}", normalize_shell_command(command)))
+        }
+        _ => None,
+    }
+}
+
+fn is_meaningful_source_edit(call: &LlmToolCall, result: &ToolCallRunResult) -> bool {
+    if !result.ok {
+        return false;
+    }
+    match call.name.as_str() {
+        "patch_file" => true,
+        "write_file" => call
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(path_requires_validation_after_write),
+        _ => false,
+    }
+}
+
+fn is_validation_probe_result(result: &ToolCallRunResult) -> bool {
+    serde_json::from_str::<serde_json::Value>(&result.content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("validation_probe")
+                .and_then(serde_json::Value::as_bool)
+        })
+        == Some(true)
+}
+
+fn is_inspection_shell_command(command: &str) -> bool {
+    let trimmed = command.trim().to_ascii_lowercase();
+    if trimmed.is_empty() || trimmed.contains("cargo ") || trimmed.contains("npm ") {
+        return false;
+    }
+    [
+        "cat ", "sed ", "head ", "tail ", "rg ", "grep ", "find ", "ls ", "wc ", "pwd",
+    ]
+    .iter()
+    .any(|prefix| trimmed == prefix.trim() || trimmed.starts_with(prefix))
+}
+
+fn normalize_shell_command(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn path_requires_validation_after_write(path: &str) -> bool {
+    let path = Path::new(path);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        file_name.as_str(),
+        ".gitignore"
+            | ".ignore"
+            | "readme"
+            | "license"
+            | "licence"
+            | "changelog"
+            | "contributors"
+            | "authors"
+    ) {
+        return false;
+    }
+    !matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("md" | "markdown" | "txt" | "rst" | "adoc")
+    )
+}
+
 fn limit_preview(content: &str, max_chars: usize) -> String {
     content.chars().take(max_chars).collect()
 }
@@ -2531,6 +2719,98 @@ mod tests {
         assert!(content.contains("\"automatic_interrupt\":true"));
     }
 
+    #[tokio::test]
+    async fn stream_response_hard_stops_repeated_pre_validation_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let trace = Arc::new(TraceRecorder::create(&temp.path().join("traces")).unwrap());
+        let scope = ToolScope::new(workspace, Arc::clone(&trace)).unwrap();
+        let tools = coding_tools(&scope);
+        let read_args = HashMap::from([
+            ("path".to_string(), json!("src/lib.rs")),
+            ("line_start".to_string(), json!(1)),
+            ("line_end".to_string(), json!(20)),
+        ]);
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk("read_file", read_args.clone())],
+            vec![tool_call_chunk("read_file", read_args.clone())],
+            vec![tool_call_chunk("read_file", read_args.clone())],
+            vec![tool_call_chunk("read_file", read_args)],
+        ]);
+
+        let error = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &tools,
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 10,
+                ..Default::default()
+            },
+            context_window_tokens: Some(8_000),
+            packet_type: "multi-file-patch",
+            expected_output_tokens: 4_096,
+            transcript_policy: TranscriptPolicy::SummarizedTranscript,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("pre-validation inspection loop detected")
+        );
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"agent.inspection_loop.hard_failed\""));
+        assert!(content.contains("read_file:src/lib.rs:1-20"));
+    }
+
+    #[tokio::test]
+    async fn stream_response_hard_stops_no_content_stream_runaway() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let gateway = ScriptedGateway::new(vec![vec![StreamChunk::Metrics(stream_metrics(
+            (NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER + 1) as u64,
+        ))]]);
+
+        let error = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &[],
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 1,
+                ..Default::default()
+            },
+            context_window_tokens: Some(8_000),
+            packet_type: "multi-file-patch",
+            expected_output_tokens: 1,
+            transcript_policy: TranscriptPolicy::FullTranscript,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no assistant content"));
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"llm.no_content_stream.hard_failed\""));
+    }
+
     #[test]
     fn parses_ollama_gpu_residency() {
         let parsed = parse_ollama_ps(
@@ -3061,6 +3341,19 @@ mod tests {
             id: Some(format!("call-{name}")),
             name: name.to_string(),
             arguments,
+        }
+    }
+
+    fn stream_metrics(eval_count: u64) -> StreamMetrics {
+        StreamMetrics {
+            provider: "test".to_string(),
+            total_duration_ns: None,
+            load_duration_ns: None,
+            prompt_eval_count: None,
+            prompt_eval_duration_ns: None,
+            eval_count: Some(eval_count),
+            eval_duration_ns: Some(1_000_000_000),
+            tokens_per_second: Some(eval_count as f64),
         }
     }
 
