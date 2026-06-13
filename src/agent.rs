@@ -28,6 +28,8 @@ const MACMON_SAMPLE_TIMEOUT_SECONDS: u64 = 5;
 const STALLED_CONFIRMATION_CHECKS: usize = 2;
 const RETAIN_RAW_TOOL_RESULT_RECENT_COUNT: usize = 4;
 const RETAIN_RAW_TOOL_RESULT_MAX_CHARS: usize = 6_000;
+const REPAIR_HANDOFF_RAW_TOOL_RESULT_RECENT_COUNT: usize = 2;
+const REPAIR_HANDOFF_RAW_TOOL_RESULT_MAX_CHARS: usize = 3_000;
 const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
 const MAX_REPAIR_NO_ACTION_TURNS: usize = 2;
 const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
@@ -69,6 +71,7 @@ pub enum TranscriptPolicy {
     FullTranscript,
     #[default]
     SummarizedTranscript,
+    SummarizedRepairHandoff,
     ValidationRepairPacket,
 }
 
@@ -77,6 +80,9 @@ impl TranscriptPolicy {
         match value {
             "full-transcript" | "full" => Some(Self::FullTranscript),
             "summarized-transcript" | "summarized" | "summary" => Some(Self::SummarizedTranscript),
+            "summarized-repair-handoff" | "repair-handoff" | "summarized-handoff" => {
+                Some(Self::SummarizedRepairHandoff)
+            }
             "validation-repair-packet" | "validation-repair" | "repair-packet" => {
                 Some(Self::ValidationRepairPacket)
             }
@@ -88,6 +94,9 @@ impl TranscriptPolicy {
         match self {
             Self::FullTranscript => "append_full_tool_transcript",
             Self::SummarizedTranscript => "append_summarized_tool_transcript",
+            Self::SummarizedRepairHandoff => {
+                "append_summarized_tool_transcript_with_red_repair_handoff"
+            }
             Self::ValidationRepairPacket => "append_validation_repair_packet",
         }
     }
@@ -106,10 +115,16 @@ impl TranscriptPolicy {
                 max_raw_tool_result_chars: RETAIN_RAW_TOOL_RESULT_MAX_CHARS,
                 preserve_latest_failed_validation: false,
             },
+            Self::SummarizedRepairHandoff => ToolResultCompaction {
+                enabled: true,
+                raw_recent_count: RETAIN_RAW_TOOL_RESULT_RECENT_COUNT,
+                max_raw_tool_result_chars: RETAIN_RAW_TOOL_RESULT_MAX_CHARS,
+                preserve_latest_failed_validation: false,
+            },
             Self::ValidationRepairPacket => ToolResultCompaction {
                 enabled: true,
-                raw_recent_count: 2,
-                max_raw_tool_result_chars: 3_000,
+                raw_recent_count: REPAIR_HANDOFF_RAW_TOOL_RESULT_RECENT_COUNT,
+                max_raw_tool_result_chars: REPAIR_HANDOFF_RAW_TOOL_RESULT_MAX_CHARS,
                 preserve_latest_failed_validation: true,
             },
         }
@@ -1096,10 +1111,12 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         }
         compact_retained_tool_results(
             &mut current_messages,
+            tools,
             trace,
             turn,
             depth,
             transcript_policy,
+            context_window_tokens,
         )?;
     }
 
@@ -1418,23 +1435,51 @@ fn trace_model_progress_status(input: ModelProgressStatusInput<'_>) -> Result<()
 
 fn compact_retained_tool_results(
     messages: &mut [LlmMessage],
+    tools: &[Box<dyn LlmTool>],
     trace: &TraceRecorder,
     turn: usize,
     llm_call_depth: usize,
     transcript_policy: TranscriptPolicy,
+    context_window_tokens: Option<usize>,
 ) -> Result<()> {
-    let compaction = transcript_policy.compaction();
-    if !compaction.enabled {
-        return Ok(());
-    }
     let retained_tool_indices = messages
         .iter()
         .enumerate()
         .filter_map(|(index, message)| (message.role == MessageRole::Tool).then_some(index))
         .collect::<Vec<_>>();
+    let latest_failed_validation_index =
+        latest_failed_validation_tool_index(messages, &retained_tool_indices);
+    let effective = effective_tool_result_compaction(
+        transcript_policy,
+        messages,
+        tools,
+        context_window_tokens,
+        latest_failed_validation_index,
+    );
+    let compaction = effective.compaction;
+    if !compaction.enabled {
+        return Ok(());
+    }
+    if effective.repair_handoff_active {
+        trace.event(
+            "llm.context_assembly.validation_repair_handoff",
+            serde_json::json!({
+                "turn": turn,
+                "llm_call_depth": llm_call_depth,
+                "transcript_policy": transcript_policy,
+                "effective_assembly_policy": "append_validation_repair_packet",
+                "estimated_tokens_before_compaction": effective.estimated_tokens_before_compaction,
+                "utilization_before_compaction": effective.utilization_before_compaction,
+                "pressure_band_before_compaction": effective.pressure_band_before_compaction,
+                "latest_failed_validation_index": latest_failed_validation_index,
+                "raw_recent_tool_results_retained": compaction.raw_recent_count,
+                "max_raw_tool_result_chars": compaction.max_raw_tool_result_chars,
+            }),
+        )?;
+    }
     let latest_failed_validation_index = compaction
         .preserve_latest_failed_validation
-        .then(|| latest_failed_validation_tool_index(messages, &retained_tool_indices))
+        .then_some(latest_failed_validation_index)
         .flatten();
     let retain_raw_from = retained_tool_indices
         .len()
@@ -1489,6 +1534,7 @@ fn compact_retained_tool_results(
                 "retained_chars": retained_chars,
                 "retained_estimated_tokens": estimate_tokens(retained_chars),
                 "transcript_policy": transcript_policy,
+                "effective_repair_handoff": effective.repair_handoff_active,
                 "raw_recent_tool_results_retained": compaction.raw_recent_count,
                 "max_raw_tool_result_chars": compaction.max_raw_tool_result_chars,
                 "preserved_latest_failed_validation_index": latest_failed_validation_index,
@@ -1497,6 +1543,50 @@ fn compact_retained_tool_results(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EffectiveToolResultCompaction {
+    compaction: ToolResultCompaction,
+    repair_handoff_active: bool,
+    estimated_tokens_before_compaction: usize,
+    utilization_before_compaction: Option<f64>,
+    pressure_band_before_compaction: &'static str,
+}
+
+fn effective_tool_result_compaction(
+    transcript_policy: TranscriptPolicy,
+    messages: &[LlmMessage],
+    tools: &[Box<dyn LlmTool>],
+    context_window_tokens: Option<usize>,
+    latest_failed_validation_index: Option<usize>,
+) -> EffectiveToolResultCompaction {
+    let estimated_tokens_before_compaction = estimate_prompt_tokens(messages, tools);
+    let utilization_before_compaction = context_window_tokens
+        .filter(|tokens| *tokens > 0)
+        .map(|tokens| estimated_tokens_before_compaction as f64 / tokens as f64);
+    let pressure_band_before_compaction = pressure_band(utilization_before_compaction);
+    let repair_handoff_active = transcript_policy == TranscriptPolicy::SummarizedRepairHandoff
+        && latest_failed_validation_index.is_some()
+        && pressure_band_before_compaction == "red";
+    let compaction = if repair_handoff_active {
+        ToolResultCompaction {
+            enabled: true,
+            raw_recent_count: REPAIR_HANDOFF_RAW_TOOL_RESULT_RECENT_COUNT,
+            max_raw_tool_result_chars: REPAIR_HANDOFF_RAW_TOOL_RESULT_MAX_CHARS,
+            preserve_latest_failed_validation: true,
+        }
+    } else {
+        transcript_policy.compaction()
+    };
+
+    EffectiveToolResultCompaction {
+        compaction,
+        repair_handoff_active,
+        estimated_tokens_before_compaction,
+        utilization_before_compaction,
+        pressure_band_before_compaction,
+    }
 }
 
 fn latest_failed_validation_tool_index(
@@ -1938,6 +2028,19 @@ fn message_chars(message: &LlmMessage) -> usize {
             .as_ref()
             .map(|calls| serde_json::to_string(calls).unwrap_or_default().len())
             .unwrap_or_default()
+}
+
+fn estimate_prompt_tokens(messages: &[LlmMessage], tools: &[Box<dyn LlmTool>]) -> usize {
+    let message_chars = messages.iter().map(message_chars).sum::<usize>();
+    let tool_descriptor_chars = tools
+        .iter()
+        .map(|tool| {
+            serde_json::to_string(&tool.descriptor())
+                .unwrap_or_default()
+                .len()
+        })
+        .sum::<usize>();
+    estimate_tokens(message_chars + tool_descriptor_chars)
 }
 
 async fn run_tool_call(
@@ -2427,10 +2530,12 @@ mod tests {
 
         compact_retained_tool_results(
             &mut messages,
+            &[],
             &trace,
             1,
             2,
             TranscriptPolicy::SummarizedTranscript,
+            Some(1_000),
         )
         .unwrap();
 
@@ -2497,10 +2602,12 @@ mod tests {
 
         compact_retained_tool_results(
             &mut messages,
+            &[],
             &trace,
             1,
             2,
             TranscriptPolicy::FullTranscript,
+            Some(1_000),
         )
         .unwrap();
 
@@ -2560,10 +2667,12 @@ mod tests {
 
         compact_retained_tool_results(
             &mut messages,
+            &[],
             &trace,
             1,
             2,
             TranscriptPolicy::ValidationRepairPacket,
+            Some(1_000),
         )
         .unwrap();
 
@@ -2581,6 +2690,75 @@ mod tests {
                 .unwrap()
                 .contains("\"validation_probe\":true")
         );
+    }
+
+    #[test]
+    fn summarized_repair_handoff_uses_repair_packet_compaction_only_under_red_pressure() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let failed_validation = serde_json::json!({
+            "validation_probe": true,
+            "success": false,
+            "repair_required": { "command": "cargo test" },
+            "stdout": "failure".repeat(2_000)
+        })
+        .to_string();
+        let mut messages = vec![LlmMessage::system("system"), LlmMessage::user("task")];
+        for index in 0..=RETAIN_RAW_TOOL_RESULT_RECENT_COUNT {
+            messages.push(LlmMessage {
+                role: MessageRole::Tool,
+                content: Some(format!("old-read-{index}").repeat(1_200)),
+                tool_calls: Some(vec![LlmToolCall {
+                    id: Some(format!("call-{index}")),
+                    name: "read_file".to_string(),
+                    arguments: HashMap::new(),
+                }]),
+                image_paths: None,
+            });
+        }
+        messages.push(LlmMessage {
+            role: MessageRole::Tool,
+            content: Some(failed_validation),
+            tool_calls: Some(vec![LlmToolCall {
+                id: Some("validation-call".to_string()),
+                name: "shell_command".to_string(),
+                arguments: HashMap::new(),
+            }]),
+            image_paths: None,
+        });
+
+        compact_retained_tool_results(
+            &mut messages,
+            &[],
+            &trace,
+            4,
+            8,
+            TranscriptPolicy::SummarizedRepairHandoff,
+            Some(1_000),
+        )
+        .unwrap();
+
+        let raw_tool_count = messages
+            .iter()
+            .filter(|message| {
+                message.role == MessageRole::Tool
+                    && !message
+                        .content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .starts_with(TOOL_RESULT_SUMMARY_PREFIX)
+            })
+            .count();
+        assert_eq!(raw_tool_count, REPAIR_HANDOFF_RAW_TOOL_RESULT_RECENT_COUNT);
+        assert!(
+            messages
+                .last()
+                .and_then(|message| message.content.as_deref())
+                .is_some_and(|content| content.contains("\"validation_probe\":true"))
+        );
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"llm.context_assembly.validation_repair_handoff\""));
+        assert!(content.contains("\"effective_repair_handoff\":true"));
     }
 
     #[test]

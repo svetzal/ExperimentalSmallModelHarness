@@ -82,7 +82,8 @@ pub async fn run() -> Result<()> {
                 TranscriptPolicy::parse(&transcript_policy).ok_or_else(|| {
                     anyhow::anyhow!(
                         "invalid transcript policy {transcript_policy:?}; expected one of \
-                         full-transcript, summarized-transcript, validation-repair-packet"
+                         full-transcript, summarized-transcript, summarized-repair-handoff, \
+                         validation-repair-packet"
                     )
                 })?;
             let expected_output_tokens = expected_output_tokens
