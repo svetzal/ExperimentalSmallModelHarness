@@ -1,4 +1,6 @@
-use crate::agent::{AgentRunConfig, default_expected_output_tokens, run_coding_agent};
+use crate::agent::{
+    AgentRunConfig, TranscriptPolicy, default_expected_output_tokens, run_coding_agent,
+};
 use crate::trace_analysis::analyze_trace;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -48,6 +50,10 @@ enum Command {
         /// Override the packet output-token budget.
         #[arg(long)]
         expected_output_tokens: Option<usize>,
+
+        /// Transcript retention policy for model/tool context.
+        #[arg(long, default_value = "summarized-transcript")]
+        transcript_policy: String,
     },
 
     /// Summarize context assembly and tool payload pressure from trace JSONL files.
@@ -70,7 +76,15 @@ pub async fn run() -> Result<()> {
             context_window_tokens,
             packet_type,
             expected_output_tokens,
+            transcript_policy,
         } => {
+            let transcript_policy =
+                TranscriptPolicy::parse(&transcript_policy).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid transcript policy {transcript_policy:?}; expected one of \
+                         full-transcript, summarized-transcript, validation-repair-packet"
+                    )
+                })?;
             let expected_output_tokens = expected_output_tokens
                 .unwrap_or_else(|| default_expected_output_tokens(&packet_type));
             let summary = run_coding_agent(AgentRunConfig {
@@ -82,6 +96,7 @@ pub async fn run() -> Result<()> {
                 context_window_tokens,
                 packet_type,
                 expected_output_tokens,
+                transcript_policy,
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);

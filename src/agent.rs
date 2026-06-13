@@ -17,7 +17,6 @@ use tokio::process::Command;
 use tokio::time::MissedTickBehavior;
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
-const ASSEMBLY_POLICY: &str = "append_summarized_tool_transcript";
 const CONTEXT_INSTRUMENTATION_VERSION: &str = "generation4.context_ledger.v1";
 const DEFAULT_THROUGHPUT_TPS: f64 = 1.0;
 const MODEL_PROGRESS_WARMUP_SECONDS: f64 = 60.0;
@@ -43,6 +42,7 @@ pub struct AgentRunConfig {
     pub context_window_tokens: Option<usize>,
     pub packet_type: String,
     pub expected_output_tokens: usize,
+    pub transcript_policy: TranscriptPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,7 +57,69 @@ pub struct AgentRunSummary {
     pub context_window_tokens: Option<usize>,
     pub packet_type: String,
     pub expected_output_tokens: usize,
+    pub transcript_policy: TranscriptPolicy,
     pub final_summary: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TranscriptPolicy {
+    FullTranscript,
+    #[default]
+    SummarizedTranscript,
+    ValidationRepairPacket,
+}
+
+impl TranscriptPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "full-transcript" | "full" => Some(Self::FullTranscript),
+            "summarized-transcript" | "summarized" | "summary" => Some(Self::SummarizedTranscript),
+            "validation-repair-packet" | "validation-repair" | "repair-packet" => {
+                Some(Self::ValidationRepairPacket)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullTranscript => "append_full_tool_transcript",
+            Self::SummarizedTranscript => "append_summarized_tool_transcript",
+            Self::ValidationRepairPacket => "append_validation_repair_packet",
+        }
+    }
+
+    fn compaction(self) -> ToolResultCompaction {
+        match self {
+            Self::FullTranscript => ToolResultCompaction {
+                enabled: false,
+                raw_recent_count: usize::MAX,
+                max_raw_tool_result_chars: usize::MAX,
+                preserve_latest_failed_validation: false,
+            },
+            Self::SummarizedTranscript => ToolResultCompaction {
+                enabled: true,
+                raw_recent_count: RETAIN_RAW_TOOL_RESULT_RECENT_COUNT,
+                max_raw_tool_result_chars: RETAIN_RAW_TOOL_RESULT_MAX_CHARS,
+                preserve_latest_failed_validation: false,
+            },
+            Self::ValidationRepairPacket => ToolResultCompaction {
+                enabled: true,
+                raw_recent_count: 2,
+                max_raw_tool_result_chars: 3_000,
+                preserve_latest_failed_validation: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ToolResultCompaction {
+    enabled: bool,
+    raw_recent_count: usize,
+    max_raw_tool_result_chars: usize,
+    preserve_latest_failed_validation: bool,
 }
 
 pub fn default_expected_output_tokens(packet_type: &str) -> usize {
@@ -110,7 +172,8 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             "context_window_tokens": config.context_window_tokens,
             "packet_type": config.packet_type,
             "expected_output_tokens": config.expected_output_tokens,
-            "assembly_policy": ASSEMBLY_POLICY,
+            "assembly_policy": config.transcript_policy.as_str(),
+            "transcript_policy": config.transcript_policy,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
             "harness_package_version": env!("CARGO_PKG_VERSION"),
             "harness_source_state": harness_source_state(),
@@ -151,6 +214,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 &tools,
                 &policy_before_turn,
                 config.context_window_tokens,
+                config.transcript_policy,
             ),
         )?;
         trace.event(
@@ -169,6 +233,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             context_window_tokens: config.context_window_tokens,
             packet_type: &config.packet_type,
             expected_output_tokens: config.expected_output_tokens,
+            transcript_policy: config.transcript_policy,
             throughput_registry_path: experiment_dir.join("model-throughput.jsonl"),
             progress_projection_override: None,
             progress_status_interval_override: None,
@@ -364,6 +429,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         context_window_tokens: config.context_window_tokens,
         packet_type: config.packet_type,
         expected_output_tokens: config.expected_output_tokens,
+        transcript_policy: config.transcript_policy,
         final_summary,
     };
     trace.event("run.finished", &summary)?;
@@ -501,6 +567,7 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     context_window_tokens: Option<usize>,
     packet_type: &'a str,
     expected_output_tokens: usize,
+    transcript_policy: TranscriptPolicy,
     throughput_registry_path: PathBuf,
     progress_projection_override: Option<ModelProgressProjection>,
     progress_status_interval_override: Option<Duration>,
@@ -607,6 +674,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         context_window_tokens,
         packet_type,
         expected_output_tokens,
+        transcript_policy,
         throughput_registry_path,
         progress_projection_override,
         progress_status_interval_override,
@@ -649,6 +717,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             completion_config: &completion_config,
             context_window_tokens,
             previous_call_total_chars,
+            transcript_policy,
         });
         previous_call_total_chars = ledger.total_chars();
         trace.event("llm.context_assembly.ledger", &ledger)?;
@@ -984,7 +1053,13 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 }),
             )?;
         }
-        compact_retained_tool_results(&mut current_messages, trace, turn, depth)?;
+        compact_retained_tool_results(
+            &mut current_messages,
+            trace,
+            turn,
+            depth,
+            transcript_policy,
+        )?;
     }
 
     unreachable!("tool iteration loop always returns or errors before exhaustion")
@@ -1011,6 +1086,7 @@ struct ContextAssemblyLedger {
     completion_temperature: f32,
     max_tool_iterations: usize,
     assembly_policy: &'static str,
+    transcript_policy: TranscriptPolicy,
 }
 
 impl ContextAssemblyLedger {
@@ -1141,6 +1217,7 @@ struct ContextAssemblyInput<'a> {
     completion_config: &'a CompletionConfig,
     context_window_tokens: Option<usize>,
     previous_call_total_chars: Option<usize>,
+    transcript_policy: TranscriptPolicy,
 }
 
 fn context_assembly_ledger(input: ContextAssemblyInput<'_>) -> ContextAssemblyLedger {
@@ -1198,7 +1275,8 @@ fn context_assembly_ledger(input: ContextAssemblyInput<'_>) -> ContextAssemblyLe
         delta_chars_from_previous_call,
         completion_temperature: input.completion_config.temperature,
         max_tool_iterations: input.completion_config.max_tool_iterations,
-        assembly_policy: ASSEMBLY_POLICY,
+        assembly_policy: input.transcript_policy.as_str(),
+        transcript_policy: input.transcript_policy,
     }
 }
 
@@ -1257,25 +1335,37 @@ fn compact_retained_tool_results(
     trace: &TraceRecorder,
     turn: usize,
     llm_call_depth: usize,
+    transcript_policy: TranscriptPolicy,
 ) -> Result<()> {
+    let compaction = transcript_policy.compaction();
+    if !compaction.enabled {
+        return Ok(());
+    }
     let retained_tool_indices = messages
         .iter()
         .enumerate()
         .filter_map(|(index, message)| (message.role == MessageRole::Tool).then_some(index))
         .collect::<Vec<_>>();
+    let latest_failed_validation_index = compaction
+        .preserve_latest_failed_validation
+        .then(|| latest_failed_validation_tool_index(messages, &retained_tool_indices))
+        .flatten();
     let retain_raw_from = retained_tool_indices
         .len()
-        .saturating_sub(RETAIN_RAW_TOOL_RESULT_RECENT_COUNT);
+        .saturating_sub(compaction.raw_recent_count);
 
     for (ordinal, message_index) in retained_tool_indices.into_iter().enumerate() {
         if ordinal >= retain_raw_from {
+            continue;
+        }
+        if Some(message_index) == latest_failed_validation_index {
             continue;
         }
         let message = &mut messages[message_index];
         let Some(content) = message.content.as_ref() else {
             continue;
         };
-        if content.len() <= RETAIN_RAW_TOOL_RESULT_MAX_CHARS
+        if content.len() <= compaction.max_raw_tool_result_chars
             || content.starts_with(TOOL_RESULT_SUMMARY_PREFIX)
         {
             continue;
@@ -1312,13 +1402,33 @@ fn compact_retained_tool_results(
                 "original_estimated_tokens": original_estimated_tokens,
                 "retained_chars": retained_chars,
                 "retained_estimated_tokens": estimate_tokens(retained_chars),
-                "raw_recent_tool_results_retained": RETAIN_RAW_TOOL_RESULT_RECENT_COUNT,
-                "max_raw_tool_result_chars": RETAIN_RAW_TOOL_RESULT_MAX_CHARS,
+                "transcript_policy": transcript_policy,
+                "raw_recent_tool_results_retained": compaction.raw_recent_count,
+                "max_raw_tool_result_chars": compaction.max_raw_tool_result_chars,
+                "preserved_latest_failed_validation_index": latest_failed_validation_index,
             }),
         )?;
     }
 
     Ok(())
+}
+
+fn latest_failed_validation_tool_index(
+    messages: &[LlmMessage],
+    retained_tool_indices: &[usize],
+) -> Option<usize> {
+    retained_tool_indices.iter().rev().copied().find(|index| {
+        messages[*index]
+            .content
+            .as_deref()
+            .is_some_and(is_failed_validation_tool_result)
+    })
+}
+
+fn is_failed_validation_tool_result(content: &str) -> bool {
+    content.contains("\"validation_probe\":true")
+        && content.contains("\"success\":false")
+        && content.contains("\"repair_required\"")
 }
 
 fn classify_model_progress(
@@ -1791,6 +1901,7 @@ fn context_snapshot(
     tools: &[Box<dyn LlmTool>],
     policy: &ToolPolicySnapshot,
     context_window_tokens: Option<usize>,
+    transcript_policy: TranscriptPolicy,
 ) -> serde_json::Value {
     let message_chars: usize = messages
         .iter()
@@ -1838,6 +1949,8 @@ fn context_snapshot(
         "max_tool_result_estimated_tokens": policy.max_tool_result_estimated_tokens,
         "max_tool_result_kind": policy.max_tool_result_kind,
         "tool_result_chars_by_kind": policy.tool_result_chars_by_kind,
+        "transcript_policy": transcript_policy,
+        "assembly_policy": transcript_policy.as_str(),
         "inferred_effective_chars": inferred_effective_chars,
         "inferred_effective_tokens": inferred_effective_tokens,
         "inferred_effective_utilization": inferred_effective_utilization,
@@ -2026,6 +2139,7 @@ mod tests {
             &[],
             &policy,
             Some(8_000),
+            TranscriptPolicy::SummarizedTranscript,
         );
 
         assert_eq!(snapshot["cumulative_tool_result_chars"], 4_000);
@@ -2080,6 +2194,7 @@ mod tests {
             completion_config: &config,
             context_window_tokens: Some(100),
             previous_call_total_chars: Some(10),
+            transcript_policy: TranscriptPolicy::SummarizedTranscript,
         });
 
         assert_eq!(ledger.turn, 3);
@@ -2119,7 +2234,14 @@ mod tests {
             });
         }
 
-        compact_retained_tool_results(&mut messages, &trace, 1, 2).unwrap();
+        compact_retained_tool_results(
+            &mut messages,
+            &trace,
+            1,
+            2,
+            TranscriptPolicy::SummarizedTranscript,
+        )
+        .unwrap();
 
         let first_tool = messages
             .iter()
@@ -2153,6 +2275,7 @@ mod tests {
             completion_config: &CompletionConfig::default(),
             context_window_tokens: Some(1_000),
             previous_call_total_chars: None,
+            transcript_policy: TranscriptPolicy::SummarizedTranscript,
         });
         assert!(
             ledger
@@ -2163,6 +2286,110 @@ mod tests {
         let content = std::fs::read_to_string(trace.path()).unwrap();
         assert!(content.contains("\"kind\":\"llm.context_assembly.tool_result_compacted\""));
         assert!(content.contains("\"tool_name\":\"read_file\""));
+    }
+
+    #[test]
+    fn full_transcript_policy_keeps_large_tool_results_raw() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let mut messages = vec![LlmMessage::system("system"), LlmMessage::user("task")];
+        messages.push(LlmMessage {
+            role: MessageRole::Tool,
+            content: Some("x".repeat(RETAIN_RAW_TOOL_RESULT_MAX_CHARS + 100)),
+            tool_calls: Some(vec![LlmToolCall {
+                id: Some("call-1".to_string()),
+                name: "read_file".to_string(),
+                arguments: HashMap::new(),
+            }]),
+            image_paths: None,
+        });
+
+        compact_retained_tool_results(
+            &mut messages,
+            &trace,
+            1,
+            2,
+            TranscriptPolicy::FullTranscript,
+        )
+        .unwrap();
+
+        assert!(
+            !messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with(TOOL_RESULT_SUMMARY_PREFIX)
+        );
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(!content.contains("llm.context_assembly.tool_result_compacted"));
+    }
+
+    #[test]
+    fn validation_repair_packet_preserves_latest_failed_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let mut messages = vec![LlmMessage::system("system"), LlmMessage::user("task")];
+        messages.push(LlmMessage {
+            role: MessageRole::Tool,
+            content: Some("old-read".repeat(1_000)),
+            tool_calls: Some(vec![LlmToolCall {
+                id: Some("call-1".to_string()),
+                name: "read_file".to_string(),
+                arguments: HashMap::new(),
+            }]),
+            image_paths: None,
+        });
+        let failed_validation = serde_json::json!({
+            "validation_probe": true,
+            "success": false,
+            "repair_required": { "command": "cargo test" },
+            "stdout": "failure".repeat(1_000)
+        })
+        .to_string();
+        messages.push(LlmMessage {
+            role: MessageRole::Tool,
+            content: Some(failed_validation),
+            tool_calls: Some(vec![LlmToolCall {
+                id: Some("call-2".to_string()),
+                name: "shell_command".to_string(),
+                arguments: HashMap::new(),
+            }]),
+            image_paths: None,
+        });
+        messages.push(LlmMessage {
+            role: MessageRole::Tool,
+            content: Some("latest-small".to_string()),
+            tool_calls: Some(vec![LlmToolCall {
+                id: Some("call-3".to_string()),
+                name: "read_file".to_string(),
+                arguments: HashMap::new(),
+            }]),
+            image_paths: None,
+        });
+
+        compact_retained_tool_results(
+            &mut messages,
+            &trace,
+            1,
+            2,
+            TranscriptPolicy::ValidationRepairPacket,
+        )
+        .unwrap();
+
+        assert!(
+            messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with(TOOL_RESULT_SUMMARY_PREFIX)
+        );
+        assert!(
+            messages[3]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("\"validation_probe\":true")
+        );
     }
 
     #[test]
@@ -2272,6 +2499,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "diagnosis-only",
             expected_output_tokens: 1,
+            transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: Some(ModelProgressProjection {
                 conservative_tokens_per_second: 1000.0,
@@ -2355,6 +2583,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "narrow-patch",
             expected_output_tokens: 2_048,
+            transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: None,
             progress_status_interval_override: None,
@@ -2408,6 +2637,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "narrow-patch",
             expected_output_tokens: 2_048,
+            transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: None,
             progress_status_interval_override: None,
@@ -2452,6 +2682,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "narrow-patch",
             expected_output_tokens: 2_048,
+            transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: None,
             progress_status_interval_override: None,
@@ -2641,6 +2872,7 @@ mod tests {
             context_window_tokens: Some(131_072),
             packet_type: "multi-file-patch".to_string(),
             expected_output_tokens: 4_096,
+            transcript_policy: TranscriptPolicy::SummarizedTranscript,
         };
         let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
 
@@ -2810,6 +3042,7 @@ mod tests {
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
+                    transcript_policy: TranscriptPolicy::SummarizedTranscript,
                 },
                 gateway,
                 self.workspace.clone(),

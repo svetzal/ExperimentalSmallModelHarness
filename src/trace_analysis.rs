@@ -12,6 +12,7 @@ pub struct TraceAnalysis {
     pub goal_file: Option<String>,
     pub tool_root: Option<String>,
     pub assembly_policy: Option<String>,
+    pub transcript_policy: Option<String>,
     pub context_window_tokens: Option<usize>,
     pub max_tool_iterations: Option<usize>,
     pub packet_type: Option<String>,
@@ -116,6 +117,7 @@ fn apply_run_started(analysis: &mut TraceAnalysis, payload: &Value) {
     analysis.context_window_tokens = value_usize(payload, "context_window_tokens");
     analysis.max_tool_iterations = value_usize(payload, "max_tool_iterations");
     analysis.assembly_policy = value_string(payload, "assembly_policy");
+    analysis.transcript_policy = value_string(payload, "transcript_policy");
     analysis.packet_type = value_string(payload, "packet_type");
     analysis.expected_output_tokens = value_usize(payload, "expected_output_tokens");
 }
@@ -153,6 +155,9 @@ fn apply_context_ledger(analysis: &mut TraceAnalysis, payload: &Value) {
     }
     if analysis.assembly_policy.is_none() {
         analysis.assembly_policy = value_string(payload, "assembly_policy");
+    }
+    if analysis.transcript_policy.is_none() {
+        analysis.transcript_policy = value_string(payload, "transcript_policy");
     }
 }
 
