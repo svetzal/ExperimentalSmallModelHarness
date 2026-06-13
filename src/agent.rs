@@ -219,6 +219,14 @@ pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary>
                 trace.event("agent.validation.repair_escalated", decision)?;
             }
         }
+        if let Some(decision) = &repair_no_action
+            && decision.escalation_required
+            && !is_fail_response(&response)
+        {
+            final_summary = repair_no_action_failure_summary(turn);
+            trace.event("agent.validation.repair_hard_failed", decision)?;
+            break;
+        }
         if response.trim().is_empty() {
             if policy.validation_required_after_write {
                 trace.event(
@@ -429,6 +437,10 @@ fn is_fail_response(response: &str) -> bool {
 
 fn should_prompt_validation_repair(policy: &ToolPolicySnapshot, response: &str) -> bool {
     policy.validation_repair.is_some() && !is_terminal_response(response)
+}
+
+fn repair_no_action_failure_summary(turn: usize) -> String {
+    format!("turn {turn} made no validation-repair edit or probe after validation failure")
 }
 
 fn canonicalize_goal(experiment_dir: &Path, goal_file: &Path) -> Result<PathBuf> {
@@ -2566,6 +2578,16 @@ mod tests {
 
         let after_write = repair_policy_snapshot(4, 2, Some(repair), BTreeMap::new());
         assert!(tracker.observe(8, 1, &after_second, &after_write).is_none());
+    }
+
+    #[test]
+    fn repair_no_action_failure_summary_names_hard_stop_reason() {
+        let summary = repair_no_action_failure_summary(8);
+
+        assert_eq!(
+            summary,
+            "turn 8 made no validation-repair edit or probe after validation failure"
+        );
     }
 
     fn repair_policy_snapshot(
