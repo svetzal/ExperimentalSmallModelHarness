@@ -35,6 +35,7 @@ const MAX_REPAIR_NO_ACTION_TURNS: usize = 2;
 const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
 const MAX_PRE_VALIDATION_REPEATED_INSPECTIONS: usize = 4;
 const NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER: usize = 20;
+const REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT: usize = 1_024;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -250,6 +251,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             context_window_tokens: config.context_window_tokens,
             packet_type: &config.packet_type,
             expected_output_tokens: config.expected_output_tokens,
+            validation_repair_active: policy_before_turn.validation_repair.is_some(),
             transcript_policy: config.transcript_policy,
             throughput_registry_path: experiment_dir.join("model-throughput.jsonl"),
             progress_projection_override: None,
@@ -584,6 +586,7 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     context_window_tokens: Option<usize>,
     packet_type: &'a str,
     expected_output_tokens: usize,
+    validation_repair_active: bool,
     transcript_policy: TranscriptPolicy,
     throughput_registry_path: PathBuf,
     progress_projection_override: Option<ModelProgressProjection>,
@@ -691,6 +694,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         context_window_tokens,
         packet_type,
         expected_output_tokens,
+        validation_repair_active,
         transcript_policy,
         throughput_registry_path,
         progress_projection_override,
@@ -776,6 +780,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         let mut latest_progress_state = ModelProgressState::WaitingForFirstToken;
         let mut last_observable_progress = started;
         let mut stalled_candidate_checks = 0usize;
+        let mut call_stream_progress_frame_count = 0usize;
+        let mut call_tool_call_progress_frame_count = 0usize;
         trace_model_progress_status(ModelProgressStatusInput {
             trace,
             turn,
@@ -920,8 +926,13 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
                     stream_progress_frame_count += 1;
+                    call_stream_progress_frame_count += 1;
+                    let progress_has_tool_call =
+                        progress.tool_call_count > 0 || progress.accumulated_tool_call_count > 0;
+                    let progress_has_content = progress.content_chars > 0;
                     if progress.tool_call_count > 0 || progress.accumulated_tool_call_count > 0 {
                         tool_call_progress_frame_count += 1;
+                        call_tool_call_progress_frame_count += 1;
                         latest_progress_state = ModelProgressState::GeneratingToolCall;
                     } else if progress.content_chars > 0 {
                         latest_progress_state = ModelProgressState::Generating;
@@ -938,10 +949,38 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                             "tool_call_count": progress.tool_call_count,
                             "accumulated_tool_call_count": progress.accumulated_tool_call_count,
                             "stream_progress_frame_count": stream_progress_frame_count,
+                            "call_stream_progress_frame_count": call_stream_progress_frame_count,
                             "tool_call_progress_frame_count": tool_call_progress_frame_count,
+                            "call_tool_call_progress_frame_count": call_tool_call_progress_frame_count,
                             "progress_state": if progress.done { "DoneFrame" } else { latest_progress_state.as_str() },
                         }),
                     )?;
+                    if validation_repair_active
+                        && !progress_has_content
+                        && !progress_has_tool_call
+                        && call_content.is_empty()
+                        && accumulated_tool_calls.is_empty()
+                        && call_stream_progress_frame_count
+                            >= REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT
+                    {
+                        trace.event(
+                            "agent.validation.repair_no_content_interrupted",
+                            serde_json::json!({
+                                "turn": turn,
+                                "llm_call_depth": depth,
+                                "expected_output_tokens": expected_output_tokens,
+                                "progress_frame_limit": REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT,
+                                "call_stream_progress_frame_count": call_stream_progress_frame_count,
+                                "call_tool_call_progress_frame_count": call_tool_call_progress_frame_count,
+                                "stream_progress_frame_count": stream_progress_frame_count,
+                                "tool_call_progress_frame_count": tool_call_progress_frame_count,
+                                "turn_content_chars": content_chars,
+                                "call_content_chars": call_content.len(),
+                                "validation_repair_active": validation_repair_active,
+                            }),
+                        )?;
+                        break;
+                    }
                 }
                 Ok(StreamChunk::Metrics(metrics)) => {
                     last_observable_progress = Instant::now();
@@ -1031,7 +1070,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 "content_chars": call_content.len(),
                 "content_estimated_tokens": estimate_tokens(call_content.len()),
                 "stream_progress_frame_count": stream_progress_frame_count,
+                "call_stream_progress_frame_count": call_stream_progress_frame_count,
                 "tool_call_progress_frame_count": tool_call_progress_frame_count,
+                "call_tool_call_progress_frame_count": call_tool_call_progress_frame_count,
                 "final_progress_state": latest_progress_state.as_str(),
                 "tool_call_count": accumulated_tool_calls.len(),
                 "tool_call_names": accumulated_tool_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
@@ -2868,6 +2909,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "diagnosis-only",
             expected_output_tokens: 1,
+            validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: Some(ModelProgressProjection {
@@ -2934,6 +2976,7 @@ mod tests {
             context_window_tokens: Some(8_000),
             packet_type: "multi-file-patch",
             expected_output_tokens: 4_096,
+            validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: None,
@@ -2976,6 +3019,7 @@ mod tests {
             context_window_tokens: Some(8_000),
             packet_type: "multi-file-patch",
             expected_output_tokens: 1,
+            validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: None,
@@ -2990,6 +3034,48 @@ mod tests {
         assert!(error.to_string().contains("no assistant content"));
         let content = std::fs::read_to_string(trace.path()).unwrap();
         assert!(content.contains("\"kind\":\"llm.no_content_stream.hard_failed\""));
+    }
+
+    #[tokio::test]
+    async fn stream_response_interrupts_validation_repair_no_content_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let progress_frames = (0..REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT)
+            .map(|index| StreamChunk::Progress(stream_progress(index, 0, 0, 0)))
+            .collect::<Vec<_>>();
+        let gateway = ScriptedGateway::new(vec![progress_frames]);
+
+        let result = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &[],
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 1,
+                ..Default::default()
+            },
+            context_window_tokens: Some(8_000),
+            packet_type: "multi-file-patch",
+            expected_output_tokens: 4_096,
+            validation_repair_active: true,
+            transcript_policy: TranscriptPolicy::FullTranscript,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 5,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "");
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"agent.validation.repair_no_content_interrupted\""));
+        assert!(content.contains("\"validation_repair_active\":true"));
+        assert!(content.contains("\"call_stream_progress_frame_count\":1024"));
+        assert!(!content.contains("\"kind\":\"llm.no_content_stream.hard_failed\""));
     }
 
     #[tokio::test]
@@ -3020,6 +3106,7 @@ mod tests {
             context_window_tokens: Some(8_000),
             packet_type: "multi-file-patch",
             expected_output_tokens: 1,
+            validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: None,
@@ -3094,6 +3181,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "narrow-patch",
             expected_output_tokens: 2_048,
+            validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: None,
@@ -3148,6 +3236,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "narrow-patch",
             expected_output_tokens: 2_048,
+            validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: None,
@@ -3193,6 +3282,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "narrow-patch",
             expected_output_tokens: 2_048,
+            validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
             progress_projection_override: None,
@@ -3592,6 +3682,22 @@ mod tests {
             eval_count: Some(eval_count),
             eval_duration_ns: Some(1_000_000_000),
             tokens_per_second: Some(eval_count as f64),
+        }
+    }
+
+    fn stream_progress(
+        frame_index: usize,
+        content_chars: usize,
+        tool_call_count: usize,
+        accumulated_tool_call_count: usize,
+    ) -> mojentic::llm::gateway::StreamProgress {
+        mojentic::llm::gateway::StreamProgress {
+            provider: "test".to_string(),
+            frame_index,
+            done: false,
+            content_chars,
+            tool_call_count,
+            accumulated_tool_call_count,
         }
     }
 
