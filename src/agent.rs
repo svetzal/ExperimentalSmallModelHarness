@@ -36,6 +36,7 @@ const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
 const MAX_PRE_VALIDATION_REPEATED_INSPECTIONS: usize = 4;
 const NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER: usize = 20;
 const REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT: usize = 1_024;
+const MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -278,6 +279,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             }
         };
         let repair_no_content_interrupted = turn_result.repair_no_content_interrupted;
+        let repair_depth_hard_stop = turn_result.repair_depth_hard_stop;
         let response = turn_result.response;
         messages = turn_result.messages;
         trace.event(
@@ -323,6 +325,11 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         {
             final_summary = repair_hard_failure_summary(decision);
             trace.event("agent.validation.repair_hard_failed", decision)?;
+            exhausted_iterations = false;
+            break;
+        }
+        if let Some(decision) = &repair_depth_hard_stop {
+            final_summary = repair_depth_failure_summary(decision);
             exhausted_iterations = false;
             break;
         }
@@ -568,6 +575,19 @@ fn repair_hard_failure_summary(decision: &RepairNoActionDecision) -> String {
     }
 }
 
+fn repair_depth_failure_summary(decision: &RepairDepthDecision) -> String {
+    match decision.reason {
+        RepairDepthReason::MaxLlmCallDepth => format!(
+            "turn {} validation repair exceeded in-turn LLM call depth limit {}",
+            decision.turn, decision.limit
+        ),
+        RepairDepthReason::RedContextAfterRepairAction => format!(
+            "turn {} validation repair reached red context pressure after in-turn repair action",
+            decision.turn
+        ),
+    }
+}
+
 fn canonicalize_goal(experiment_dir: &Path, goal_file: &Path) -> Result<PathBuf> {
     let candidate = if goal_file.is_absolute() {
         goal_file.to_path_buf()
@@ -630,6 +650,7 @@ struct StreamResponseResult {
     response: String,
     messages: Vec<LlmMessage>,
     repair_no_content_interrupted: bool,
+    repair_depth_hard_stop: Option<RepairDepthDecision>,
 }
 
 #[derive(Debug, Default)]
@@ -658,6 +679,27 @@ struct RepairNoActionDecision {
 enum RepairNoActionReason {
     NoRepairAction,
     NoContentInterrupted,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepairDepthDecision {
+    turn: usize,
+    llm_call_depth: usize,
+    reason: RepairDepthReason,
+    limit: usize,
+    estimated_tokens: usize,
+    context_window_tokens: Option<usize>,
+    utilization: Option<f64>,
+    pressure_band: &'static str,
+    message_count: usize,
+    max_tool_iterations: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RepairDepthReason {
+    MaxLlmCallDepth,
+    RedContextAfterRepairAction,
 }
 
 impl RepairNoActionTracker {
@@ -794,6 +836,25 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         });
         previous_call_total_chars = ledger.total_chars();
         trace.event("llm.context_assembly.ledger", &ledger)?;
+        if let Some(decision) = repair_depth_decision(validation_repair_active, &ledger) {
+            trace.event("agent.validation.repair_depth_hard_failed", &decision)?;
+            trace.event(
+                "agent.stream.finished",
+                serde_json::json!({
+                    "turn": turn,
+                    "chunks": chunk_count,
+                    "chars": content_chars,
+                    "llm_call_count": depth,
+                    "repair_depth_hard_stop": &decision,
+                }),
+            )?;
+            return Ok(StreamResponseResult {
+                response,
+                messages: current_messages,
+                repair_no_content_interrupted,
+                repair_depth_hard_stop: Some(decision),
+            });
+        }
         let projection = progress_projection_override.clone().unwrap_or_else(|| {
             model_progress_projection(
                 model,
@@ -1142,6 +1203,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 response,
                 messages: current_messages,
                 repair_no_content_interrupted,
+                repair_depth_hard_stop: None,
             });
         }
 
@@ -1212,6 +1274,36 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     }
 
     unreachable!("tool iteration loop always returns or errors before exhaustion")
+}
+
+fn repair_depth_decision(
+    validation_repair_active: bool,
+    ledger: &ContextAssemblyLedger,
+) -> Option<RepairDepthDecision> {
+    if !validation_repair_active {
+        return None;
+    }
+
+    let reason = if ledger.llm_call_depth >= MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH {
+        Some(RepairDepthReason::MaxLlmCallDepth)
+    } else if ledger.llm_call_depth > 0 && ledger.pressure_band == "red" {
+        Some(RepairDepthReason::RedContextAfterRepairAction)
+    } else {
+        None
+    }?;
+
+    Some(RepairDepthDecision {
+        turn: ledger.turn,
+        llm_call_depth: ledger.llm_call_depth,
+        reason,
+        limit: MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH,
+        estimated_tokens: ledger.estimated_tokens,
+        context_window_tokens: ledger.context_window_tokens,
+        utilization: ledger.utilization,
+        pressure_band: ledger.pressure_band,
+        message_count: ledger.message_count,
+        max_tool_iterations: ledger.max_tool_iterations,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3127,6 +3219,108 @@ mod tests {
         assert!(content.contains("\"validation_repair_active\":true"));
         assert!(content.contains("\"call_stream_progress_frame_count\":1024"));
         assert!(!content.contains("\"kind\":\"llm.no_content_stream.hard_failed\""));
+    }
+
+    #[tokio::test]
+    async fn stream_response_hard_stops_validation_repair_at_depth_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let tools: Vec<Box<dyn LlmTool>> = vec![Box::new(EchoTool)];
+        let gateway = ScriptedGateway::new(
+            (0..MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH)
+                .map(|index| {
+                    vec![tool_call_chunk(
+                        "echo",
+                        HashMap::from([("value".to_string(), json!(format!("step-{index}")))]),
+                    )]
+                })
+                .collect(),
+        );
+
+        let result = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &tools,
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH + 5,
+                ..Default::default()
+            },
+            context_window_tokens: Some(131_072),
+            packet_type: "multi-file-patch",
+            expected_output_tokens: 4_096,
+            validation_repair_active: true,
+            transcript_policy: TranscriptPolicy::SummarizedTranscript,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 5,
+        })
+        .await
+        .unwrap();
+
+        let decision = result.repair_depth_hard_stop.unwrap();
+        assert!(matches!(
+            decision.reason,
+            RepairDepthReason::MaxLlmCallDepth
+        ));
+        assert_eq!(
+            decision.llm_call_depth,
+            MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH
+        );
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"agent.validation.repair_depth_hard_failed\""));
+        assert!(content.contains("\"reason\":\"max_llm_call_depth\""));
+    }
+
+    #[tokio::test]
+    async fn stream_response_hard_stops_validation_repair_red_context_after_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let tools: Vec<Box<dyn LlmTool>> = vec![Box::new(EchoTool)];
+        let gateway = ScriptedGateway::new(vec![vec![tool_call_chunk(
+            "echo",
+            HashMap::from([("value".to_string(), json!("large enough"))]),
+        )]]);
+
+        let result = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &tools,
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 5,
+                ..Default::default()
+            },
+            context_window_tokens: Some(1),
+            packet_type: "multi-file-patch",
+            expected_output_tokens: 4_096,
+            validation_repair_active: true,
+            transcript_policy: TranscriptPolicy::FullTranscript,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 6,
+        })
+        .await
+        .unwrap();
+
+        let decision = result.repair_depth_hard_stop.unwrap();
+        assert!(matches!(
+            decision.reason,
+            RepairDepthReason::RedContextAfterRepairAction
+        ));
+        assert_eq!(decision.llm_call_depth, 1);
+        assert_eq!(decision.pressure_band, "red");
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"agent.validation.repair_depth_hard_failed\""));
+        assert!(content.contains("\"reason\":\"red_context_after_repair_action\""));
     }
 
     #[tokio::test]
