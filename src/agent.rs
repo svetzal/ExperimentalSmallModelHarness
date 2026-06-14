@@ -48,6 +48,7 @@ pub struct AgentRunConfig {
     pub context_window_tokens: Option<usize>,
     pub packet_type: String,
     pub expected_output_tokens: usize,
+    pub num_predict: Option<usize>,
     pub transcript_policy: TranscriptPolicy,
 }
 
@@ -63,6 +64,7 @@ pub struct AgentRunSummary {
     pub context_window_tokens: Option<usize>,
     pub packet_type: String,
     pub expected_output_tokens: usize,
+    pub num_predict: Option<usize>,
     pub transcript_policy: TranscriptPolicy,
     pub final_summary: String,
 }
@@ -191,6 +193,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             "context_window_tokens": config.context_window_tokens,
             "packet_type": config.packet_type,
             "expected_output_tokens": config.expected_output_tokens,
+            "num_predict": config.num_predict,
             "assembly_policy": config.transcript_policy.as_str(),
             "transcript_policy": config.transcript_policy,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
@@ -215,9 +218,15 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         LlmMessage::system(system_prompt),
         LlmMessage::user(run_prompt(&goal)),
     ];
+    let num_predict = config
+        .num_predict
+        .map(i32::try_from)
+        .transpose()
+        .context("num_predict exceeds i32 range")?;
     let completion_config = CompletionConfig {
         temperature: 0.2,
         max_tool_iterations: config.max_tool_iterations,
+        num_predict,
         ..Default::default()
     };
 
@@ -474,6 +483,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         context_window_tokens: config.context_window_tokens,
         packet_type: config.packet_type,
         expected_output_tokens: config.expected_output_tokens,
+        num_predict: config.num_predict,
         transcript_policy: config.transcript_policy,
         final_summary,
     };
@@ -3789,6 +3799,7 @@ mod tests {
             context_window_tokens: Some(131_072),
             packet_type: "multi-file-patch".to_string(),
             expected_output_tokens: 4_096,
+            num_predict: None,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
         };
         let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
@@ -4024,6 +4035,7 @@ mod tests {
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
+                    num_predict: None,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                 },
                 gateway,

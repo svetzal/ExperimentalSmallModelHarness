@@ -51,6 +51,10 @@ enum Command {
         #[arg(long)]
         expected_output_tokens: Option<usize>,
 
+        /// Override Ollama num_predict / maximum generated tokens.
+        #[arg(long)]
+        num_predict: Option<usize>,
+
         /// Transcript retention policy for model/tool context.
         #[arg(long, default_value = "summarized-transcript")]
         transcript_policy: String,
@@ -76,6 +80,7 @@ pub async fn run() -> Result<()> {
             context_window_tokens,
             packet_type,
             expected_output_tokens,
+            num_predict,
             transcript_policy,
         } => {
             let transcript_policy =
@@ -97,6 +102,7 @@ pub async fn run() -> Result<()> {
                 context_window_tokens,
                 packet_type,
                 expected_output_tokens,
+                num_predict,
                 transcript_policy,
             })
             .await?;
