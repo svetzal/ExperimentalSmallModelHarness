@@ -289,6 +289,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         };
         let repair_no_content_interrupted = turn_result.repair_no_content_interrupted;
         let repair_depth_hard_stop = turn_result.repair_depth_hard_stop;
+        let thinking_chars_this_turn = turn_result.thinking_chars;
         let response = turn_result.response;
         messages = turn_result.messages;
         trace.event(
@@ -296,6 +297,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             serde_json::json!({
                 "turn": turn,
                 "response": response,
+                "thinking_chars_this_turn": thinking_chars_this_turn,
             }),
         )?;
         let policy = scope.policy_snapshot();
@@ -313,6 +315,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 "max_tool_result_estimated_tokens": policy.max_tool_result_estimated_tokens,
                 "max_tool_result_kind": policy.max_tool_result_kind,
                 "tool_result_chars_by_kind": policy.tool_result_chars_by_kind,
+                "thinking_chars_this_turn": thinking_chars_this_turn,
             }),
         )?;
         let repair_no_action = repair_no_action_tracker.observe(
@@ -388,10 +391,21 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             }
             consecutive_empty_responses += 1;
             let empty_response_decision = empty_response_decision(consecutive_empty_responses);
+            if thinking_chars_this_turn > 0 {
+                trace.event(
+                    "agent.turn.thinking_only_response",
+                    serde_json::json!({
+                        "turn": turn,
+                        "thinking_chars_this_turn": thinking_chars_this_turn,
+                        "consecutive_empty_responses": consecutive_empty_responses,
+                    }),
+                )?;
+            }
             trace.event(
                 "agent.turn.empty_response",
                 serde_json::json!({
                     "turn": turn,
+                    "thinking_chars_this_turn": thinking_chars_this_turn,
                     "consecutive_empty_responses": consecutive_empty_responses,
                     "escalation_required": empty_response_decision.escalation_required,
                 }),
@@ -659,6 +673,7 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
 struct StreamResponseResult {
     response: String,
     messages: Vec<LlmMessage>,
+    thinking_chars: usize,
     repair_no_content_interrupted: bool,
     repair_depth_hard_stop: Option<RepairDepthDecision>,
 }
@@ -812,6 +827,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let mut response = String::new();
     let mut chunk_count = 0usize;
     let mut content_chars = 0usize;
+    let mut thinking_chunk_count = 0usize;
+    let mut thinking_chars = 0usize;
     let mut stream_progress_frame_count = 0usize;
     let mut tool_call_progress_frame_count = 0usize;
     let mut no_content_segment_eval_count = 0usize;
@@ -854,6 +871,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     "turn": turn,
                     "chunks": chunk_count,
                     "chars": content_chars,
+                    "thinking_chunks": thinking_chunk_count,
+                    "thinking_chars": thinking_chars,
                     "llm_call_count": depth,
                     "repair_depth_hard_stop": &decision,
                 }),
@@ -861,6 +880,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             return Ok(StreamResponseResult {
                 response,
                 messages: current_messages,
+                thinking_chars,
                 repair_no_content_interrupted,
                 repair_depth_hard_stop: Some(decision),
             });
@@ -901,6 +921,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         let mut stalled_candidate_checks = 0usize;
         let mut call_stream_progress_frame_count = 0usize;
         let mut call_tool_call_progress_frame_count = 0usize;
+        let mut call_thinking_chunk_count = 0usize;
+        let mut call_thinking_chars = 0usize;
         trace_model_progress_status(ModelProgressStatusInput {
             trace,
             turn,
@@ -1041,6 +1063,29 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     )?;
                     accumulated_tool_calls = tool_calls;
                 }
+                Ok(StreamChunk::Thinking(thinking)) => {
+                    last_observable_progress = Instant::now();
+                    stalled_candidate_checks = 0;
+                    latest_progress_state = ModelProgressState::Generating;
+                    no_content_segment_eval_count = 0;
+                    thinking_chunk_count += 1;
+                    thinking_chars += thinking.len();
+                    call_thinking_chunk_count += 1;
+                    call_thinking_chars += thinking.len();
+                    trace.event(
+                        "llm.stream.thinking",
+                        serde_json::json!({
+                            "turn": turn,
+                            "llm_call_depth": depth,
+                            "chunk": thinking_chunk_count,
+                            "call_chunk": call_thinking_chunk_count,
+                            "chars": thinking.len(),
+                            "total_thinking_chars": thinking_chars,
+                            "call_thinking_chars": call_thinking_chars,
+                            "preview": limit_preview(&thinking, 240),
+                        }),
+                    )?;
+                }
                 Ok(StreamChunk::Progress(progress)) => {
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
@@ -1049,11 +1094,12 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     let progress_has_tool_call =
                         progress.tool_call_count > 0 || progress.accumulated_tool_call_count > 0;
                     let progress_has_content = progress.content_chars > 0;
+                    let progress_has_thinking = progress.thinking_chars > 0;
                     if progress.tool_call_count > 0 || progress.accumulated_tool_call_count > 0 {
                         tool_call_progress_frame_count += 1;
                         call_tool_call_progress_frame_count += 1;
                         latest_progress_state = ModelProgressState::GeneratingToolCall;
-                    } else if progress.content_chars > 0 {
+                    } else if progress.content_chars > 0 || progress.thinking_chars > 0 {
                         latest_progress_state = ModelProgressState::Generating;
                     }
                     trace.event(
@@ -1065,6 +1111,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                             "frame_index": progress.frame_index,
                             "done": progress.done,
                             "content_chars": progress.content_chars,
+                            "thinking_chars": progress.thinking_chars,
                             "tool_call_count": progress.tool_call_count,
                             "accumulated_tool_call_count": progress.accumulated_tool_call_count,
                             "stream_progress_frame_count": stream_progress_frame_count,
@@ -1076,8 +1123,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     )?;
                     if validation_repair_active
                         && !progress_has_content
+                        && !progress_has_thinking
                         && !progress_has_tool_call
                         && call_content.is_empty()
+                        && call_thinking_chars == 0
                         && accumulated_tool_calls.is_empty()
                         && call_stream_progress_frame_count
                             >= REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT
@@ -1096,6 +1145,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                                 "tool_call_progress_frame_count": tool_call_progress_frame_count,
                                 "turn_content_chars": content_chars,
                                 "call_content_chars": call_content.len(),
+                                "turn_thinking_chars": thinking_chars,
+                                "call_thinking_chars": call_thinking_chars,
                                 "validation_repair_active": validation_repair_active,
                             }),
                         )?;
@@ -1105,7 +1156,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 Ok(StreamChunk::Metrics(metrics)) => {
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
-                    if call_content.is_empty() && accumulated_tool_calls.is_empty() {
+                    if call_content.is_empty()
+                        && call_thinking_chars == 0
+                        && accumulated_tool_calls.is_empty()
+                    {
                         no_content_segment_eval_count = no_content_segment_eval_count
                             .saturating_add(metrics.eval_count.unwrap_or_default() as usize);
                     }
@@ -1125,6 +1179,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                             "packet_type": packet_type,
                             "expected_output_tokens": expected_output_tokens,
                             "context_band": ledger.pressure_band,
+                            "turn_thinking_chars": thinking_chars,
+                            "call_thinking_chars": call_thinking_chars,
                         }),
                     )?;
                     if let Some(sample) = throughput_sample(
@@ -1140,6 +1196,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         trace.event("llm.throughput.sample", &sample)?;
                     }
                     if call_content.is_empty()
+                        && call_thinking_chars == 0
                         && accumulated_tool_calls.is_empty()
                         && no_assistant_content_limit > 0
                         && no_content_segment_eval_count > no_assistant_content_limit
@@ -1155,6 +1212,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                                 "limit": no_assistant_content_limit,
                                 "turn_content_chars": content_chars,
                                 "call_content_chars": call_content.len(),
+                                "turn_thinking_chars": thinking_chars,
+                                "call_thinking_chars": call_thinking_chars,
                                 "tool_call_progress_frame_count": tool_call_progress_frame_count,
                                 "stream_progress_frame_count": stream_progress_frame_count,
                             }),
@@ -1189,6 +1248,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 "duration_ms": started.elapsed().as_millis(),
                 "content_chars": call_content.len(),
                 "content_estimated_tokens": estimate_tokens(call_content.len()),
+                "thinking_chars": call_thinking_chars,
+                "turn_thinking_chars": thinking_chars,
+                "thinking_chunk_count": call_thinking_chunk_count,
                 "stream_progress_frame_count": stream_progress_frame_count,
                 "call_stream_progress_frame_count": call_stream_progress_frame_count,
                 "tool_call_progress_frame_count": tool_call_progress_frame_count,
@@ -1206,12 +1268,15 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     "turn": turn,
                     "chunks": chunk_count,
                     "chars": content_chars,
+                    "thinking_chunks": thinking_chunk_count,
+                    "thinking_chars": thinking_chars,
                     "llm_call_count": depth + 1,
                 }),
             )?;
             return Ok(StreamResponseResult {
                 response,
                 messages: current_messages,
+                thinking_chars,
                 repair_no_content_interrupted,
                 repair_depth_hard_stop: None,
             });
@@ -3865,6 +3930,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_traces_thinking_only_response_separately_from_empty_stream() {
+        let fixture = AgentFixture::new("Finish after thinking.");
+        let gateway = ScriptedGateway::new(vec![
+            vec![StreamChunk::Thinking(
+                "Considering whether to edit files or answer DONE.".to_string(),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 2).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"llm.stream.thinking\""));
+        assert!(trace.contains("\"kind\":\"agent.turn.thinking_only_response\""));
+        assert!(trace.contains("\"thinking_chars_this_turn\":49"));
+        assert!(trace.contains("Considering whether to edit files or answer DONE."));
+    }
+
+    #[tokio::test]
     async fn fixture_accepts_done_after_docs_only_write_following_validation() {
         let fixture = AgentFixture::new("Validate, write a README, and finish.");
         fixture.write_fake_cargo(0, "ok");
@@ -4082,6 +4167,7 @@ mod tests {
             frame_index,
             done: false,
             content_chars,
+            thinking_chars: 0,
             tool_call_count,
             accumulated_tool_call_count,
         }
