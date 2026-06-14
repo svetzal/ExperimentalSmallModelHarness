@@ -432,6 +432,19 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                         "consecutive_empty_responses": consecutive_empty_responses,
                     }),
                 )?;
+                final_summary =
+                    empty_response_hard_failure_summary(turn, consecutive_empty_responses);
+                trace.event(
+                    "agent.turn.empty_response_hard_failed",
+                    serde_json::json!({
+                        "turn": turn,
+                        "consecutive_empty_responses": consecutive_empty_responses,
+                        "thinking_chars_this_turn": thinking_chars_this_turn,
+                        "final_summary": final_summary,
+                    }),
+                )?;
+                exhausted_iterations = false;
+                break;
             }
             messages.push(LlmMessage::user(empty_response_decision.prompt));
             continue;
@@ -602,6 +615,12 @@ fn should_prompt_validation_repair(policy: &ToolPolicySnapshot, response: &str) 
 
 fn repair_no_action_failure_summary(turn: usize) -> String {
     format!("turn {turn} made no validation-repair edit or probe after validation failure")
+}
+
+fn empty_response_hard_failure_summary(turn: usize, consecutive_empty_responses: usize) -> String {
+    format!(
+        "turn {turn} produced {consecutive_empty_responses} consecutive empty responses with no tool calls or final text"
+    )
 }
 
 fn repair_hard_failure_summary(decision: &RepairNoActionDecision) -> String {
@@ -4024,15 +4043,20 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            vec![StreamChunk::Content("FAIL blocked".to_string())],
+            vec![StreamChunk::Content("DONE".to_string())],
         ]);
 
         let summary = fixture.run(&gateway, 4).await;
 
-        assert_eq!(summary.final_summary, "FAIL blocked");
+        assert_eq!(
+            summary.final_summary,
+            "turn 3 produced 3 consecutive empty responses with no tool calls or final text"
+        );
         let trace = std::fs::read_to_string(summary.trace_file).unwrap();
         assert!(trace.contains("\"kind\":\"agent.turn.empty_response_escalated\""));
+        assert!(trace.contains("\"kind\":\"agent.turn.empty_response_hard_failed\""));
         assert!(trace.contains("\"consecutive_empty_responses\":3"));
+        assert!(!trace.contains("DONE"));
     }
 
     #[tokio::test]
