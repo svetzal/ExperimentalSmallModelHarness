@@ -1289,23 +1289,19 @@ impl ShellCommandTool {
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
         let validation_probe = is_validation_probe(command);
-        let before_mutation_snapshot = if validation_probe {
-            None
-        } else {
-            match self.scope.shell_mutation_snapshot() {
-                Ok(snapshot) => Some(snapshot),
-                Err(error) => {
-                    let _ = self.scope.trace.event(
-                        "agent.shell.mutation_snapshot_failed",
-                        json!({
-                            "command": command,
-                            "cwd": self.scope.relative_display(&cwd),
-                            "phase": "before",
-                            "error": error.to_string(),
-                        }),
-                    );
-                    None
-                }
+        let before_mutation_snapshot = match self.scope.shell_mutation_snapshot() {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                let _ = self.scope.trace.event(
+                    "agent.shell.mutation_snapshot_failed",
+                    json!({
+                        "command": command,
+                        "cwd": self.scope.relative_display(&cwd),
+                        "phase": "before",
+                        "error": error.to_string(),
+                    }),
+                );
+                None
             }
         };
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
@@ -1330,18 +1326,6 @@ impl ShellCommandTool {
                 match self.scope.shell_mutation_snapshot() {
                     Ok(after_snapshot) => {
                         let paths = changed_shell_mutation_paths(&before_snapshot, &after_snapshot);
-                        self.scope.note_sensed_shell_mutation(&paths);
-                        if !paths.is_empty() {
-                            let _ = self.scope.trace.event(
-                                "agent.shell.mutation_sensed",
-                                json!({
-                                    "command": command,
-                                    "cwd": self.scope.relative_display(&cwd),
-                                    "paths": paths.clone(),
-                                    "validation_required_after_write": true,
-                                }),
-                            );
-                        }
                         (paths, None)
                     }
                     Err(error) => {
@@ -1368,6 +1352,18 @@ impl ShellCommandTool {
         } else {
             None
         };
+        self.scope.note_sensed_shell_mutation(&shell_mutation_paths);
+        if shell_mutation_sensed {
+            let _ = self.scope.trace.event(
+                "agent.shell.mutation_sensed",
+                json!({
+                    "command": command,
+                    "cwd": self.scope.relative_display(&cwd),
+                    "paths": shell_mutation_paths.clone(),
+                    "validation_required_after_write": true,
+                }),
+            );
+        }
         Ok(json!({
             "cwd": self.scope.relative_display(&cwd),
             "command": command,
@@ -2322,6 +2318,37 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["shell_mutation_sensed"], true);
         assert_eq!(result["shell_mutation_paths"], json!(["src/lib.rs"]));
+        assert_eq!(snapshot.total_write_operations, 1);
+        assert_eq!(snapshot.writes_since_shell_probe, 1);
+        assert_eq!(snapshot.writes_since_shell_probe_paths["src/lib.rs"], 1);
+        assert!(snapshot.validation_required_after_write);
+    }
+
+    #[tokio::test]
+    async fn mutating_validation_probe_counts_as_write_after_probe_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"formatter-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn value()->i32{1}\n").unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+        let mut args = HashMap::new();
+        args.insert("command".to_string(), json!("cargo fmt"));
+
+        let result = tool.shell(&args).await.unwrap();
+        let snapshot = scope.policy_snapshot();
+
+        assert_eq!(result["validation_probe"], true);
+        assert_eq!(result["success"], true);
+        assert_eq!(result["shell_mutation_sensed"], true);
+        assert_eq!(result["shell_mutation_paths"], json!(["src/lib.rs"]));
+        assert_eq!(snapshot.total_shell_probes, 1);
         assert_eq!(snapshot.total_write_operations, 1);
         assert_eq!(snapshot.writes_since_shell_probe, 1);
         assert_eq!(snapshot.writes_since_shell_probe_paths["src/lib.rs"], 1);
