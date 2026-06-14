@@ -559,7 +559,7 @@ impl ToolScope {
                     .or_insert_with(|| PatchFallbackState {
                         attempts: 0,
                         reason: String::new(),
-                        guidance: "Retry with a smaller unified diff or replace the bounded file with write_file after reading the current contents.".to_string(),
+                        guidance: "Retry with a smaller unified diff. write_file replaces the entire file; use it on existing source only after reading the complete current file and preserving unrelated content.".to_string(),
                     });
             fallback.attempts += 1;
             fallback.reason = reason.to_string();
@@ -1032,7 +1032,7 @@ impl LlmTool for WriteFileTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "write_file".to_string(),
-                description: "Create or replace a UTF-8 file under the active experiment root."
+                description: "Create a new UTF-8 file or replace an entire existing UTF-8 file under the active experiment root. For existing source repairs, prefer patch_file; write_file is whole-file replacement and must preserve unrelated content."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -1935,6 +1935,16 @@ mod tests {
         assert_eq!(snapshot.patch_fallbacks[0].path, "workspace/src/main.rs");
         assert_eq!(snapshot.patch_fallbacks[0].attempts, 1);
         assert!(snapshot.patch_fallbacks[0].reason.contains("dry-run"));
+        assert!(
+            snapshot.patch_fallbacks[0]
+                .guidance
+                .contains("write_file replaces the entire file")
+        );
+        assert!(
+            !snapshot.patch_fallbacks[0]
+                .guidance
+                .contains("bounded write_file")
+        );
     }
 
     #[test]

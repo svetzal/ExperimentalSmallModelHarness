@@ -616,9 +616,9 @@ fn system_prompt() -> String {
         "Create a project-appropriate .gitignore unless the task explicitly forbids additional files.",
         "Ignore generated build, dependency, cache, and virtual-environment directories such as target/, build/, dist/, node_modules/, .venv/, and __pycache__/. Do not list or inspect ignored paths unless explicitly needed.",
         "Use timeout_secs 1800 for first cargo build, cargo test, or similarly expensive validation probes.",
-        "After a validation failure, repair narrowly: cite the failing command and failure text, inspect only relevant code, apply a focused patch or bounded write, then rerun validation.",
+        "After a validation failure, repair narrowly: cite the failing command and failure text, inspect only relevant code, prefer a focused patch for existing source, then rerun validation.",
         "For Rust projects after edits, prefer this validation ladder: cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings, focused tests, then cargo test.",
-        "If patch_file fails or times out for a file, retry with a smaller diff or use a bounded write_file after reading the current contents.",
+        "If patch_file fails or times out for an existing source file, retry with a smaller diff. write_file replaces the entire file; use it for existing source only after reading the complete current file and preserving unrelated content.",
         "Never end a turn with an empty response. Continue using tools, or reply DONE/FAIL as instructed.",
         "When you have completed the task and verified it, answer exactly DONE.",
         "If the task cannot be completed, answer exactly FAIL with one concise reason.",
@@ -2547,7 +2547,8 @@ fn validation_repair_no_action_prompt(decision: &RepairNoActionDecision) -> Stri
          Failing command: {command}\n\
          Failure text: {failure_text}\n\
          Repair read targets since the latest failed validation: {read_targets}\n\
-         Your next turn must take exactly one repair action: apply one focused patch/write_file to the relevant source, \
+         Your next turn must take exactly one repair action: apply one focused patch to the relevant source, \
+         replace an existing source file with write_file only after reading the complete file and preserving unrelated content, \
          run one deterministic probe that narrows the failure, or reply FAIL with a concrete blocker. \
          Do not emit a text-only repair plan or restate the plan without taking one of those actions.",
         command = repair.command,
@@ -3624,6 +3625,8 @@ mod tests {
         assert!(prompt.contains("Validation repair action contract is active"));
         assert!(prompt.contains("exactly one repair action"));
         assert!(prompt.contains("one focused source edit"));
+        assert!(!prompt.contains("bounded write"));
+        assert!(!prompt.contains("patch/write_file"));
         assert!(prompt.contains("one deterministic diagnostic probe"));
         assert!(prompt.contains("reply FAIL with a concrete blocker"));
         assert!(prompt.contains("Do not emit a text-only repair plan"));
@@ -3677,6 +3680,10 @@ mod tests {
         assert!(prompt.contains("Validation repair escalation is active"));
         assert!(prompt.contains("src/main.rs (3)"));
         assert!(prompt.contains("exactly one repair action"));
+        assert!(prompt.contains("apply one focused patch"));
+        assert!(prompt.contains("write_file only after reading the complete file"));
+        assert!(!prompt.contains("bounded write"));
+        assert!(!prompt.contains("patch/write_file"));
         assert!(prompt.contains("Do not emit a text-only repair plan"));
 
         let after_write = repair_policy_snapshot(4, 2, Some(repair), BTreeMap::new());
