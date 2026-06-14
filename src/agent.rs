@@ -49,6 +49,7 @@ pub struct AgentRunConfig {
     pub packet_type: String,
     pub expected_output_tokens: usize,
     pub num_predict: Option<usize>,
+    pub max_thinking_only_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
 }
 
@@ -65,6 +66,7 @@ pub struct AgentRunSummary {
     pub packet_type: String,
     pub expected_output_tokens: usize,
     pub num_predict: Option<usize>,
+    pub max_thinking_only_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
     pub final_summary: String,
 }
@@ -194,6 +196,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             "packet_type": config.packet_type,
             "expected_output_tokens": config.expected_output_tokens,
             "num_predict": config.num_predict,
+            "max_thinking_only_tokens": config.max_thinking_only_tokens,
             "assembly_policy": config.transcript_policy.as_str(),
             "transcript_policy": config.transcript_policy,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
@@ -262,6 +265,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             context_window_tokens: config.context_window_tokens,
             packet_type: &config.packet_type,
             expected_output_tokens: config.expected_output_tokens,
+            max_thinking_only_tokens: config.max_thinking_only_tokens,
             validation_repair_active: policy_before_turn.validation_repair.is_some(),
             transcript_policy: config.transcript_policy,
             throughput_registry_path: experiment_dir.join("model-throughput.jsonl"),
@@ -498,6 +502,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         packet_type: config.packet_type,
         expected_output_tokens: config.expected_output_tokens,
         num_predict: config.num_predict,
+        max_thinking_only_tokens: config.max_thinking_only_tokens,
         transcript_policy: config.transcript_policy,
         final_summary,
     };
@@ -659,6 +664,7 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     context_window_tokens: Option<usize>,
     packet_type: &'a str,
     expected_output_tokens: usize,
+    max_thinking_only_tokens: usize,
     validation_repair_active: bool,
     transcript_policy: TranscriptPolicy,
     throughput_registry_path: PathBuf,
@@ -808,6 +814,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         context_window_tokens,
         packet_type,
         expected_output_tokens,
+        max_thinking_only_tokens,
         validation_repair_active,
         transcript_policy,
         throughput_registry_path,
@@ -1085,6 +1092,33 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                             "preview": limit_preview(&thinking, 240),
                         }),
                     )?;
+                    let call_thinking_estimated_tokens = estimate_tokens(call_thinking_chars);
+                    if max_thinking_only_tokens > 0
+                        && call_content.is_empty()
+                        && accumulated_tool_calls.is_empty()
+                        && call_tool_call_progress_frame_count == 0
+                        && call_thinking_estimated_tokens > max_thinking_only_tokens
+                    {
+                        trace.event(
+                            "llm.thinking_only_stream.hard_failed",
+                            serde_json::json!({
+                                "turn": turn,
+                                "llm_call_depth": depth,
+                                "call_thinking_chars": call_thinking_chars,
+                                "call_thinking_estimated_tokens": call_thinking_estimated_tokens,
+                                "max_thinking_only_tokens": max_thinking_only_tokens,
+                                "expected_output_tokens": expected_output_tokens,
+                                "thinking_chunk_count": call_thinking_chunk_count,
+                                "content_chars": call_content.len(),
+                                "tool_call_count": accumulated_tool_calls.len(),
+                                "call_tool_call_progress_frame_count": call_tool_call_progress_frame_count,
+                                "latest_preview": limit_preview(&thinking, 240),
+                            }),
+                        )?;
+                        anyhow::bail!(
+                            "thinking-only stream exceeded {max_thinking_only_tokens} estimated tokens without assistant content or tool calls"
+                        );
+                    }
                 }
                 Ok(StreamChunk::Progress(progress)) => {
                     last_observable_progress = Instant::now();
@@ -3127,6 +3161,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "diagnosis-only",
             expected_output_tokens: 1,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3194,6 +3229,7 @@ mod tests {
             context_window_tokens: Some(8_000),
             packet_type: "multi-file-patch",
             expected_output_tokens: 4_096,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3237,6 +3273,7 @@ mod tests {
             context_window_tokens: Some(8_000),
             packet_type: "multi-file-patch",
             expected_output_tokens: 1,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3252,6 +3289,49 @@ mod tests {
         assert!(error.to_string().contains("no assistant content"));
         let content = std::fs::read_to_string(trace.path()).unwrap();
         assert!(content.contains("\"kind\":\"llm.no_content_stream.hard_failed\""));
+    }
+
+    #[tokio::test]
+    async fn stream_response_hard_stops_thinking_only_stream_runaway() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let gateway = ScriptedGateway::new(vec![vec![StreamChunk::Thinking(
+            "I am planning concrete edits but not emitting a tool call.".to_string(),
+        )]]);
+
+        let error = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &[],
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 1,
+                ..Default::default()
+            },
+            context_window_tokens: Some(8_000),
+            packet_type: "multi-file-patch",
+            expected_output_tokens: 4_096,
+            max_thinking_only_tokens: 1,
+            validation_repair_active: false,
+            transcript_policy: TranscriptPolicy::FullTranscript,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("thinking-only stream exceeded"));
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"llm.stream.thinking\""));
+        assert!(content.contains("\"kind\":\"llm.thinking_only_stream.hard_failed\""));
+        assert!(content.contains("\"max_thinking_only_tokens\":1"));
+        assert!(content.contains("\"content_chars\":0"));
+        assert!(content.contains("\"tool_call_count\":0"));
     }
 
     #[tokio::test]
@@ -3276,6 +3356,7 @@ mod tests {
             context_window_tokens: Some(8_000),
             packet_type: "multi-file-patch",
             expected_output_tokens: 4_096,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3326,6 +3407,7 @@ mod tests {
             context_window_tokens: Some(131_072),
             packet_type: "multi-file-patch",
             expected_output_tokens: 4_096,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3375,6 +3457,7 @@ mod tests {
             context_window_tokens: Some(1),
             packet_type: "multi-file-patch",
             expected_output_tokens: 4_096,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3427,6 +3510,7 @@ mod tests {
             context_window_tokens: Some(8_000),
             packet_type: "multi-file-patch",
             expected_output_tokens: 1,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3502,6 +3586,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "narrow-patch",
             expected_output_tokens: 2_048,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3557,6 +3642,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "narrow-patch",
             expected_output_tokens: 2_048,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3603,6 +3689,7 @@ mod tests {
             context_window_tokens: Some(1_000),
             packet_type: "narrow-patch",
             expected_output_tokens: 2_048,
+            max_thinking_only_tokens: usize::MAX,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3865,6 +3952,7 @@ mod tests {
             packet_type: "multi-file-patch".to_string(),
             expected_output_tokens: 4_096,
             num_predict: None,
+            max_thinking_only_tokens: 4_096,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
         };
         let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
@@ -4121,6 +4209,7 @@ mod tests {
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
                     num_predict: None,
+                    max_thinking_only_tokens: 2_048,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                 },
                 gateway,

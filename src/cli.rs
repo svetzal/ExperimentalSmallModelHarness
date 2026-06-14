@@ -55,6 +55,10 @@ enum Command {
         #[arg(long)]
         num_predict: Option<usize>,
 
+        /// Max reasoning-only tokens in one LLM call before hard-stop. Defaults to the expected output budget; 0 disables.
+        #[arg(long)]
+        max_thinking_only_tokens: Option<usize>,
+
         /// Transcript retention policy for model/tool context.
         #[arg(long, default_value = "summarized-transcript")]
         transcript_policy: String,
@@ -81,6 +85,7 @@ pub async fn run() -> Result<()> {
             packet_type,
             expected_output_tokens,
             num_predict,
+            max_thinking_only_tokens,
             transcript_policy,
         } => {
             let transcript_policy =
@@ -93,6 +98,8 @@ pub async fn run() -> Result<()> {
                 })?;
             let expected_output_tokens = expected_output_tokens
                 .unwrap_or_else(|| default_expected_output_tokens(&packet_type));
+            let max_thinking_only_tokens =
+                max_thinking_only_tokens.unwrap_or(expected_output_tokens);
             let summary = run_coding_agent(AgentRunConfig {
                 experiment_dir: experiment,
                 goal_file: goal,
@@ -103,6 +110,7 @@ pub async fn run() -> Result<()> {
                 packet_type,
                 expected_output_tokens,
                 num_predict,
+                max_thinking_only_tokens,
                 transcript_policy,
             })
             .await?;
