@@ -1,5 +1,6 @@
 use crate::agent::{
-    AgentRunConfig, TranscriptPolicy, default_expected_output_tokens, run_coding_agent,
+    AgentRunConfig, TranscriptPolicy, default_expected_output_tokens,
+    default_max_thinking_only_tokens, run_coding_agent,
 };
 use crate::trace_analysis::analyze_trace;
 use anyhow::Result;
@@ -55,7 +56,7 @@ enum Command {
         #[arg(long)]
         num_predict: Option<usize>,
 
-        /// Max reasoning-only tokens in one LLM call before hard-stop. Defaults to the expected output budget; 0 disables.
+        /// Max reasoning-only tokens in one LLM call before hard-stop. Defaults to max(expected output, 25% of num_predict); 0 disables.
         #[arg(long)]
         max_thinking_only_tokens: Option<usize>,
 
@@ -98,8 +99,9 @@ pub async fn run() -> Result<()> {
                 })?;
             let expected_output_tokens = expected_output_tokens
                 .unwrap_or_else(|| default_expected_output_tokens(&packet_type));
-            let max_thinking_only_tokens =
-                max_thinking_only_tokens.unwrap_or(expected_output_tokens);
+            let max_thinking_only_tokens = max_thinking_only_tokens.unwrap_or_else(|| {
+                default_max_thinking_only_tokens(expected_output_tokens, num_predict)
+            });
             let summary = run_coding_agent(AgentRunConfig {
                 experiment_dir: experiment,
                 goal_file: goal,

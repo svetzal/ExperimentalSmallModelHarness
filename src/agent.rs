@@ -156,6 +156,16 @@ pub fn default_expected_output_tokens(packet_type: &str) -> usize {
     }
 }
 
+pub fn default_max_thinking_only_tokens(
+    expected_output_tokens: usize,
+    num_predict: Option<usize>,
+) -> usize {
+    num_predict
+        .filter(|tokens| *tokens > 0)
+        .map(|tokens| tokens.div_ceil(4).max(expected_output_tokens))
+        .unwrap_or(expected_output_tokens)
+}
+
 pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
     let gateway = OllamaGateway::new();
     let tool_root = PathBuf::from(".")
@@ -2683,6 +2693,14 @@ mod tests {
         assert_eq!(estimate_tokens(1), 1);
         assert_eq!(estimate_tokens(4), 1);
         assert_eq!(estimate_tokens(5), 2);
+    }
+
+    #[test]
+    fn default_max_thinking_only_tokens_uses_generation_budget_fraction() {
+        assert_eq!(default_max_thinking_only_tokens(4_096, None), 4_096);
+        assert_eq!(default_max_thinking_only_tokens(4_096, Some(32_768)), 8_192);
+        assert_eq!(default_max_thinking_only_tokens(4_096, Some(8_000)), 4_096);
+        assert_eq!(default_max_thinking_only_tokens(4_096, Some(0)), 4_096);
     }
 
     #[test]
