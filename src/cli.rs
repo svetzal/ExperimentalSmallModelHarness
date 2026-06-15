@@ -1,6 +1,6 @@
 use crate::agent::{
     AgentRunConfig, TranscriptPolicy, default_expected_output_tokens,
-    default_max_thinking_only_tokens, run_coding_agent,
+    default_max_thinking_only_tokens, default_repair_exit_thinking_tokens, run_coding_agent,
 };
 use crate::trace_analysis::analyze_trace;
 use anyhow::Result;
@@ -60,6 +60,10 @@ enum Command {
         #[arg(long)]
         max_thinking_only_tokens: Option<usize>,
 
+        /// Post-validation hidden-only reasoning tokens before interrupting and retrying repair. 0 disables.
+        #[arg(long)]
+        repair_exit_thinking_tokens: Option<usize>,
+
         /// Transcript retention policy for model/tool context.
         #[arg(long, default_value = "summarized-transcript")]
         transcript_policy: String,
@@ -87,6 +91,7 @@ pub async fn run() -> Result<()> {
             expected_output_tokens,
             num_predict,
             max_thinking_only_tokens,
+            repair_exit_thinking_tokens,
             transcript_policy,
         } => {
             let transcript_policy =
@@ -102,6 +107,8 @@ pub async fn run() -> Result<()> {
             let max_thinking_only_tokens = max_thinking_only_tokens.unwrap_or_else(|| {
                 default_max_thinking_only_tokens(expected_output_tokens, num_predict)
             });
+            let repair_exit_thinking_tokens =
+                repair_exit_thinking_tokens.unwrap_or_else(default_repair_exit_thinking_tokens);
             let summary = run_coding_agent(AgentRunConfig {
                 experiment_dir: experiment,
                 goal_file: goal,
@@ -113,6 +120,7 @@ pub async fn run() -> Result<()> {
                 expected_output_tokens,
                 num_predict,
                 max_thinking_only_tokens,
+                repair_exit_thinking_tokens,
                 transcript_policy,
             })
             .await?;

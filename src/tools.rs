@@ -51,6 +51,9 @@ struct ToolPolicyState {
     max_tool_result_chars: usize,
     max_tool_result_kind: Option<String>,
     tool_result_chars_by_kind: BTreeMap<String, usize>,
+    emitted_first_source_mutation: bool,
+    emitted_first_validation_probe: bool,
+    emitted_first_post_validation_repair_action: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -326,9 +329,33 @@ impl ToolScope {
             .iter()
             .map(|path| self.relative_display(path))
             .collect::<Vec<_>>();
+        let source_paths = relative_paths
+            .iter()
+            .filter(|path| path_requires_validation_after_write(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut first_source_mutation = false;
+        let mut first_post_validation_repair_action = false;
+        let mut active_repair = None;
+        let total_write_operations;
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         if policy.consecutive_writes_without_shell >= MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
             bail!("write budget exhausted: run a shell validation probe before editing again");
+        }
+        if !source_paths.is_empty() && !policy.emitted_first_source_mutation {
+            policy.emitted_first_source_mutation = true;
+            first_source_mutation = true;
+        }
+        if !source_paths.is_empty()
+            && policy.validation_repair.is_some()
+            && !policy.emitted_first_post_validation_repair_action
+        {
+            policy.emitted_first_post_validation_repair_action = true;
+            first_post_validation_repair_action = true;
+            active_repair = policy
+                .validation_repair
+                .as_ref()
+                .map(ValidationRepairSnapshot::from);
         }
         policy.consecutive_writes_without_shell += 1;
         policy.writes_since_shell_probe += 1;
@@ -339,6 +366,29 @@ impl ToolScope {
                 .or_insert(0) += 1;
         }
         policy.total_write_operations += 1;
+        total_write_operations = policy.total_write_operations;
+        drop(policy);
+        if first_source_mutation {
+            self.trace.event(
+                "agent.stage.first_source_mutation",
+                json!({
+                    "action": "write_intent",
+                    "paths": source_paths,
+                    "total_write_operations": total_write_operations,
+                }),
+            )?;
+        }
+        if first_post_validation_repair_action {
+            self.trace.event(
+                "agent.stage.first_post_validation_repair_action",
+                json!({
+                    "action": "write_intent",
+                    "paths": source_paths,
+                    "total_write_operations": total_write_operations,
+                    "active_repair": active_repair,
+                }),
+            )?;
+        }
         Ok(())
     }
 
@@ -346,7 +396,31 @@ impl ToolScope {
         if paths.is_empty() {
             return;
         }
+        let source_paths = paths
+            .iter()
+            .filter(|path| path_requires_validation_after_write(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut first_source_mutation = false;
+        let mut first_post_validation_repair_action = false;
+        let mut active_repair = None;
+        let total_write_operations;
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
+        if !source_paths.is_empty() && !policy.emitted_first_source_mutation {
+            policy.emitted_first_source_mutation = true;
+            first_source_mutation = true;
+        }
+        if !source_paths.is_empty()
+            && policy.validation_repair.is_some()
+            && !policy.emitted_first_post_validation_repair_action
+        {
+            policy.emitted_first_post_validation_repair_action = true;
+            first_post_validation_repair_action = true;
+            active_repair = policy
+                .validation_repair
+                .as_ref()
+                .map(ValidationRepairSnapshot::from);
+        }
         policy.consecutive_writes_without_shell += 1;
         policy.writes_since_shell_probe += 1;
         for relative in paths {
@@ -356,6 +430,29 @@ impl ToolScope {
                 .or_insert(0) += 1;
         }
         policy.total_write_operations += 1;
+        total_write_operations = policy.total_write_operations;
+        drop(policy);
+        if first_source_mutation {
+            let _ = self.trace.event(
+                "agent.stage.first_source_mutation",
+                json!({
+                    "action": "shell_mutation",
+                    "paths": source_paths,
+                    "total_write_operations": total_write_operations,
+                }),
+            );
+        }
+        if first_post_validation_repair_action {
+            let _ = self.trace.event(
+                "agent.stage.first_post_validation_repair_action",
+                json!({
+                    "action": "shell_mutation",
+                    "paths": source_paths,
+                    "total_write_operations": total_write_operations,
+                    "active_repair": active_repair,
+                }),
+            );
+        }
     }
 
     fn shell_mutation_snapshot(&self) -> Result<BTreeMap<String, FileFingerprint>> {
@@ -395,10 +492,56 @@ impl ToolScope {
         let command_family = command_family(command);
         let failure_text = failure_summary(&stderr.content, &stdout.content);
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
+        let first_validation_probe = !policy.emitted_first_validation_probe;
+        if first_validation_probe {
+            policy.emitted_first_validation_probe = true;
+        }
+        let first_post_validation_repair_action = policy.validation_repair.is_some()
+            && !policy.emitted_first_post_validation_repair_action;
+        let active_repair = if first_post_validation_repair_action {
+            policy.emitted_first_post_validation_repair_action = true;
+            policy
+                .validation_repair
+                .as_ref()
+                .map(ValidationRepairSnapshot::from)
+        } else {
+            None
+        };
         policy.consecutive_writes_without_shell = 0;
         policy.writes_since_shell_probe = 0;
         policy.writes_since_shell_probe_paths.clear();
         policy.total_shell_probes += 1;
+        let total_shell_probes = policy.total_shell_probes;
+        drop(policy);
+
+        if first_validation_probe {
+            self.trace.event(
+                "agent.stage.first_validation_probe",
+                json!({
+                    "command": command,
+                    "command_family": &command_family,
+                    "status": output.status.code(),
+                    "success": output.status.success(),
+                    "total_shell_probes": total_shell_probes,
+                }),
+            )?;
+        }
+        if first_post_validation_repair_action {
+            self.trace.event(
+                "agent.stage.first_post_validation_repair_action",
+                json!({
+                    "action": "validation_probe",
+                    "command": command,
+                    "command_family": &command_family,
+                    "status": output.status.code(),
+                    "success": output.status.success(),
+                    "total_shell_probes": total_shell_probes,
+                    "active_repair": active_repair,
+                }),
+            )?;
+        }
+
+        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
 
         if output.status.success() {
             let previous = policy.validation_repair.take();
