@@ -33,6 +33,7 @@ const REPAIR_HANDOFF_RAW_TOOL_RESULT_MAX_CHARS: usize = 3_000;
 const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
 const MAX_REPAIR_NO_ACTION_TURNS: usize = 2;
 const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
+const HIDDEN_ONLY_NO_ACTION_ESCALATION_TURNS: usize = 2;
 const MAX_PRE_VALIDATION_REPEATED_INSPECTIONS: usize = 4;
 const NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER: usize = 20;
 const REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT: usize = 1_024;
@@ -253,6 +254,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
 
     let mut final_summary = String::new();
     let mut consecutive_empty_responses = 0usize;
+    let mut consecutive_hidden_only_no_action_turns = 0usize;
     let mut repair_no_action_tracker = RepairNoActionTracker::default();
     let mut exhausted_iterations = true;
     for turn in 1..=config.max_iterations {
@@ -325,6 +327,9 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         )?;
         let policy = scope.policy_snapshot();
         let tool_calls_this_turn = policy.total_tool_calls - policy_before_turn.total_tool_calls;
+        let wrote_this_turn =
+            policy.total_write_operations > policy_before_turn.total_write_operations;
+        let probed_this_turn = policy.total_shell_probes > policy_before_turn.total_shell_probes;
         trace.event(
             "agent.context.turn_pressure",
             serde_json::json!({
@@ -370,6 +375,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         }
         if response.trim().is_empty() {
             if policy.validation_required_after_write {
+                consecutive_hidden_only_no_action_turns = 0;
                 trace.event(
                     "agent.validation.required_after_edit",
                     serde_json::json!({
@@ -388,6 +394,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 continue;
             }
             if let Some(decision) = &repair_no_action {
+                consecutive_hidden_only_no_action_turns = 0;
                 final_summary = format!(
                     "turn {turn} made no validation-repair edit or probe after validation failure"
                 );
@@ -396,6 +403,69 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 )));
                 continue;
             }
+            if thinking_chars_this_turn > 0 && !wrote_this_turn && !probed_this_turn {
+                consecutive_hidden_only_no_action_turns += 1;
+                let escalation_required = consecutive_hidden_only_no_action_turns
+                    >= HIDDEN_ONLY_NO_ACTION_ESCALATION_TURNS;
+                trace.event(
+                    "agent.turn.thinking_only_response",
+                    serde_json::json!({
+                        "turn": turn,
+                        "thinking_chars_this_turn": thinking_chars_this_turn,
+                        "consecutive_empty_responses": consecutive_empty_responses,
+                        "consecutive_hidden_only_no_action_turns": consecutive_hidden_only_no_action_turns,
+                    }),
+                )?;
+                trace.event(
+                    "agent.turn.hidden_only_no_action",
+                    serde_json::json!({
+                        "turn": turn,
+                        "thinking_chars_this_turn": thinking_chars_this_turn,
+                        "tool_calls_this_turn": tool_calls_this_turn,
+                        "wrote_this_turn": wrote_this_turn,
+                        "probed_this_turn": probed_this_turn,
+                        "consecutive_hidden_only_no_action_turns": consecutive_hidden_only_no_action_turns,
+                        "escalation_required": escalation_required,
+                        "policy": policy,
+                    }),
+                )?;
+                if escalation_required {
+                    final_summary = hidden_only_no_action_hard_failure_summary(
+                        turn,
+                        consecutive_hidden_only_no_action_turns,
+                    );
+                    trace.event(
+                        "agent.turn.hidden_only_no_action_escalated",
+                        serde_json::json!({
+                            "turn": turn,
+                            "consecutive_hidden_only_no_action_turns": consecutive_hidden_only_no_action_turns,
+                            "thinking_chars_this_turn": thinking_chars_this_turn,
+                            "tool_calls_this_turn": tool_calls_this_turn,
+                        }),
+                    )?;
+                    trace.event(
+                        "agent.turn.hidden_only_no_action_hard_failed",
+                        serde_json::json!({
+                            "turn": turn,
+                            "consecutive_hidden_only_no_action_turns": consecutive_hidden_only_no_action_turns,
+                            "thinking_chars_this_turn": thinking_chars_this_turn,
+                            "tool_calls_this_turn": tool_calls_this_turn,
+                            "final_summary": final_summary,
+                        }),
+                    )?;
+                    exhausted_iterations = false;
+                    break;
+                }
+                final_summary = format!(
+                    "turn {turn} produced hidden reasoning but no source mutation, validation probe, or final text"
+                );
+                messages.push(LlmMessage::user(hidden_only_no_action_prompt(
+                    consecutive_hidden_only_no_action_turns,
+                    tool_calls_this_turn,
+                )));
+                continue;
+            }
+            consecutive_hidden_only_no_action_turns = 0;
             if tool_calls_this_turn > 0 {
                 trace.event(
                     "agent.turn.tool_only_response",
@@ -459,6 +529,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             continue;
         }
         consecutive_empty_responses = 0;
+        consecutive_hidden_only_no_action_turns = 0;
         final_summary = response.clone();
         messages.push(LlmMessage::assistant(response));
         if policy.validation_required_after_write {
@@ -630,6 +701,15 @@ fn repair_no_action_failure_summary(turn: usize) -> String {
 fn empty_response_hard_failure_summary(turn: usize, consecutive_empty_responses: usize) -> String {
     format!(
         "turn {turn} produced {consecutive_empty_responses} consecutive empty responses with no tool calls or final text"
+    )
+}
+
+fn hidden_only_no_action_hard_failure_summary(
+    turn: usize,
+    consecutive_hidden_only_no_action_turns: usize,
+) -> String {
+    format!(
+        "turn {turn} produced {consecutive_hidden_only_no_action_turns} consecutive hidden-only no-action responses without source mutation, validation probe, or final text"
     )
 }
 
@@ -2668,6 +2748,21 @@ fn empty_response_prompt(consecutive_empty_responses: usize) -> String {
     )
 }
 
+fn hidden_only_no_action_prompt(
+    consecutive_hidden_only_no_action_turns: usize,
+    tool_calls_this_turn: usize,
+) -> String {
+    format!(
+        "Hidden-only no-action turn detected. Your previous turn produced hidden reasoning \
+         but no visible final text, no source mutation, and no validation probe. \
+         Consecutive hidden-only no-action turns: {consecutive_hidden_only_no_action_turns}. \
+         Tool calls in the previous turn: {tool_calls_this_turn}.\n\
+         In the next turn, take exactly one concrete action: write or patch the next source change, \
+         run a deterministic validation probe, or reply FAIL with a concrete blocker. \
+         Do not repeat broad inspection or restate the plan."
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EmptyResponseDecision {
     escalation_required: bool,
@@ -4176,6 +4271,44 @@ mod tests {
         assert!(trace.contains("\"kind\":\"agent.turn.thinking_only_response\""));
         assert!(trace.contains("\"thinking_chars_this_turn\":49"));
         assert!(trace.contains("Considering whether to edit files or answer DONE."));
+    }
+
+    #[tokio::test]
+    async fn fixture_escalates_repeated_hidden_only_no_action_turns() {
+        let fixture = AgentFixture::new("Inspect, then implement.");
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk("list_tree", HashMap::new())],
+            vec![StreamChunk::Thinking(
+                "I should write src/lib.rs now, but I am still planning.".to_string(),
+            )],
+            vec![StreamChunk::Thinking(
+                "I need to stop going in circles and write the code now.".to_string(),
+            )],
+            vec![tool_call_chunk(
+                "write_file",
+                HashMap::from([
+                    ("path".to_string(), json!("src/lib.rs")),
+                    (
+                        "content".to_string(),
+                        json!("pub fn answer() -> u32 { 42 }\n"),
+                    ),
+                ]),
+            )],
+        ]);
+
+        let summary = fixture.run(&gateway, 4).await;
+
+        assert_eq!(
+            summary.final_summary,
+            "turn 2 produced 2 consecutive hidden-only no-action responses without source mutation, validation probe, or final text"
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.turn.hidden_only_no_action\""));
+        assert!(trace.contains("\"kind\":\"agent.turn.hidden_only_no_action_escalated\""));
+        assert!(trace.contains("\"kind\":\"agent.turn.hidden_only_no_action_hard_failed\""));
+        assert!(trace.contains("\"tool_calls_this_turn\":1"));
+        assert!(trace.contains("\"tool_calls_this_turn\":0"));
+        assert!(!trace.contains("pub fn answer"));
     }
 
     #[tokio::test]
