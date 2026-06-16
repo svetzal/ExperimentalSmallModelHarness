@@ -40,6 +40,8 @@ const REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT: usize = 1_024;
 const MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH: usize = 12;
 const DEFAULT_REPAIR_EXIT_THINKING_TOKENS: usize = 16_384;
 const ACTION_BOUNDARY_INTENT_HIT_LIMIT: usize = 2;
+const ACTION_BOUNDARY_INTENT_BUFFER_CHARS: usize = 4_096;
+const ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -1087,6 +1089,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         let mut call_thinking_chunk_count = 0usize;
         let mut call_thinking_chars = 0usize;
         let mut call_action_intent_hits = 0usize;
+        let mut call_action_intent_buffer = String::new();
+        let mut last_action_intent_hit_token: Option<usize> = None;
         trace_model_progress_status(ModelProgressStatusInput {
             trace,
             turn,
@@ -1236,6 +1240,11 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     thinking_chars += thinking.len();
                     call_thinking_chunk_count += 1;
                     call_thinking_chars += thinking.len();
+                    push_bounded_buffer(
+                        &mut call_action_intent_buffer,
+                        &thinking,
+                        ACTION_BOUNDARY_INTENT_BUFFER_CHARS,
+                    );
                     trace.event(
                         "llm.stream.thinking",
                         serde_json::json!({
@@ -1250,8 +1259,14 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         }),
                     )?;
                     let call_thinking_estimated_tokens = estimate_tokens(call_thinking_chars);
-                    if action_intent_signal(&thinking) {
+                    if action_intent_signal(&call_action_intent_buffer)
+                        && last_action_intent_hit_token.is_none_or(|last_hit_token| {
+                            call_thinking_estimated_tokens
+                                >= last_hit_token + ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS
+                        })
+                    {
                         call_action_intent_hits += 1;
+                        last_action_intent_hit_token = Some(call_thinking_estimated_tokens);
                     }
                     if !validation_repair_active
                         && action_boundary_interrupt_tokens > 0
@@ -1269,7 +1284,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                             action_boundary_interrupt_tokens,
                             action_intent_hits: call_action_intent_hits,
                             hit_limit: ACTION_BOUNDARY_INTENT_HIT_LIMIT,
-                            latest_preview: limit_preview(&thinking, 240),
+                            latest_preview: limit_preview(&call_action_intent_buffer, 240),
                         };
                         trace.event("agent.action_boundary.interrupted", &interrupt)?;
                         action_boundary_interrupted = Some(interrupt);
@@ -2596,6 +2611,8 @@ fn action_intent_signal(thinking: &str) -> bool {
         "let me",
         "i will",
         "i'll",
+        "i'm going to",
+        "i am going to",
         "i should",
         "i need to",
         "now i",
@@ -2618,6 +2635,22 @@ fn action_intent_signal(thinking: &str) -> bool {
     .iter()
     .any(|phrase| text.contains(phrase));
     intent && action
+}
+
+fn push_bounded_buffer(buffer: &mut String, chunk: &str, max_chars: usize) {
+    if max_chars == 0 {
+        buffer.clear();
+        return;
+    }
+    buffer.push_str(chunk);
+    if buffer.len() <= max_chars {
+        return;
+    }
+    let mut start = buffer.len() - max_chars;
+    while !buffer.is_char_boundary(start) {
+        start += 1;
+    }
+    buffer.drain(..start);
 }
 
 fn inspection_signature(call: &LlmToolCall) -> Option<String> {
@@ -2978,6 +3011,9 @@ mod tests {
         ));
         assert!(action_intent_signal(
             "I will use patch_file to edit src/lib.rs."
+        ));
+        assert!(action_intent_signal(
+            "I'm going to write the first source file."
         ));
         assert!(!action_intent_signal(
             "The code probably needs more structure."
@@ -3651,6 +3687,7 @@ mod tests {
         let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
         let gateway = ScriptedGateway::new(vec![vec![
             StreamChunk::Thinking("Let me write the first file. ".to_string()),
+            StreamChunk::Thinking("x".repeat(ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS * 4)),
             StreamChunk::Thinking("I will use write_file for src/lib.rs. ".to_string()),
         ]]);
 
@@ -3689,6 +3726,56 @@ mod tests {
         assert!(content.contains("\"kind\":\"agent.action_boundary.interrupted\""));
         assert!(content.contains("\"action_intent_hits\":2"));
         assert!(!content.contains("\"kind\":\"llm.thinking_only_stream.hard_failed\""));
+    }
+
+    #[tokio::test]
+    async fn stream_response_detects_action_boundary_across_split_thinking_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let gateway = ScriptedGateway::new(vec![vec![
+            StreamChunk::Thinking("I".to_string()),
+            StreamChunk::Thinking("'m".to_string()),
+            StreamChunk::Thinking(" going".to_string()),
+            StreamChunk::Thinking(" to".to_string()),
+            StreamChunk::Thinking(" write".to_string()),
+            StreamChunk::Thinking(" src/lib.rs".to_string()),
+            StreamChunk::Thinking("x".repeat(ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS * 4)),
+            StreamChunk::Thinking(" before calling write_file.".to_string()),
+        ]]);
+
+        let result = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &[],
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 1,
+                ..Default::default()
+            },
+            context_window_tokens: Some(8_000),
+            packet_type: "multi-file-patch",
+            expected_output_tokens: 4_096,
+            max_thinking_only_tokens: usize::MAX,
+            repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 1,
+            validation_repair_active: false,
+            transcript_policy: TranscriptPolicy::FullTranscript,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "");
+        assert!(result.action_boundary_interrupted.is_some());
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"agent.action_boundary.interrupted\""));
+        assert!(content.contains("\"action_intent_hits\":2"));
     }
 
     #[tokio::test]
