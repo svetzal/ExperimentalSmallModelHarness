@@ -1250,7 +1250,7 @@ impl LlmTool for EditFileTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "edit_file".to_string(),
-                description: "Apply one or more structured text edits to an existing UTF-8 file under the active experiment root. Use replace_exact for a unique snippet, replace_lines/delete_lines for known line ranges, and insert_before/insert_after for a unique anchor."
+                description: "Apply one or more structured text edits to an existing UTF-8 file under the active experiment root. Use replace_exact for a unique snippet, replace_lines/delete_lines for known line ranges, and insert_before/insert_after for a unique anchor. Insert operations are line-aware: when the anchor is a complete line, inserted text is placed on adjacent complete lines instead of being concatenated onto the anchor line."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -1374,12 +1374,9 @@ impl EditFileTool {
                             let offset = content
                                 .find(anchor)
                                 .expect("exactly one match implies find succeeds");
-                            let insert_at = if kind == "insert_before" {
-                                offset
-                            } else {
-                                offset + anchor.len()
-                            };
-                            content.insert_str(insert_at, text);
+                            let insertion =
+                                line_aware_insertion(&content, offset, anchor.len(), kind, text);
+                            content.insert_str(insertion.offset, &insertion.text);
                         }
                         count => bail!("edits[{index}] {kind} is ambiguous: matched {count} times"),
                     }
@@ -1389,6 +1386,8 @@ impl EditFileTool {
                         "match_count": matches,
                         "anchor_bytes": anchor.len(),
                         "inserted_bytes": text.len(),
+                        "normalized_inserted_bytes": content.len() - before_edit_len,
+                        "line_boundary_normalized": content.len() - before_edit_len != text.len(),
                         "bytes_delta": content.len() as isize - before_edit_len as isize,
                     })
                 }
@@ -1797,6 +1796,61 @@ fn split_lines_preserving_newlines(content: &str) -> Vec<String> {
         Vec::new()
     } else {
         content.split_inclusive('\n').map(str::to_string).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedInsertion {
+    offset: usize,
+    text: String,
+}
+
+fn line_aware_insertion(
+    content: &str,
+    anchor_offset: usize,
+    anchor_len: usize,
+    kind: &str,
+    text: &str,
+) -> NormalizedInsertion {
+    let anchor_end = anchor_offset + anchor_len;
+    let anchor_at_line_start = anchor_offset == 0 || content[..anchor_offset].ends_with('\n');
+    let anchor_at_line_end = anchor_end == content.len() || content[anchor_end..].starts_with('\n');
+    let anchor_is_complete_line = anchor_at_line_start && anchor_at_line_end;
+
+    if !anchor_is_complete_line {
+        return NormalizedInsertion {
+            offset: if kind == "insert_before" {
+                anchor_offset
+            } else {
+                anchor_end
+            },
+            text: text.to_string(),
+        };
+    }
+
+    if kind == "insert_after" {
+        let offset = if content[anchor_end..].starts_with('\n') {
+            anchor_end + '\n'.len_utf8()
+        } else {
+            anchor_end
+        };
+        let mut normalized = text.to_string();
+        if offset < content.len() && !normalized.ends_with('\n') {
+            normalized.push('\n');
+        }
+        NormalizedInsertion {
+            offset,
+            text: normalized,
+        }
+    } else {
+        let mut normalized = text.to_string();
+        if !normalized.ends_with('\n') {
+            normalized.push('\n');
+        }
+        NormalizedInsertion {
+            offset: anchor_offset,
+            text: normalized,
+        }
     }
 }
 
@@ -2597,6 +2651,72 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "TWO\nthree\nfour\n"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_file_insert_after_complete_line_anchor_starts_next_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let tool = EditFileTool { scope };
+        let result = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "insert_after",
+                            "anchor": "two",
+                            "text": "inserted"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "one\ntwo\ninserted\nthree\n"
+        );
+        assert_eq!(result["edits_applied"][0]["line_boundary_normalized"], true);
+    }
+
+    #[tokio::test]
+    async fn edit_file_insert_before_complete_line_anchor_ends_inserted_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let tool = EditFileTool { scope };
+        let result = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "insert_before",
+                            "anchor": "two",
+                            "text": "inserted"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "one\ninserted\ntwo\nthree\n"
+        );
+        assert_eq!(result["edits_applied"][0]["line_boundary_normalized"], true);
     }
 
     #[test]
