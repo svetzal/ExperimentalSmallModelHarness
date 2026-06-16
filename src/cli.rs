@@ -45,7 +45,7 @@ enum Command {
         context_window_tokens: Option<usize>,
 
         /// Packet type used for default output-token budgeting.
-        #[arg(long, default_value = "multi-file-patch")]
+        #[arg(long, default_value = "multi-file-edit")]
         packet_type: String,
 
         /// Override the packet output-token budget.

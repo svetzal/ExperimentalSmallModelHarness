@@ -159,6 +159,7 @@ pub fn default_expected_output_tokens(packet_type: &str) -> usize {
     match packet_type {
         "diagnosis-only" => 512,
         "narrow-patch" => 2_048,
+        "multi-file-edit" => 4_096,
         "multi-file-patch" => 4_096,
         "full-small-project" => 8_192,
         "validation-repair" => 2_048,
@@ -818,9 +819,9 @@ fn system_prompt() -> String {
         "Create a project-appropriate .gitignore unless the task explicitly forbids additional files.",
         "Ignore generated build, dependency, cache, and virtual-environment directories such as target/, build/, dist/, node_modules/, .venv/, and __pycache__/. Do not list or inspect ignored paths unless explicitly needed.",
         "Use timeout_secs 1800 for first cargo build, cargo test, or similarly expensive validation probes.",
-        "After a validation failure, repair narrowly: cite the failing command and failure text, inspect only relevant code, prefer a focused patch for existing source, then rerun validation.",
+        "After a validation failure, repair narrowly: cite the failing command and failure text, inspect only relevant code, prefer edit_file for focused existing-source repairs, then rerun validation.",
         "For Rust projects after edits, prefer this validation ladder: cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings, focused tests, then cargo test.",
-        "If patch_file fails or times out for an existing source file, retry with a smaller diff. write_file replaces the entire file; use it for existing source only after reading the complete current file and preserving unrelated content.",
+        "Use edit_file for existing source edits. Use write_file for new files, or for existing source only after reading the complete current file and preserving unrelated content.",
         "Never end a turn with an empty response. Continue using tools, or reply DONE/FAIL as instructed.",
         "When you have completed the task and verified it, answer exactly DONE.",
         "If the task cannot be completed, answer exactly FAIL with one concise reason.",
@@ -2720,7 +2721,8 @@ fn action_intent_signal(thinking: &str) -> bool {
         "run cargo",
         "call write_file",
         "use write_file",
-        "use patch_file",
+        "call edit_file",
+        "use edit_file",
     ]
     .iter()
     .any(|phrase| text.contains(phrase));
@@ -2775,6 +2777,11 @@ fn is_meaningful_source_edit(call: &LlmToolCall, result: &ToolCallRunResult) -> 
         return false;
     }
     match call.name.as_str() {
+        "edit_file" => call
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(path_requires_validation_after_write),
         "patch_file" => true,
         "write_file" => call
             .arguments
@@ -2972,7 +2979,7 @@ fn hidden_only_no_action_prompt(
          but no visible final text, no source mutation, and no validation probe. \
          Consecutive hidden-only no-action turns: {consecutive_hidden_only_no_action_turns}. \
          Tool calls in the previous turn: {tool_calls_this_turn}.\n\
-         In the next turn, take exactly one concrete action: write or patch the next source change, \
+         In the next turn, take exactly one concrete action: write or edit the next source change, \
          run a deterministic validation probe, or reply FAIL with a concrete blocker. \
          Do not repeat broad inspection or restate the plan."
     )
@@ -3012,7 +3019,7 @@ fn action_boundary_interrupt_prompt_text(
          Estimated hidden-thinking tokens in the interrupted call: {tokens}. \
          Action-intent hits: {hits} of required {hit_limit}. \
          Latest preview: {preview}\n\
-         Your next turn must take exactly one concrete action: write or patch the next source change, \
+         Your next turn must take exactly one concrete action: write or edit the next source change, \
          run one deterministic validation or diagnostic probe, or reply FAIL with a concrete blocker. \
          Do not restate the plan. Do not repeat broad inspection.",
         tokens = interrupt.call_thinking_estimated_tokens,
@@ -3045,7 +3052,7 @@ fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
          Command family failure count: {command_count}\n\
          Failure-summary repeat count: {summary_count}\n\
          Your next turn must take exactly one targeted repair action based on the listed failure details: \
-         apply one focused source edit, run one deterministic diagnostic probe that narrows those exact details, \
+         apply one focused source edit with edit_file, run one deterministic diagnostic probe that narrows those exact details, \
          or reply FAIL with a concrete blocker. \
          Do not emit a text-only repair plan. Do not repeat broad inspection. \
          If you edit, run the validation ladder immediately afterward: cargo fmt --check, cargo clippy, focused tests, then broad tests.",
@@ -3084,7 +3091,7 @@ fn validation_repair_no_action_prompt(decision: &RepairNoActionDecision) -> Stri
          Failure text: {failure_text}\n\
          Failure details:\n{failure_details}\n\
          Repair read targets since the latest failed validation: {read_targets}\n\
-         Your next turn must take exactly one targeted repair action: apply one focused patch to the relevant source, \
+         Your next turn must take exactly one targeted repair action: apply one focused structured edit with edit_file to the relevant source, \
          replace an existing source file with write_file only after reading the complete file and preserving unrelated content, \
          run one deterministic probe that narrows the listed failure details, or reply FAIL with a concrete blocker. \
          Do not emit a text-only repair plan or restate the plan without taking one of those actions.",
@@ -3129,6 +3136,8 @@ mod tests {
 
     #[test]
     fn default_max_thinking_only_tokens_uses_generation_budget_fraction() {
+        assert_eq!(default_expected_output_tokens("multi-file-edit"), 4_096);
+        assert_eq!(default_expected_output_tokens("multi-file-patch"), 4_096);
         assert_eq!(default_max_thinking_only_tokens(4_096, None), 4_096);
         assert_eq!(default_max_thinking_only_tokens(4_096, Some(32_768)), 8_192);
         assert_eq!(default_max_thinking_only_tokens(4_096, Some(8_000)), 4_096);
@@ -3146,7 +3155,7 @@ mod tests {
             "Let me write the missing implementation now."
         ));
         assert!(action_intent_signal(
-            "I will use patch_file to edit src/lib.rs."
+            "I will use edit_file to edit src/lib.rs."
         ));
         assert!(action_intent_signal(
             "I'm going to write the first source file."
@@ -4492,7 +4501,7 @@ mod tests {
         assert!(prompt.contains("src/main.rs:12:5"));
         assert!(prompt.contains("src/main.rs (3)"));
         assert!(prompt.contains("exactly one targeted repair action"));
-        assert!(prompt.contains("apply one focused patch"));
+        assert!(prompt.contains("apply one focused structured edit with edit_file"));
         assert!(prompt.contains("write_file only after reading the complete file"));
         assert!(!prompt.contains("bounded write"));
         assert!(!prompt.contains("patch/write_file"));
@@ -4789,6 +4798,53 @@ mod tests {
         assert!(trace.contains("\"validation_probe\":true"));
         assert!(!trace.contains("\"kind\":\"agent.validation.required_after_edit\""));
         assert!(!trace.contains("\"turn\":2,\"max_iterations\""));
+    }
+
+    #[tokio::test]
+    async fn fixture_records_edit_file_as_source_mutation() {
+        let fixture = AgentFixture::new("Edit existing source, validate, and finish.");
+        fixture.write_fake_cargo(0, "ok");
+        std::fs::create_dir_all(fixture.workspace.join("src")).unwrap();
+        std::fs::write(
+            fixture.workspace.join("src/lib.rs"),
+            "pub fn answer() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "edit_file",
+                HashMap::from([
+                    ("path".to_string(), json!("src/lib.rs")),
+                    (
+                        "edits".to_string(),
+                        json!([
+                            {
+                                "kind": "replace_exact",
+                                "old": "    1\n",
+                                "new": "    42\n"
+                            }
+                        ]),
+                    ),
+                ]),
+            )],
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 3).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("src/lib.rs")).unwrap(),
+            "pub fn answer() -> u32 {\n    42\n}\n"
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"tool.edit_file\""));
+        assert!(trace.contains("\"kind\":\"agent.stage.first_source_mutation\""));
+        assert!(trace.contains("\"action\":\"write_intent\""));
     }
 
     #[tokio::test]

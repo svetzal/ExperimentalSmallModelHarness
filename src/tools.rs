@@ -766,7 +766,7 @@ pub fn coding_tools(scope: &ToolScope) -> Vec<Box<dyn LlmTool>> {
         Box::new(WriteFileTool {
             scope: scope.clone(),
         }),
-        Box::new(PatchFileTool {
+        Box::new(EditFileTool {
             scope: scope.clone(),
         }),
         Box::new(ShellCommandTool {
@@ -1180,7 +1180,7 @@ impl LlmTool for WriteFileTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "write_file".to_string(),
-                description: "Create a new UTF-8 file or replace an entire existing UTF-8 file under the active experiment root. For existing source repairs, prefer patch_file; write_file is whole-file replacement and must preserve unrelated content."
+                description: "Create a new UTF-8 file or replace an entire existing UTF-8 file under the active experiment root. For existing source repairs, prefer edit_file; write_file is whole-file replacement and must preserve unrelated content."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -1219,6 +1219,232 @@ impl WriteFileTool {
         Ok(json!({
             "path": self.scope.relative_display(&path),
             "bytes_written": content.len()
+        }))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EditFileTool {
+    scope: ToolScope,
+}
+
+#[async_trait]
+impl LlmTool for EditFileTool {
+    async fn run(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &ToolRunCtx,
+    ) -> mojentic::Result<Value> {
+        self.scope.note_tool_call();
+        let result = self.edit(args).await.map_err(to_mojentic_error);
+        let payload = match &result {
+            Ok(value) => value.clone(),
+            Err(error) => json!({ "error": error.to_string() }),
+        };
+        self.scope.trace_tool_event("tool.edit_file", payload);
+        result
+    }
+
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            r#type: "function".to_string(),
+            function: FunctionDescriptor {
+                name: "edit_file".to_string(),
+                description: "Apply one or more structured text edits to an existing UTF-8 file under the active experiment root. Use replace_exact for a unique snippet, replace_lines/delete_lines for known line ranges, and insert_before/insert_after for a unique anchor."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "edits": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {
+                                        "type": "string",
+                                        "enum": [
+                                            "replace_exact",
+                                            "replace_lines",
+                                            "insert_before",
+                                            "insert_after",
+                                            "delete_lines"
+                                        ]
+                                    },
+                                    "old": {
+                                        "type": "string",
+                                        "description": "Existing unique snippet for replace_exact."
+                                    },
+                                    "new": {
+                                        "type": "string",
+                                        "description": "Replacement text for replace_exact or replace_lines."
+                                    },
+                                    "anchor": {
+                                        "type": "string",
+                                        "description": "Existing unique snippet for insert_before or insert_after."
+                                    },
+                                    "text": {
+                                        "type": "string",
+                                        "description": "Inserted text for insert_before or insert_after."
+                                    },
+                                    "start_line": { "type": "integer", "minimum": 1 },
+                                    "end_line": { "type": "integer", "minimum": 1 },
+                                    "expected": {
+                                        "type": "string",
+                                        "description": "Optional context that must appear in the selected line range."
+                                    }
+                                },
+                                "required": ["kind"]
+                            }
+                        }
+                    },
+                    "required": ["path", "edits"]
+                }),
+            },
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn LlmTool> {
+        Box::new(self.clone())
+    }
+}
+
+impl EditFileTool {
+    async fn edit(&self, args: &HashMap<String, Value>) -> Result<Value> {
+        let path_arg = required_str(args, "path")?;
+        let edits = required_array(args, "edits")?;
+        let path = self.scope.resolve_existing_or_new(path_arg)?;
+        self.scope.check_write(&path)?;
+        if !path.is_file() {
+            bail!(
+                "edit_file can only edit existing files; use write_file to create {}",
+                self.scope.relative_display(&path)
+            );
+        }
+
+        let mut content = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        let bytes_before = content.len();
+        let mut applied = Vec::new();
+
+        for (index, edit) in edits.iter().enumerate() {
+            let object = edit
+                .as_object()
+                .with_context(|| format!("edits[{index}] must be an object"))?;
+            let kind = required_edit_str(object, index, "kind")?;
+            let before_edit_len = content.len();
+            let summary = match kind {
+                "replace_exact" => {
+                    let old = required_edit_str(object, index, "old")?;
+                    if old.is_empty() {
+                        bail!("edits[{index}].old must not be empty");
+                    }
+                    let new = required_edit_str(object, index, "new")?;
+                    let matches = content.match_indices(old).count();
+                    match matches {
+                        0 => bail!("edits[{index}] replace_exact found no match"),
+                        1 => {
+                            content = content.replacen(old, new, 1);
+                        }
+                        count => bail!(
+                            "edits[{index}] replace_exact is ambiguous: matched {count} times"
+                        ),
+                    }
+                    json!({
+                        "index": index,
+                        "kind": kind,
+                        "match_count": matches,
+                        "old_bytes": old.len(),
+                        "new_bytes": new.len(),
+                        "bytes_delta": content.len() as isize - before_edit_len as isize,
+                    })
+                }
+                "insert_before" | "insert_after" => {
+                    let anchor = required_edit_str(object, index, "anchor")?;
+                    if anchor.is_empty() {
+                        bail!("edits[{index}].anchor must not be empty");
+                    }
+                    let text = required_edit_str(object, index, "text")?;
+                    let matches = content.match_indices(anchor).count();
+                    match matches {
+                        0 => bail!("edits[{index}] {kind} found no anchor match"),
+                        1 => {
+                            let offset = content
+                                .find(anchor)
+                                .expect("exactly one match implies find succeeds");
+                            let insert_at = if kind == "insert_before" {
+                                offset
+                            } else {
+                                offset + anchor.len()
+                            };
+                            content.insert_str(insert_at, text);
+                        }
+                        count => bail!("edits[{index}] {kind} is ambiguous: matched {count} times"),
+                    }
+                    json!({
+                        "index": index,
+                        "kind": kind,
+                        "match_count": matches,
+                        "anchor_bytes": anchor.len(),
+                        "inserted_bytes": text.len(),
+                        "bytes_delta": content.len() as isize - before_edit_len as isize,
+                    })
+                }
+                "replace_lines" => {
+                    let new = required_edit_str(object, index, "new")?;
+                    let start_line = required_edit_u64(object, index, "start_line")?;
+                    let end_line = required_edit_u64(object, index, "end_line")?;
+                    let (start_index, end_index, selected) =
+                        selected_line_range(&content, start_line, end_line, index)?;
+                    verify_expected_context(object, index, &selected)?;
+                    let mut lines = split_lines_preserving_newlines(&content);
+                    lines.splice(start_index..end_index, [new.to_string()]);
+                    content = lines.concat();
+                    json!({
+                        "index": index,
+                        "kind": kind,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "old_bytes": selected.len(),
+                        "new_bytes": new.len(),
+                        "bytes_delta": content.len() as isize - before_edit_len as isize,
+                    })
+                }
+                "delete_lines" => {
+                    let start_line = required_edit_u64(object, index, "start_line")?;
+                    let end_line = required_edit_u64(object, index, "end_line")?;
+                    let (start_index, end_index, selected) =
+                        selected_line_range(&content, start_line, end_line, index)?;
+                    verify_expected_context(object, index, &selected)?;
+                    let mut lines = split_lines_preserving_newlines(&content);
+                    lines.drain(start_index..end_index);
+                    content = lines.concat();
+                    json!({
+                        "index": index,
+                        "kind": kind,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "deleted_bytes": selected.len(),
+                        "bytes_delta": content.len() as isize - before_edit_len as isize,
+                    })
+                }
+                other => bail!("edits[{index}].kind is unsupported: {other}"),
+            };
+            applied.push(summary);
+        }
+
+        self.scope.note_write_intent(std::slice::from_ref(&path))?;
+        tokio::fs::write(&path, content.as_bytes())
+            .await
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(json!({
+            "path": self.scope.relative_display(&path),
+            "edit_count": applied.len(),
+            "bytes_before": bytes_before,
+            "bytes_after": content.len(),
+            "edits_applied": applied,
         }))
     }
 }
@@ -1536,6 +1762,81 @@ fn required_str<'a>(args: &'a HashMap<String, Value>, key: &str) -> Result<&'a s
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .with_context(|| format!("missing required string argument {key:?}"))
+}
+
+fn required_array<'a>(args: &'a HashMap<String, Value>, key: &str) -> Result<&'a Vec<Value>> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("missing required non-empty array argument {key:?}"))
+}
+
+fn required_edit_str<'a>(
+    edit: &'a serde_json::Map<String, Value>,
+    index: usize,
+    key: &str,
+) -> Result<&'a str> {
+    edit.get(key)
+        .and_then(Value::as_str)
+        .with_context(|| format!("missing required string argument edits[{index}].{key}"))
+}
+
+fn required_edit_u64(
+    edit: &serde_json::Map<String, Value>,
+    index: usize,
+    key: &str,
+) -> Result<u64> {
+    edit.get(key)
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= 1)
+        .with_context(|| format!("missing required positive integer argument edits[{index}].{key}"))
+}
+
+fn split_lines_preserving_newlines(content: &str) -> Vec<String> {
+    if content.is_empty() {
+        Vec::new()
+    } else {
+        content.split_inclusive('\n').map(str::to_string).collect()
+    }
+}
+
+fn selected_line_range(
+    content: &str,
+    start_line: u64,
+    end_line: u64,
+    edit_index: usize,
+) -> Result<(usize, usize, String)> {
+    if end_line < start_line {
+        bail!("edits[{edit_index}].end_line must be greater than or equal to start_line");
+    }
+    let lines = split_lines_preserving_newlines(content);
+    let total_lines = lines.len() as u64;
+    if start_line > total_lines || end_line > total_lines {
+        bail!(
+            "edits[{edit_index}] line range {start_line}-{end_line} exceeds file length {total_lines}"
+        );
+    }
+    let start_index = (start_line - 1) as usize;
+    let end_index = end_line as usize;
+    let selected = lines[start_index..end_index].concat();
+    Ok((start_index, end_index, selected))
+}
+
+fn verify_expected_context(
+    edit: &serde_json::Map<String, Value>,
+    index: usize,
+    selected: &str,
+) -> Result<()> {
+    let Some(expected) = edit.get("expected").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if expected.is_empty() {
+        bail!("edits[{index}].expected must not be empty when provided");
+    }
+    if !selected.contains(expected) {
+        bail!("edits[{index}].expected was not found in the selected line range");
+    }
+    Ok(())
 }
 
 fn validate_line_range(line_start: Option<u64>, line_end: Option<u64>) -> Result<()> {
@@ -2149,6 +2450,167 @@ mod tests {
                 .guidance
                 .contains("bounded write_file")
         );
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_exact_updates_unique_snippet() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(&file, "pub fn value() -> i32 {\n    1\n}\n").unwrap();
+
+        let tool = EditFileTool {
+            scope: scope.clone(),
+        };
+        let result = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "replace_exact",
+                            "old": "    1\n",
+                            "new": "    2\n"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(result["edit_count"], 1);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "pub fn value() -> i32 {\n    2\n}\n"
+        );
+        assert_eq!(scope.policy_snapshot().writes_since_shell_probe, 1);
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_ambiguous_exact_match_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(&file, "same\nsame\n").unwrap();
+
+        let tool = EditFileTool {
+            scope: scope.clone(),
+        };
+        let error = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "replace_exact",
+                            "old": "same",
+                            "new": "changed"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ambiguous"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "same\nsame\n");
+        assert_eq!(scope.policy_snapshot().writes_since_shell_probe, 0);
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_lines_checks_expected_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let tool = EditFileTool { scope };
+        let error = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "replace_lines",
+                            "start_line": 2,
+                            "end_line": 2,
+                            "expected": "missing",
+                            "new": "TWO\n"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("expected was not found"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_supports_line_and_anchor_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let tool = EditFileTool { scope };
+        tool.edit(&HashMap::from([
+            ("path".to_string(), json!("workspace/src/lib.rs")),
+            (
+                "edits".to_string(),
+                json!([
+                    {
+                        "kind": "replace_lines",
+                        "start_line": 2,
+                        "end_line": 2,
+                        "expected": "two",
+                        "new": "TWO\n"
+                    },
+                    {
+                        "kind": "insert_after",
+                        "anchor": "three\n",
+                        "text": "four\n"
+                    },
+                    {
+                        "kind": "delete_lines",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "expected": "one"
+                    }
+                ]),
+            ),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "TWO\nthree\nfour\n"
+        );
+    }
+
+    #[test]
+    fn coding_tools_exposes_edit_file_instead_of_patch_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let tools = coding_tools(&scope);
+        let names = tools
+            .iter()
+            .map(|tool| tool.descriptor().function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"edit_file".to_string()));
+        assert!(!names.contains(&"patch_file".to_string()));
     }
 
     #[test]
