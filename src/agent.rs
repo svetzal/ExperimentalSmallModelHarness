@@ -32,6 +32,7 @@ const REPAIR_HANDOFF_RAW_TOOL_RESULT_RECENT_COUNT: usize = 2;
 const REPAIR_HANDOFF_RAW_TOOL_RESULT_MAX_CHARS: usize = 3_000;
 const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
 const MAX_REPAIR_NO_ACTION_TURNS: usize = 2;
+const MAX_ACTION_BOUNDARY_NO_ACTION_TURNS: usize = 2;
 const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
 const HIDDEN_ONLY_NO_ACTION_ESCALATION_TURNS: usize = 2;
 const MAX_PRE_VALIDATION_REPEATED_INSPECTIONS: usize = 4;
@@ -261,6 +262,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     let mut final_summary = String::new();
     let mut consecutive_empty_responses = 0usize;
     let mut consecutive_hidden_only_no_action_turns = 0usize;
+    let mut action_boundary_no_action_tracker = ActionBoundaryNoActionTracker::default();
     let mut repair_no_action_tracker = RepairNoActionTracker::default();
     let mut exhausted_iterations = true;
     for turn in 1..=config.max_iterations {
@@ -381,6 +383,31 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             exhausted_iterations = false;
             break;
         }
+        let action_boundary_no_action = action_boundary_no_action_tracker.observe(
+            turn,
+            tool_calls_this_turn,
+            &policy_before_turn,
+            &policy,
+            action_boundary_interrupted.clone(),
+        );
+        if let Some(decision) = &action_boundary_no_action {
+            trace.event("agent.action_boundary.no_action", decision)?;
+            if decision.escalation_required {
+                final_summary = action_boundary_no_action_failure_summary(decision);
+                trace.event("agent.action_boundary.hard_failed", decision)?;
+                exhausted_iterations = false;
+                break;
+            }
+            final_summary = format!(
+                "turn {turn} action-boundary interrupt after hidden reasoning with no source mutation or validation probe"
+            );
+            trace.event("agent.action_boundary.prompted", &decision.interrupt)?;
+            if !response.trim().is_empty() {
+                messages.push(LlmMessage::assistant(response.clone()));
+            }
+            messages.push(LlmMessage::user(action_boundary_interrupt_prompt(decision)));
+            continue;
+        }
         if response.trim().is_empty() {
             if policy.validation_required_after_write {
                 consecutive_hidden_only_no_action_turns = 0;
@@ -417,9 +444,9 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                     "turn {turn} action-boundary interrupt after hidden reasoning with no visible action"
                 );
                 trace.event("agent.action_boundary.prompted", interrupt)?;
-                messages.push(LlmMessage::user(action_boundary_interrupt_prompt(
-                    interrupt,
-                )));
+                messages.push(LlmMessage::user(
+                    action_boundary_interrupt_prompt_for_interrupt(interrupt),
+                ));
                 continue;
             }
             if thinking_chars_this_turn > 0 && !wrote_this_turn && !probed_this_turn {
@@ -733,6 +760,13 @@ fn hidden_only_no_action_hard_failure_summary(
     )
 }
 
+fn action_boundary_no_action_failure_summary(decision: &ActionBoundaryNoActionDecision) -> String {
+    format!(
+        "turn {} produced {} consecutive action-boundary interrupts without source mutation or validation probe",
+        decision.turn, decision.consecutive_no_action_turns
+    )
+}
+
 fn repair_hard_failure_summary(decision: &RepairNoActionDecision) -> String {
     match decision.reason {
         RepairNoActionReason::NoRepairAction => repair_no_action_failure_summary(decision.turn),
@@ -839,6 +873,24 @@ struct ActionBoundaryInterrupt {
 }
 
 #[derive(Debug, Default)]
+struct ActionBoundaryNoActionTracker {
+    consecutive_no_action_turns: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActionBoundaryNoActionDecision {
+    turn: usize,
+    tool_calls_this_turn: usize,
+    consecutive_no_action_turns: usize,
+    escalation_required: bool,
+    interrupt: ActionBoundaryInterrupt,
+    total_write_operations_before_turn: usize,
+    total_write_operations_after_turn: usize,
+    total_shell_probes_before_turn: usize,
+    total_shell_probes_after_turn: usize,
+}
+
+#[derive(Debug, Default)]
 struct RepairNoActionTracker {
     active_failure_key: Option<String>,
     consecutive_no_action_turns: usize,
@@ -885,6 +937,44 @@ struct RepairDepthDecision {
 enum RepairDepthReason {
     MaxLlmCallDepth,
     RedContextAfterRepairAction,
+}
+
+impl ActionBoundaryNoActionTracker {
+    fn observe(
+        &mut self,
+        turn: usize,
+        tool_calls_this_turn: usize,
+        before: &ToolPolicySnapshot,
+        after: &ToolPolicySnapshot,
+        interrupt: Option<ActionBoundaryInterrupt>,
+    ) -> Option<ActionBoundaryNoActionDecision> {
+        let wrote_this_turn = after.total_write_operations > before.total_write_operations;
+        let probed_this_turn = after.total_shell_probes > before.total_shell_probes;
+        let Some(interrupt) = interrupt else {
+            if wrote_this_turn || probed_this_turn {
+                self.consecutive_no_action_turns = 0;
+            }
+            return None;
+        };
+        if wrote_this_turn || probed_this_turn {
+            self.consecutive_no_action_turns = 0;
+            return None;
+        }
+
+        self.consecutive_no_action_turns += 1;
+        Some(ActionBoundaryNoActionDecision {
+            turn,
+            tool_calls_this_turn,
+            consecutive_no_action_turns: self.consecutive_no_action_turns,
+            escalation_required: self.consecutive_no_action_turns
+                >= MAX_ACTION_BOUNDARY_NO_ACTION_TURNS,
+            interrupt,
+            total_write_operations_before_turn: before.total_write_operations,
+            total_write_operations_after_turn: after.total_write_operations,
+            total_shell_probes_before_turn: before.total_shell_probes,
+            total_shell_probes_after_turn: after.total_shell_probes,
+        })
+    }
 }
 
 impl RepairNoActionTracker {
@@ -2888,9 +2978,35 @@ fn hidden_only_no_action_prompt(
     )
 }
 
-fn action_boundary_interrupt_prompt(interrupt: &ActionBoundaryInterrupt) -> String {
+fn action_boundary_interrupt_prompt(decision: &ActionBoundaryNoActionDecision) -> String {
+    action_boundary_interrupt_prompt_text(
+        &decision.interrupt,
+        decision.consecutive_no_action_turns,
+        decision.escalation_required,
+    )
+}
+
+fn action_boundary_interrupt_prompt_for_interrupt(interrupt: &ActionBoundaryInterrupt) -> String {
+    action_boundary_interrupt_prompt_text(interrupt, 1, false)
+}
+
+fn action_boundary_interrupt_prompt_text(
+    interrupt: &ActionBoundaryInterrupt,
+    consecutive_no_action_turns: usize,
+    escalation_required: bool,
+) -> String {
+    let pressure = if escalation_required {
+        format!(
+            "Action-boundary escalation is active after {consecutive_no_action_turns} consecutive interrupted action-intent turns without a source edit or validation probe."
+        )
+    } else {
+        format!(
+            "Action-boundary no-action count: {consecutive_no_action_turns} consecutive interrupted action-intent turn(s) without a source edit or validation probe."
+        )
+    };
     format!(
-        "Action-boundary interrupt fired. Your hidden reasoning repeatedly stated intent to act, \
+        "{pressure}\n\
+         Action-boundary interrupt fired. Your hidden reasoning repeatedly stated intent to act, \
          but no assistant-visible content, completed tool call, source edit, validation probe, \
          or FAIL crossed the stream boundary.\n\
          Estimated hidden-thinking tokens in the interrupted call: {tokens}. \
@@ -4618,6 +4734,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_hard_stops_repeated_action_boundary_no_action() {
+        let fixture = AgentFixture::new("Inspect, then implement.");
+        let boundary_thinking = vec![
+            StreamChunk::Thinking("I will write the source change now. ".to_string()),
+            StreamChunk::Thinking("x".repeat(ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS * 4)),
+            StreamChunk::Thinking("I will use write_file for src/lib.rs. ".to_string()),
+        ];
+        let gateway =
+            ScriptedGateway::new(vec![boundary_thinking.clone(), boundary_thinking.clone()]);
+
+        let summary = fixture
+            .run_with_action_boundary_interrupt(&gateway, 3)
+            .await;
+
+        assert_eq!(
+            summary.final_summary,
+            "turn 2 produced 2 consecutive action-boundary interrupts without source mutation or validation probe"
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.action_boundary.no_action\""));
+        assert!(trace.contains("\"kind\":\"agent.action_boundary.prompted\""));
+        assert!(trace.contains("\"kind\":\"agent.action_boundary.hard_failed\""));
+        assert!(trace.contains("\"consecutive_no_action_turns\":2"));
+        assert!(!trace.contains("pub fn answer"));
+    }
+
+    #[tokio::test]
     async fn fixture_accepts_done_after_docs_only_write_following_validation() {
         let fixture = AgentFixture::new("Validate, write a README, and finish.");
         fixture.write_fake_cargo(0, "ok");
@@ -4826,6 +4969,34 @@ mod tests {
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     action_boundary_interrupt_tokens: 0,
+                    transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                },
+                gateway,
+                self.workspace.clone(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn run_with_action_boundary_interrupt(
+            &self,
+            gateway: &ScriptedGateway,
+            max_iterations: usize,
+        ) -> AgentRunSummary {
+            run_coding_agent_with_gateway(
+                AgentRunConfig {
+                    experiment_dir: self.experiment.clone(),
+                    goal_file: PathBuf::from("task.md"),
+                    model: "fake-model".to_string(),
+                    max_iterations,
+                    max_tool_iterations: 10,
+                    context_window_tokens: Some(131_072),
+                    packet_type: "narrow-patch".to_string(),
+                    expected_output_tokens: 2_048,
+                    num_predict: None,
+                    max_thinking_only_tokens: usize::MAX,
+                    repair_exit_thinking_tokens: 16_384,
+                    action_boundary_interrupt_tokens: 1,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                 },
                 gateway,
