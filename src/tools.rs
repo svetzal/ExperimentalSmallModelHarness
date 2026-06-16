@@ -46,6 +46,7 @@ struct ToolPolicyState {
     validation_repair_read_paths: BTreeMap<String, usize>,
     repeated_command_failures: HashMap<String, usize>,
     repeated_failure_summaries: HashMap<String, usize>,
+    latest_successful_validation_after_write: Option<SuccessfulValidationState>,
     patch_fallbacks_by_file: BTreeMap<String, PatchFallbackState>,
     total_tool_result_chars: usize,
     max_tool_result_chars: usize,
@@ -67,6 +68,7 @@ pub struct ToolPolicySnapshot {
     pub total_shell_probes: usize,
     pub validation_repair: Option<ValidationRepairSnapshot>,
     pub validation_repair_read_paths: BTreeMap<String, usize>,
+    pub latest_successful_validation_after_write: Option<SuccessfulValidationSnapshot>,
     pub patch_fallbacks: Vec<PatchFallbackSnapshot>,
     pub total_tool_result_chars: usize,
     pub total_tool_result_estimated_tokens: usize,
@@ -97,6 +99,36 @@ struct ValidationRepairState {
     failure_details: Vec<String>,
     repeated_command_family_count: usize,
     repeated_failure_summary_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SuccessfulValidationSnapshot {
+    pub command: String,
+    pub command_family: String,
+    pub status: Option<i32>,
+    pub total_shell_probes: usize,
+    pub total_write_operations: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuccessfulValidationState {
+    command: String,
+    command_family: String,
+    status: Option<i32>,
+    total_shell_probes: usize,
+    total_write_operations: usize,
+}
+
+impl From<&SuccessfulValidationState> for SuccessfulValidationSnapshot {
+    fn from(state: &SuccessfulValidationState) -> Self {
+        Self {
+            command: state.command.clone(),
+            command_family: state.command_family.clone(),
+            status: state.status,
+            total_shell_probes: state.total_shell_probes,
+            total_write_operations: state.total_write_operations,
+        }
+    }
 }
 
 impl From<&ValidationRepairState> for ValidationRepairSnapshot {
@@ -495,7 +527,12 @@ impl ToolScope {
         let command_family = command_family(command);
         let failure_text = failure_summary(&stderr.content, &stdout.content);
         let failure_details = failure_details(&stderr.content, &stdout.content);
+        let success = output.status.success();
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
+        let had_pending_source_writes = policy
+            .writes_since_shell_probe_paths
+            .keys()
+            .any(|path| path_requires_validation_after_write(path));
         let first_validation_probe = !policy.emitted_first_validation_probe;
         if first_validation_probe {
             policy.emitted_first_validation_probe = true;
@@ -516,6 +553,16 @@ impl ToolScope {
         policy.writes_since_shell_probe_paths.clear();
         policy.total_shell_probes += 1;
         let total_shell_probes = policy.total_shell_probes;
+        let total_write_operations = policy.total_write_operations;
+        if success && had_pending_source_writes {
+            policy.latest_successful_validation_after_write = Some(SuccessfulValidationState {
+                command: command.to_string(),
+                command_family: command_family.clone(),
+                status: output.status.code(),
+                total_shell_probes,
+                total_write_operations,
+            });
+        }
         drop(policy);
 
         if first_validation_probe {
@@ -525,7 +572,7 @@ impl ToolScope {
                     "command": command,
                     "command_family": &command_family,
                     "status": output.status.code(),
-                    "success": output.status.success(),
+                    "success": success,
                     "total_shell_probes": total_shell_probes,
                 }),
             )?;
@@ -538,7 +585,7 @@ impl ToolScope {
                     "command": command,
                     "command_family": &command_family,
                     "status": output.status.code(),
-                    "success": output.status.success(),
+                    "success": success,
                     "total_shell_probes": total_shell_probes,
                     "active_repair": active_repair,
                 }),
@@ -547,7 +594,7 @@ impl ToolScope {
 
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
 
-        if output.status.success() {
+        if success {
             let previous = policy.validation_repair.take();
             policy.validation_repair_read_paths.clear();
             drop(policy);
@@ -650,6 +697,10 @@ impl ToolScope {
                 .as_ref()
                 .map(ValidationRepairSnapshot::from),
             validation_repair_read_paths: policy.validation_repair_read_paths.clone(),
+            latest_successful_validation_after_write: policy
+                .latest_successful_validation_after_write
+                .as_ref()
+                .map(SuccessfulValidationSnapshot::from),
             patch_fallbacks: policy
                 .patch_fallbacks_by_file
                 .iter()
@@ -1754,6 +1805,9 @@ impl ShellCommandTool {
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
         let validation_probe = is_validation_probe(command);
+        let validation_probe_clears_pending_source_writes =
+            validation_probe && self.scope.policy_snapshot().validation_required_after_write;
+        let command_family = command_family(command);
         let before_mutation_snapshot = match self.scope.shell_mutation_snapshot() {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
@@ -1832,7 +1886,9 @@ impl ShellCommandTool {
         Ok(json!({
             "cwd": self.scope.relative_display(&cwd),
             "command": command,
+            "command_family": command_family,
             "validation_probe": validation_probe,
+            "validation_probe_clears_pending_source_writes": validation_probe_clears_pending_source_writes,
             "status": output.status.code(),
             "success": output.status.success(),
             "stdout": stdout.content,

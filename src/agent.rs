@@ -1,4 +1,7 @@
-use crate::tools::{ToolPolicySnapshot, ToolScope, ValidationRepairSnapshot, coding_tools};
+use crate::tools::{
+    SuccessfulValidationSnapshot, ToolPolicySnapshot, ToolScope, ValidationRepairSnapshot,
+    coding_tools,
+};
 use crate::trace::TraceRecorder;
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -265,14 +268,21 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     let mut consecutive_hidden_only_no_action_turns = 0usize;
     let mut action_boundary_no_action_tracker = ActionBoundaryNoActionTracker::default();
     let mut repair_no_action_tracker = RepairNoActionTracker::default();
+    let mut final_response_only_next_turn = false;
     let mut exhausted_iterations = true;
+    let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     for turn in 1..=config.max_iterations {
         let policy_before_turn = scope.policy_snapshot();
+        let active_tools = if final_response_only_next_turn {
+            &no_tools
+        } else {
+            &tools
+        };
         trace.event(
             "agent.context.estimated",
             context_snapshot(
                 &messages,
-                &tools,
+                active_tools,
                 &policy_before_turn,
                 config.context_window_tokens,
                 config.transcript_policy,
@@ -283,13 +293,14 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             serde_json::json!({
                 "turn": turn,
                 "max_iterations": config.max_iterations,
+                "final_response_only": final_response_only_next_turn,
             }),
         )?;
         let turn_result = match stream_response(StreamResponseRequest {
             gateway,
             model: &config.model,
             messages: &messages,
-            tools: &tools,
+            tools: active_tools,
             completion_config: completion_config.clone(),
             context_window_tokens: config.context_window_tokens,
             packet_type: &config.packet_type,
@@ -322,6 +333,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 return Err(error);
             }
         };
+        final_response_only_next_turn = false;
         let repair_no_content_interrupted = turn_result.repair_no_content_interrupted;
         let action_boundary_interrupted = turn_result.action_boundary_interrupted;
         let repair_depth_hard_stop = turn_result.repair_depth_hard_stop;
@@ -341,6 +353,8 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         let wrote_this_turn =
             policy.total_write_operations > policy_before_turn.total_write_operations;
         let probed_this_turn = policy.total_shell_probes > policy_before_turn.total_shell_probes;
+        let terminalize_after_validation =
+            should_terminalize_after_successful_validation(&policy_before_turn, &policy);
         trace.event(
             "agent.context.turn_pressure",
             serde_json::json!({
@@ -523,6 +537,21 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                     }),
                 )?;
                 final_summary = format!("turn {turn} used tools but produced no final text");
+                if let Some(validation) = terminalize_after_validation.as_ref() {
+                    trace.event(
+                        "agent.validation.success_terminal_prompted",
+                        serde_json::json!({
+                            "turn": turn,
+                            "tool_calls_this_turn": tool_calls_this_turn,
+                            "validation": validation,
+                        }),
+                    )?;
+                    final_response_only_next_turn = true;
+                    messages.push(LlmMessage::user(successful_validation_done_prompt(
+                        validation,
+                    )));
+                    continue;
+                }
                 messages.push(LlmMessage::user(
                     "You used tools but produced no final text. Continue from the current project state. \
                      If validation passed, reply exactly DONE. If validation failed, fix the cause and validate again.",
@@ -599,6 +628,21 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         if is_terminal_response(&final_summary) {
             exhausted_iterations = false;
             break;
+        }
+        if let Some(validation) = terminalize_after_validation.as_ref() {
+            trace.event(
+                "agent.validation.success_terminal_prompted",
+                serde_json::json!({
+                    "turn": turn,
+                    "tool_calls_this_turn": tool_calls_this_turn,
+                    "validation": validation,
+                }),
+            )?;
+            final_response_only_next_turn = true;
+            messages.push(LlmMessage::user(successful_validation_done_prompt(
+                validation,
+            )));
+            continue;
         }
         if let Some(repair) = &policy.validation_repair
             && should_prompt_validation_repair(&policy, &final_summary)
@@ -740,6 +784,32 @@ fn is_fail_response(response: &str) -> bool {
 
 fn should_prompt_validation_repair(policy: &ToolPolicySnapshot, response: &str) -> bool {
     policy.validation_repair.is_some() && !is_terminal_response(response)
+}
+
+fn should_terminalize_after_successful_validation(
+    before: &ToolPolicySnapshot,
+    after: &ToolPolicySnapshot,
+) -> Option<SuccessfulValidationSnapshot> {
+    let validation = after.latest_successful_validation_after_write.as_ref()?;
+    if validation.total_shell_probes <= before.total_shell_probes {
+        return None;
+    }
+    if after.validation_required_after_write || after.validation_repair.is_some() {
+        return None;
+    }
+    Some(validation.clone())
+}
+
+fn successful_validation_done_prompt(validation: &SuccessfulValidationSnapshot) -> String {
+    format!(
+        "The requested validation command has passed after the source edits.\n\
+         Passing command: {command}\n\
+         Command family: {command_family}\n\
+         Do not call any more tools. Do not run broader validation or formatting cleanup. \
+         Reply exactly DONE if the requested task is complete, or exactly FAIL with one concise blocker.",
+        command = validation.command,
+        command_family = validation.command_family,
+    )
 }
 
 fn repair_no_action_failure_summary(turn: usize) -> String {
@@ -1091,6 +1161,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let no_assistant_content_limit =
         expected_output_tokens.saturating_mul(NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER);
     let mut inspection_loop_tracker = InspectionLoopTracker::default();
+    let mut final_response_only_after_validation: Option<SuccessfulValidationSnapshot> = None;
+    let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     let correlation_id = format!(
         "harness-turn-{turn}-{}",
         chrono::Utc::now().timestamp_millis()
@@ -1105,12 +1177,17 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             .into());
         }
 
+        let active_tools = if final_response_only_after_validation.is_some() {
+            &no_tools
+        } else {
+            tools
+        };
         let ledger = context_assembly_ledger(ContextAssemblyInput {
             model,
             turn,
             llm_call_depth: depth,
             messages: &current_messages,
-            tools,
+            tools: active_tools,
             completion_config: &completion_config,
             context_window_tokens,
             previous_call_total_chars,
@@ -1195,8 +1272,12 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             stalled_candidate_checks,
             automatic_interrupt: false,
         })?;
-        let mut stream =
-            gateway.complete_stream(model, &current_messages, Some(tools), &completion_config);
+        let mut stream = gateway.complete_stream(
+            model,
+            &current_messages,
+            Some(active_tools),
+            &completion_config,
+        );
         let mut status_interval = tokio::time::interval(
             progress_status_interval_override.unwrap_or_else(progress_status_interval),
         );
@@ -1654,7 +1735,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         )?;
 
         for call in &accumulated_tool_calls {
-            let tool_result = run_tool_call(call, tools, &correlation_id).await;
+            let tool_result = run_tool_call(call, active_tools, &correlation_id).await;
             let tool_message = LlmMessage {
                 role: MessageRole::Tool,
                 content: Some(tool_result.content.clone()),
@@ -1686,10 +1767,29 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 trace.event("agent.inspection_loop.hard_failed", &decision)?;
                 anyhow::bail!("{}", inspection_loop_failure_summary(&decision));
             }
+            if final_response_only_after_validation.is_none()
+                && let Some(validation) = successful_validation_from_tool_result(&tool_result)
+            {
+                trace.event(
+                    "agent.validation.success_terminal_prompted",
+                    serde_json::json!({
+                        "turn": turn,
+                        "llm_call_depth": depth,
+                        "tool_call_id": &call.id,
+                        "tool_name": &call.name,
+                        "validation": &validation,
+                        "scope": "in_turn",
+                    }),
+                )?;
+                current_messages.push(LlmMessage::user(successful_validation_done_prompt(
+                    &validation,
+                )));
+                final_response_only_after_validation = Some(validation);
+            }
         }
         compact_retained_tool_results(
             &mut current_messages,
-            tools,
+            active_tools,
             trace,
             turn,
             depth,
@@ -2803,6 +2903,57 @@ fn is_validation_probe_result(result: &ToolCallRunResult) -> bool {
         == Some(true)
 }
 
+fn successful_validation_from_tool_result(
+    result: &ToolCallRunResult,
+) -> Option<SuccessfulValidationSnapshot> {
+    if !result.ok {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(&result.content).ok()?;
+    if value
+        .get("validation_probe")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    if value.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    if value
+        .get("validation_probe_clears_pending_source_writes")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    if value
+        .get("shell_mutation_requires_validation")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return None;
+    }
+    Some(SuccessfulValidationSnapshot {
+        command: value
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("validation command")
+            .to_string(),
+        command_family: value
+            .get("command_family")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("validation")
+            .to_string(),
+        status: value
+            .get("status")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|status| i32::try_from(status).ok()),
+        total_shell_probes: 0,
+        total_write_operations: 0,
+    })
+}
+
 fn is_inspection_shell_command(command: &str) -> bool {
     let trimmed = command.trim().to_ascii_lowercase();
     if trimmed.is_empty() || trimmed.contains("cargo ") || trimmed.contains("npm ") {
@@ -3194,6 +3345,7 @@ mod tests {
             total_shell_probes: 1,
             validation_repair: None,
             validation_repair_read_paths: BTreeMap::new(),
+            latest_successful_validation_after_write: None,
             patch_fallbacks: vec![],
             total_tool_result_chars: 4_000,
             total_tool_result_estimated_tokens: 1_000,
@@ -4406,6 +4558,49 @@ mod tests {
     }
 
     #[test]
+    fn successful_validation_terminalization_requires_new_passing_validation() {
+        let before = repair_policy_snapshot(1, 0, None, BTreeMap::new());
+        let mut after = repair_policy_snapshot(1, 1, None, BTreeMap::new());
+        after.latest_successful_validation_after_write = Some(SuccessfulValidationSnapshot {
+            command: "cargo test focused".to_string(),
+            command_family: "cargo test".to_string(),
+            status: Some(0),
+            total_shell_probes: 1,
+            total_write_operations: 1,
+        });
+
+        let decision = should_terminalize_after_successful_validation(&before, &after);
+
+        assert_eq!(
+            decision.map(|validation| validation.command),
+            Some("cargo test focused".to_string())
+        );
+
+        let mut dirty_after = after.clone();
+        dirty_after.validation_required_after_write = true;
+        assert!(should_terminalize_after_successful_validation(&before, &dirty_after).is_none());
+
+        let mut stale_before = before;
+        stale_before.total_shell_probes = 1;
+        assert!(should_terminalize_after_successful_validation(&stale_before, &after).is_none());
+    }
+
+    #[test]
+    fn successful_validation_done_prompt_forbids_more_tools() {
+        let prompt = successful_validation_done_prompt(&SuccessfulValidationSnapshot {
+            command: "cargo test focused".to_string(),
+            command_family: "cargo test".to_string(),
+            status: Some(0),
+            total_shell_probes: 1,
+            total_write_operations: 1,
+        });
+
+        assert!(prompt.contains("has passed"));
+        assert!(prompt.contains("Do not call any more tools"));
+        assert!(prompt.contains("Reply exactly DONE"));
+    }
+
+    #[test]
     fn empty_response_decision_escalates_after_repeated_true_empty_turns() {
         let first = empty_response_decision(1);
         let third = empty_response_decision(EMPTY_RESPONSE_ESCALATION_TURNS);
@@ -4588,6 +4783,7 @@ mod tests {
             total_shell_probes,
             validation_repair,
             validation_repair_read_paths,
+            latest_successful_validation_after_write: None,
             patch_fallbacks: vec![],
             total_tool_result_chars: 0,
             total_tool_result_estimated_tokens: 0,
@@ -4845,6 +5041,56 @@ mod tests {
         assert!(trace.contains("\"kind\":\"tool.edit_file\""));
         assert!(trace.contains("\"kind\":\"agent.stage.first_source_mutation\""));
         assert!(trace.contains("\"action\":\"write_intent\""));
+    }
+
+    #[tokio::test]
+    async fn fixture_terminalizes_after_successful_post_write_validation() {
+        let fixture = AgentFixture::new("Edit existing source, validate, and finish.");
+        fixture.write_fake_cargo(0, "ok");
+        std::fs::create_dir_all(fixture.workspace.join("src")).unwrap();
+        std::fs::write(
+            fixture.workspace.join("src/lib.rs"),
+            "pub fn answer() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "edit_file",
+                HashMap::from([
+                    ("path".to_string(), json!("src/lib.rs")),
+                    (
+                        "edits".to_string(),
+                        json!([
+                            {
+                                "kind": "replace_exact",
+                                "old": "    1\n",
+                                "new": "    42\n"
+                            }
+                        ]),
+                    ),
+                ]),
+            )],
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 2).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        let tool_counts = gateway.tool_counts();
+        assert!(
+            tool_counts.len() >= 3,
+            "expected at least three model calls, got {tool_counts:?}"
+        );
+        assert!(tool_counts[0] > 0, "{tool_counts:?}");
+        assert!(tool_counts[1] > 0, "{tool_counts:?}");
+        assert_eq!(tool_counts[2], 0, "{tool_counts:?}");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.validation.success_terminal_prompted\""));
+        assert!(trace.contains("\"scope\":\"in_turn\""));
     }
 
     #[tokio::test]
@@ -5116,13 +5362,22 @@ mod tests {
 
     struct ScriptedGateway {
         streams: StdMutex<VecDeque<Vec<StreamChunk>>>,
+        tool_counts: StdMutex<Vec<usize>>,
     }
 
     impl ScriptedGateway {
         fn new(streams: Vec<Vec<StreamChunk>>) -> Self {
             Self {
                 streams: StdMutex::new(VecDeque::from(streams)),
+                tool_counts: StdMutex::new(Vec::new()),
             }
+        }
+
+        fn tool_counts(&self) -> Vec<usize> {
+            self.tool_counts
+                .lock()
+                .expect("scripted gateway tool-count mutex poisoned")
+                .clone()
         }
     }
 
@@ -5164,10 +5419,14 @@ mod tests {
             &'a self,
             _model: &'a str,
             _messages: &'a [LlmMessage],
-            _tools: Option<&'a [Box<dyn LlmTool>]>,
+            tools: Option<&'a [Box<dyn LlmTool>]>,
             _config: &'a CompletionConfig,
         ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
         {
+            self.tool_counts
+                .lock()
+                .expect("scripted gateway tool-count mutex poisoned")
+                .push(tools.map(|tools| tools.len()).unwrap_or(0));
             let chunks = self
                 .streams
                 .lock()
