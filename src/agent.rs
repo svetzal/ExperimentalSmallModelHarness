@@ -39,6 +39,7 @@ const NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER: usize = 20;
 const REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT: usize = 1_024;
 const MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH: usize = 12;
 const DEFAULT_REPAIR_EXIT_THINKING_TOKENS: usize = 16_384;
+const ACTION_BOUNDARY_INTENT_HIT_LIMIT: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -53,6 +54,7 @@ pub struct AgentRunConfig {
     pub num_predict: Option<usize>,
     pub max_thinking_only_tokens: usize,
     pub repair_exit_thinking_tokens: usize,
+    pub action_boundary_interrupt_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
 }
 
@@ -71,6 +73,7 @@ pub struct AgentRunSummary {
     pub num_predict: Option<usize>,
     pub max_thinking_only_tokens: usize,
     pub repair_exit_thinking_tokens: usize,
+    pub action_boundary_interrupt_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
     pub final_summary: String,
 }
@@ -216,6 +219,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             "num_predict": config.num_predict,
             "max_thinking_only_tokens": config.max_thinking_only_tokens,
             "repair_exit_thinking_tokens": config.repair_exit_thinking_tokens,
+            "action_boundary_interrupt_tokens": config.action_boundary_interrupt_tokens,
             "assembly_policy": config.transcript_policy.as_str(),
             "transcript_policy": config.transcript_policy,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
@@ -287,6 +291,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             expected_output_tokens: config.expected_output_tokens,
             max_thinking_only_tokens: config.max_thinking_only_tokens,
             repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
+            action_boundary_interrupt_tokens: config.action_boundary_interrupt_tokens,
             validation_repair_active: policy_before_turn.validation_repair.is_some(),
             transcript_policy: config.transcript_policy,
             throughput_registry_path: experiment_dir.join("model-throughput.jsonl"),
@@ -313,6 +318,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             }
         };
         let repair_no_content_interrupted = turn_result.repair_no_content_interrupted;
+        let action_boundary_interrupted = turn_result.action_boundary_interrupted;
         let repair_depth_hard_stop = turn_result.repair_depth_hard_stop;
         let thinking_chars_this_turn = turn_result.thinking_chars;
         let response = turn_result.response;
@@ -400,6 +406,17 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 );
                 messages.push(LlmMessage::user(validation_repair_no_action_prompt(
                     decision,
+                )));
+                continue;
+            }
+            if let Some(interrupt) = &action_boundary_interrupted {
+                consecutive_hidden_only_no_action_turns = 0;
+                final_summary = format!(
+                    "turn {turn} action-boundary interrupt after hidden reasoning with no visible action"
+                );
+                trace.event("agent.action_boundary.prompted", interrupt)?;
+                messages.push(LlmMessage::user(action_boundary_interrupt_prompt(
+                    interrupt,
                 )));
                 continue;
             }
@@ -607,6 +624,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         num_predict: config.num_predict,
         max_thinking_only_tokens: config.max_thinking_only_tokens,
         repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
+        action_boundary_interrupt_tokens: config.action_boundary_interrupt_tokens,
         transcript_policy: config.transcript_policy,
         final_summary,
     };
@@ -785,6 +803,7 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     expected_output_tokens: usize,
     max_thinking_only_tokens: usize,
     repair_exit_thinking_tokens: usize,
+    action_boundary_interrupt_tokens: usize,
     validation_repair_active: bool,
     transcript_policy: TranscriptPolicy,
     throughput_registry_path: PathBuf,
@@ -801,7 +820,20 @@ struct StreamResponseResult {
     messages: Vec<LlmMessage>,
     thinking_chars: usize,
     repair_no_content_interrupted: bool,
+    action_boundary_interrupted: Option<ActionBoundaryInterrupt>,
     repair_depth_hard_stop: Option<RepairDepthDecision>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActionBoundaryInterrupt {
+    turn: usize,
+    llm_call_depth: usize,
+    call_thinking_chars: usize,
+    call_thinking_estimated_tokens: usize,
+    action_boundary_interrupt_tokens: usize,
+    action_intent_hits: usize,
+    hit_limit: usize,
+    latest_preview: String,
 }
 
 #[derive(Debug, Default)]
@@ -936,6 +968,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         expected_output_tokens,
         max_thinking_only_tokens,
         repair_exit_thinking_tokens,
+        action_boundary_interrupt_tokens,
         validation_repair_active,
         transcript_policy,
         throughput_registry_path,
@@ -961,6 +994,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let mut tool_call_progress_frame_count = 0usize;
     let mut no_content_segment_eval_count = 0usize;
     let mut repair_no_content_interrupted = false;
+    let mut action_boundary_interrupted = None;
     let no_assistant_content_limit =
         expected_output_tokens.saturating_mul(NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER);
     let mut inspection_loop_tracker = InspectionLoopTracker::default();
@@ -1010,6 +1044,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 messages: current_messages,
                 thinking_chars,
                 repair_no_content_interrupted,
+                action_boundary_interrupted,
                 repair_depth_hard_stop: Some(decision),
             });
         }
@@ -1051,6 +1086,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         let mut call_tool_call_progress_frame_count = 0usize;
         let mut call_thinking_chunk_count = 0usize;
         let mut call_thinking_chars = 0usize;
+        let mut call_action_intent_hits = 0usize;
         trace_model_progress_status(ModelProgressStatusInput {
             trace,
             turn,
@@ -1214,6 +1250,31 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         }),
                     )?;
                     let call_thinking_estimated_tokens = estimate_tokens(call_thinking_chars);
+                    if action_intent_signal(&thinking) {
+                        call_action_intent_hits += 1;
+                    }
+                    if !validation_repair_active
+                        && action_boundary_interrupt_tokens > 0
+                        && call_content.is_empty()
+                        && accumulated_tool_calls.is_empty()
+                        && call_tool_call_progress_frame_count == 0
+                        && call_action_intent_hits >= ACTION_BOUNDARY_INTENT_HIT_LIMIT
+                        && call_thinking_estimated_tokens > action_boundary_interrupt_tokens
+                    {
+                        let interrupt = ActionBoundaryInterrupt {
+                            turn,
+                            llm_call_depth: depth,
+                            call_thinking_chars,
+                            call_thinking_estimated_tokens,
+                            action_boundary_interrupt_tokens,
+                            action_intent_hits: call_action_intent_hits,
+                            hit_limit: ACTION_BOUNDARY_INTENT_HIT_LIMIT,
+                            latest_preview: limit_preview(&thinking, 240),
+                        };
+                        trace.event("agent.action_boundary.interrupted", &interrupt)?;
+                        action_boundary_interrupted = Some(interrupt);
+                        break;
+                    }
                     if max_thinking_only_tokens > 0
                         && call_content.is_empty()
                         && accumulated_tool_calls.is_empty()
@@ -1460,6 +1521,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 messages: current_messages,
                 thinking_chars,
                 repair_no_content_interrupted,
+                action_boundary_interrupted,
                 repair_depth_hard_stop: None,
             });
         }
@@ -2528,6 +2590,36 @@ fn inspection_loop_failure_summary(decision: &InspectionLoopDecision) -> String 
     )
 }
 
+fn action_intent_signal(thinking: &str) -> bool {
+    let text = thinking.to_ascii_lowercase();
+    let intent = [
+        "let me",
+        "i will",
+        "i'll",
+        "i should",
+        "i need to",
+        "now i",
+        "next i",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase));
+    let action = [
+        "write",
+        "patch",
+        "edit",
+        "implement",
+        "create",
+        "add ",
+        "run cargo",
+        "call write_file",
+        "use write_file",
+        "use patch_file",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase));
+    intent && action
+}
+
 fn inspection_signature(call: &LlmToolCall) -> Option<String> {
     match call.name.as_str() {
         "read_file" => {
@@ -2763,6 +2855,24 @@ fn hidden_only_no_action_prompt(
     )
 }
 
+fn action_boundary_interrupt_prompt(interrupt: &ActionBoundaryInterrupt) -> String {
+    format!(
+        "Action-boundary interrupt fired. Your hidden reasoning repeatedly stated intent to act, \
+         but no assistant-visible content, completed tool call, source edit, validation probe, \
+         or FAIL crossed the stream boundary.\n\
+         Estimated hidden-thinking tokens in the interrupted call: {tokens}. \
+         Action-intent hits: {hits} of required {hit_limit}. \
+         Latest preview: {preview}\n\
+         Your next turn must take exactly one concrete action: write or patch the next source change, \
+         run one deterministic validation or diagnostic probe, or reply FAIL with a concrete blocker. \
+         Do not restate the plan. Do not repeat broad inspection.",
+        tokens = interrupt.call_thinking_estimated_tokens,
+        hits = interrupt.action_intent_hits,
+        hit_limit = interrupt.hit_limit,
+        preview = interrupt.latest_preview,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EmptyResponseDecision {
     escalation_required: bool,
@@ -2859,6 +2969,23 @@ mod tests {
     #[test]
     fn default_repair_exit_thinking_tokens_uses_bounded_retry_threshold() {
         assert_eq!(default_repair_exit_thinking_tokens(), 16_384);
+    }
+
+    #[test]
+    fn action_intent_signal_requires_intent_and_action_language() {
+        assert!(action_intent_signal(
+            "Let me write the missing implementation now."
+        ));
+        assert!(action_intent_signal(
+            "I will use patch_file to edit src/lib.rs."
+        ));
+        assert!(!action_intent_signal(
+            "The code probably needs more structure."
+        ));
+        assert!(!action_intent_signal("Let me think about the design."));
+        assert!(!action_intent_signal(
+            "Write operations are tracked by the harness."
+        ));
     }
 
     #[test]
@@ -3339,6 +3466,7 @@ mod tests {
             expected_output_tokens: 1,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3408,6 +3536,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3453,6 +3582,7 @@ mod tests {
             expected_output_tokens: 1,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3493,6 +3623,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: 1,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3512,6 +3643,52 @@ mod tests {
         assert!(content.contains("\"max_thinking_only_tokens\":1"));
         assert!(content.contains("\"content_chars\":0"));
         assert!(content.contains("\"tool_call_count\":0"));
+    }
+
+    #[tokio::test]
+    async fn stream_response_interrupts_pre_validation_action_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let gateway = ScriptedGateway::new(vec![vec![
+            StreamChunk::Thinking("Let me write the first file. ".to_string()),
+            StreamChunk::Thinking("I will use write_file for src/lib.rs. ".to_string()),
+        ]]);
+
+        let result = stream_response(StreamResponseRequest {
+            gateway: &gateway,
+            model: "fake-model",
+            messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
+            tools: &[],
+            completion_config: CompletionConfig {
+                temperature: 0.2,
+                max_tool_iterations: 1,
+                ..Default::default()
+            },
+            context_window_tokens: Some(8_000),
+            packet_type: "multi-file-patch",
+            expected_output_tokens: 4_096,
+            max_thinking_only_tokens: usize::MAX,
+            repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 1,
+            validation_repair_active: false,
+            transcript_policy: TranscriptPolicy::FullTranscript,
+            throughput_registry_path: temp.path().join("model-throughput.jsonl"),
+            progress_projection_override: None,
+            progress_status_interval_override: None,
+            runner_activity_override: None,
+            trace: &trace,
+            turn: 1,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "");
+        assert!(result.action_boundary_interrupted.is_some());
+        assert!(!result.repair_no_content_interrupted);
+        let content = std::fs::read_to_string(trace.path()).unwrap();
+        assert!(content.contains("\"kind\":\"agent.action_boundary.interrupted\""));
+        assert!(content.contains("\"action_intent_hits\":2"));
+        assert!(!content.contains("\"kind\":\"llm.thinking_only_stream.hard_failed\""));
     }
 
     #[tokio::test]
@@ -3537,6 +3714,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 1,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3581,6 +3759,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3633,6 +3812,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3684,6 +3864,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3738,6 +3919,7 @@ mod tests {
             expected_output_tokens: 1,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3815,6 +3997,7 @@ mod tests {
             expected_output_tokens: 2_048,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3872,6 +4055,7 @@ mod tests {
             expected_output_tokens: 2_048,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -3920,6 +4104,7 @@ mod tests {
             expected_output_tokens: 2_048,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -4184,6 +4369,7 @@ mod tests {
             num_predict: None,
             max_thinking_only_tokens: 4_096,
             repair_exit_thinking_tokens: 16_384,
+            action_boundary_interrupt_tokens: 0,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
         };
         let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
@@ -4519,6 +4705,7 @@ mod tests {
                     num_predict: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
+                    action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                 },
                 gateway,

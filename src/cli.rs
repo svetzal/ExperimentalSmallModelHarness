@@ -64,6 +64,10 @@ enum Command {
         #[arg(long)]
         repair_exit_thinking_tokens: Option<usize>,
 
+        /// Pre-validation hidden action-intent reasoning tokens before interrupting and forcing an action. 0 disables.
+        #[arg(long, default_value_t = 0)]
+        action_boundary_interrupt_tokens: usize,
+
         /// Transcript retention policy for model/tool context.
         #[arg(long, default_value = "summarized-transcript")]
         transcript_policy: String,
@@ -92,6 +96,7 @@ pub async fn run() -> Result<()> {
             num_predict,
             max_thinking_only_tokens,
             repair_exit_thinking_tokens,
+            action_boundary_interrupt_tokens,
             transcript_policy,
         } => {
             let transcript_policy =
@@ -121,6 +126,7 @@ pub async fn run() -> Result<()> {
                 num_predict,
                 max_thinking_only_tokens,
                 repair_exit_thinking_tokens,
+                action_boundary_interrupt_tokens,
                 transcript_policy,
             })
             .await?;
