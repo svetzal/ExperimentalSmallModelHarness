@@ -1250,7 +1250,7 @@ impl LlmTool for EditFileTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "edit_file".to_string(),
-                description: "Apply one or more structured text edits to an existing UTF-8 file under the active experiment root. Use replace_exact for a unique snippet, replace_lines/delete_lines for known line ranges, and insert_before/insert_after for a unique anchor. Insert operations are line-aware: when the anchor is a complete line, inserted text is placed on adjacent complete lines instead of being concatenated onto the anchor line."
+                description: "Apply one or more structured text edits to an existing UTF-8 file under the active experiment root. Use replace_exact for a unique snippet, replace_lines/delete_lines for known line ranges, insert_before/insert_after for a unique anchor, and replace_between for a bounded block between unique anchors. Insert operations are line-aware: when the anchor is a complete line, inserted text is placed on adjacent complete lines instead of being concatenated onto the anchor line."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -1267,6 +1267,7 @@ impl LlmTool for EditFileTool {
                                         "enum": [
                                             "replace_exact",
                                             "replace_lines",
+                                            "replace_between",
                                             "insert_before",
                                             "insert_after",
                                             "delete_lines"
@@ -1278,7 +1279,7 @@ impl LlmTool for EditFileTool {
                                     },
                                     "new": {
                                         "type": "string",
-                                        "description": "Replacement text for replace_exact or replace_lines."
+                                        "description": "Replacement text for replace_exact, replace_lines, or replace_between."
                                     },
                                     "anchor": {
                                         "type": "string",
@@ -1288,11 +1289,27 @@ impl LlmTool for EditFileTool {
                                         "type": "string",
                                         "description": "Inserted text for insert_before or insert_after."
                                     },
+                                    "start_anchor": {
+                                        "type": "string",
+                                        "description": "Unique starting anchor for replace_between."
+                                    },
+                                    "end_anchor": {
+                                        "type": "string",
+                                        "description": "Unique ending anchor for replace_between."
+                                    },
+                                    "include_start": {
+                                        "type": "boolean",
+                                        "description": "For replace_between, include start_anchor in the replaced region. Defaults to true."
+                                    },
+                                    "include_end": {
+                                        "type": "boolean",
+                                        "description": "For replace_between, include end_anchor in the replaced region. Defaults to false."
+                                    },
                                     "start_line": { "type": "integer", "minimum": 1 },
                                     "end_line": { "type": "integer", "minimum": 1 },
                                     "expected": {
                                         "type": "string",
-                                        "description": "Optional context that must appear in the selected line range."
+                                        "description": "Optional context that must appear in the selected line range or replace_between block."
                                     }
                                 },
                                 "required": ["kind"]
@@ -1404,6 +1421,81 @@ impl EditFileTool {
                     json!({
                         "index": index,
                         "kind": kind,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "old_bytes": selected.len(),
+                        "new_bytes": new.len(),
+                        "bytes_delta": content.len() as isize - before_edit_len as isize,
+                    })
+                }
+                "replace_between" => {
+                    let start_anchor = required_edit_str(object, index, "start_anchor")?;
+                    if start_anchor.is_empty() {
+                        bail!("edits[{index}].start_anchor must not be empty");
+                    }
+                    let end_anchor = required_edit_str(object, index, "end_anchor")?;
+                    if end_anchor.is_empty() {
+                        bail!("edits[{index}].end_anchor must not be empty");
+                    }
+                    let new = required_edit_str(object, index, "new")?;
+                    let include_start = optional_edit_bool(object, "include_start").unwrap_or(true);
+                    let include_end = optional_edit_bool(object, "include_end").unwrap_or(false);
+                    let start_matches = content.match_indices(start_anchor).count();
+                    let end_matches = content.match_indices(end_anchor).count();
+                    if start_matches == 0 {
+                        bail!("edits[{index}] replace_between found no start_anchor match");
+                    }
+                    if start_matches > 1 {
+                        bail!(
+                            "edits[{index}] replace_between start_anchor is ambiguous: matched {start_matches} times"
+                        );
+                    }
+                    if end_matches == 0 {
+                        bail!("edits[{index}] replace_between found no end_anchor match");
+                    }
+                    if end_matches > 1 {
+                        bail!(
+                            "edits[{index}] replace_between end_anchor is ambiguous: matched {end_matches} times"
+                        );
+                    }
+                    let start_offset = content
+                        .find(start_anchor)
+                        .expect("exactly one start match implies find succeeds");
+                    let end_offset = content
+                        .find(end_anchor)
+                        .expect("exactly one end match implies find succeeds");
+                    let start_anchor_end = start_offset + start_anchor.len();
+                    let end_anchor_end = end_offset + end_anchor.len();
+                    if end_offset < start_anchor_end {
+                        bail!(
+                            "edits[{index}] replace_between end_anchor must occur after start_anchor"
+                        );
+                    }
+                    let replace_start = if include_start {
+                        start_offset
+                    } else {
+                        start_anchor_end
+                    };
+                    let replace_end = if include_end {
+                        end_anchor_end
+                    } else {
+                        end_offset
+                    };
+                    if replace_end < replace_start {
+                        bail!("edits[{index}] replace_between selected an inverted range");
+                    }
+                    let selected = content[replace_start..replace_end].to_string();
+                    verify_expected_context(object, index, &selected)?;
+                    let start_line = line_number_at_byte(&content, replace_start);
+                    let end_line = line_number_at_byte(&content, replace_end);
+                    content.replace_range(replace_start..replace_end, new);
+                    json!({
+                        "index": index,
+                        "kind": kind,
+                        "start_anchor_bytes": start_anchor.len(),
+                        "end_anchor_bytes": end_anchor.len(),
+                        "include_start": include_start,
+                        "include_end": include_end,
                         "start_line": start_line,
                         "end_line": end_line,
                         "old_bytes": selected.len(),
@@ -1791,6 +1883,10 @@ fn required_edit_u64(
         .with_context(|| format!("missing required positive integer argument edits[{index}].{key}"))
 }
 
+fn optional_edit_bool(edit: &serde_json::Map<String, Value>, key: &str) -> Option<bool> {
+    edit.get(key).and_then(Value::as_bool)
+}
+
 fn split_lines_preserving_newlines(content: &str) -> Vec<String> {
     if content.is_empty() {
         Vec::new()
@@ -1852,6 +1948,13 @@ fn line_aware_insertion(
             text: normalized,
         }
     }
+}
+
+fn line_number_at_byte(content: &str, byte_index: usize) -> usize {
+    1 + content[..byte_index]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
 }
 
 fn selected_line_range(
@@ -2717,6 +2820,81 @@ mod tests {
             "one\ninserted\ntwo\nthree\n"
         );
         assert_eq!(result["edits_applied"][0]["line_boundary_normalized"], true);
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_between_preserves_excluded_end_anchor() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(
+            &file,
+            "before\nimpl Display {\n    old\n}\n// Tests\nmod tests {}\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool { scope };
+        let result = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "replace_between",
+                            "start_anchor": "impl Display {",
+                            "end_anchor": "// Tests",
+                            "include_start": true,
+                            "include_end": false,
+                            "expected": "old",
+                            "new": "impl Display {\n    new\n}\n"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "before\nimpl Display {\n    new\n}\n// Tests\nmod tests {}\n"
+        );
+        assert_eq!(result["edits_applied"][0]["start_line"], 2);
+        assert_eq!(result["edits_applied"][0]["end_line"], 5);
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_between_rejects_ambiguous_anchors_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        let original = "start\nold\nend\nstart\nold\nend\n";
+        std::fs::write(&file, original).unwrap();
+
+        let tool = EditFileTool { scope };
+        let error = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "replace_between",
+                            "start_anchor": "start",
+                            "end_anchor": "end",
+                            "new": "replacement\n"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("start_anchor is ambiguous"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
     }
 
     #[test]
