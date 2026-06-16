@@ -83,6 +83,7 @@ pub struct ValidationRepairSnapshot {
     pub command_family: String,
     pub status: Option<i32>,
     pub failure_text: String,
+    pub failure_details: Vec<String>,
     pub repeated_command_family_count: usize,
     pub repeated_failure_summary_count: usize,
 }
@@ -93,6 +94,7 @@ struct ValidationRepairState {
     command_family: String,
     status: Option<i32>,
     failure_text: String,
+    failure_details: Vec<String>,
     repeated_command_family_count: usize,
     repeated_failure_summary_count: usize,
 }
@@ -105,6 +107,7 @@ impl From<&ValidationRepairState> for ValidationRepairSnapshot {
             command_family: state.command_family.clone(),
             status: state.status,
             failure_text: state.failure_text.clone(),
+            failure_details: state.failure_details.clone(),
             repeated_command_family_count: state.repeated_command_family_count,
             repeated_failure_summary_count: state.repeated_failure_summary_count,
         }
@@ -491,6 +494,7 @@ impl ToolScope {
     ) -> Result<Option<ValidationRepairSnapshot>> {
         let command_family = command_family(command);
         let failure_text = failure_summary(&stderr.content, &stdout.content);
+        let failure_details = failure_details(&stderr.content, &stdout.content);
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         let first_validation_probe = !policy.emitted_first_validation_probe;
         if first_validation_probe {
@@ -580,6 +584,7 @@ impl ToolScope {
             command_family,
             status: output.status.code(),
             failure_text,
+            failure_details,
             repeated_command_family_count: command_count,
             repeated_failure_summary_count: summary_count,
         };
@@ -1816,6 +1821,62 @@ fn failure_summary(stderr: &str, stdout: &str) -> String {
         .unwrap_or_else(|| "validation command failed without output".to_string())
 }
 
+fn failure_details(stderr: &str, stdout: &str) -> Vec<String> {
+    let combined = [stdout, stderr]
+        .into_iter()
+        .filter(|source| !source.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lines = combined.lines().map(str::trim).collect::<Vec<_>>();
+    let mut details = Vec::new();
+
+    for line in &lines {
+        if line.starts_with("---- ") && line.ends_with(" stdout ----") {
+            push_unique_detail(
+                &mut details,
+                line.trim_start_matches("---- ")
+                    .trim_end_matches(" stdout ----")
+                    .trim(),
+            );
+            continue;
+        }
+        if line.starts_with("thread '") && line.contains(" panicked at ") {
+            push_unique_detail(&mut details, line);
+            continue;
+        }
+        if line.starts_with("error[") || line.starts_with("error:") || line.starts_with("FAILED") {
+            push_unique_detail(&mut details, line);
+        }
+    }
+
+    if let Some(failures_index) = lines.iter().position(|line| *line == "failures:") {
+        for line in lines.iter().skip(failures_index + 1) {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with("test result:") {
+                break;
+            }
+            if !line.contains(':') && !line.starts_with('-') {
+                push_unique_detail(&mut details, line);
+            }
+        }
+    }
+
+    details
+        .into_iter()
+        .take(8)
+        .map(|detail| limit_text(&detail, 240).content)
+        .collect()
+}
+
+fn push_unique_detail(details: &mut Vec<String>, detail: &str) {
+    let trimmed = detail.trim();
+    if !trimmed.is_empty() && !details.iter().any(|existing| existing == trimmed) {
+        details.push(trimmed.to_string());
+    }
+}
+
 fn fallback_text(fallbacks: &[PatchFallbackSnapshot]) -> String {
     fallbacks
         .iter()
@@ -2366,6 +2427,37 @@ mod tests {
         assert_eq!(
             failure_summary("", " \nerror[E0425]: cannot find value `x`\nnext"),
             "error[E0425]: cannot find value `x`"
+        );
+    }
+
+    #[test]
+    fn extracts_targeted_cargo_test_failure_details() {
+        let stdout = r#"
+running 21 tests
+test tests::test_invader_shot_removed_when_leaving_bottom_edge ... FAILED
+
+failures:
+
+---- tests::test_invader_shot_removed_when_leaving_bottom_edge stdout ----
+
+thread 'tests::test_invader_shot_removed_when_leaving_bottom_edge' (31479173) panicked at src/lib.rs:739:9:
+Invader shot should be removed when leaving bottom edge
+
+failures:
+    tests::test_invader_shot_removed_when_leaving_bottom_edge
+
+test result: FAILED. 20 passed; 1 failed; finished in 0.00s
+"#;
+
+        let details = failure_details("", stdout);
+
+        assert!(details
+            .iter()
+            .any(|detail| detail == "tests::test_invader_shot_removed_when_leaving_bottom_edge"));
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("src/lib.rs:739:9"))
         );
     }
 

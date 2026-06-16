@@ -2920,18 +2920,22 @@ fn empty_response_decision(consecutive_empty_responses: usize) -> EmptyResponseD
 }
 
 fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
+    let failure_details = repair_detail_text(repair);
     format!(
         "Validation repair action contract is active.\n\
          Failing command: {command}\n\
          Failure text: {failure_text}\n\
+         Failure details:\n{failure_details}\n\
          Command family failure count: {command_count}\n\
          Failure-summary repeat count: {summary_count}\n\
-         Your next turn must take exactly one repair action: apply one focused source edit, \
-         run one deterministic diagnostic probe that narrows this failure, or reply FAIL with a concrete blocker. \
-         Do not emit a text-only repair plan. Do not repeat broad inspection unless it is the diagnostic probe. \
+         Your next turn must take exactly one targeted repair action based on the listed failure details: \
+         apply one focused source edit, run one deterministic diagnostic probe that narrows those exact details, \
+         or reply FAIL with a concrete blocker. \
+         Do not emit a text-only repair plan. Do not repeat broad inspection. \
          If you edit, run the validation ladder immediately afterward: cargo fmt --check, cargo clippy, focused tests, then broad tests.",
         command = repair.command,
         failure_text = repair.failure_text,
+        failure_details = failure_details,
         command_count = repair.repeated_command_family_count,
         summary_count = repair.repeated_failure_summary_count,
     )
@@ -2939,6 +2943,7 @@ fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
 
 fn validation_repair_no_action_prompt(decision: &RepairNoActionDecision) -> String {
     let repair = &decision.active_repair;
+    let failure_details = repair_detail_text(repair);
     let read_targets = if decision.validation_repair_read_paths.is_empty() {
         "none recorded".to_string()
     } else {
@@ -2961,14 +2966,29 @@ fn validation_repair_no_action_prompt(decision: &RepairNoActionDecision) -> Stri
         "{pressure}\n\
          Failing command: {command}\n\
          Failure text: {failure_text}\n\
+         Failure details:\n{failure_details}\n\
          Repair read targets since the latest failed validation: {read_targets}\n\
-         Your next turn must take exactly one repair action: apply one focused patch to the relevant source, \
+         Your next turn must take exactly one targeted repair action: apply one focused patch to the relevant source, \
          replace an existing source file with write_file only after reading the complete file and preserving unrelated content, \
-         run one deterministic probe that narrows the failure, or reply FAIL with a concrete blocker. \
+         run one deterministic probe that narrows the listed failure details, or reply FAIL with a concrete blocker. \
          Do not emit a text-only repair plan or restate the plan without taking one of those actions.",
         command = repair.command,
         failure_text = repair.failure_text,
+        failure_details = failure_details,
     )
+}
+
+fn repair_detail_text(repair: &ValidationRepairSnapshot) -> String {
+    if repair.failure_details.is_empty() {
+        format!("- {}", repair.failure_text)
+    } else {
+        repair
+            .failure_details
+            .iter()
+            .map(|detail| format!("- {detail}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[cfg(test)]
@@ -4240,6 +4260,7 @@ mod tests {
             command_family: "cargo clippy".to_string(),
             status: Some(101),
             failure_text: "warning: length comparison to zero".to_string(),
+            failure_details: Vec::new(),
             repeated_command_family_count: 1,
             repeated_failure_summary_count: 1,
         };
@@ -4279,15 +4300,23 @@ mod tests {
             command_family: "cargo test".to_string(),
             status: Some(101),
             failure_text: "error[E0425]: cannot find value".to_string(),
+            failure_details: vec![
+                "tests::invader_shot_removed_when_leaving_bottom_edge".to_string(),
+                "thread 'tests::invader_shot_removed_when_leaving_bottom_edge' panicked at src/lib.rs:739:9:"
+                    .to_string(),
+            ],
             repeated_command_family_count: 2,
             repeated_failure_summary_count: 1,
         });
 
         assert!(prompt.contains("Failing command: cargo test"));
         assert!(prompt.contains("Failure text: error[E0425]: cannot find value"));
+        assert!(prompt.contains("Failure details:"));
+        assert!(prompt.contains("tests::invader_shot_removed_when_leaving_bottom_edge"));
+        assert!(prompt.contains("src/lib.rs:739:9"));
         assert!(prompt.contains("Command family failure count: 2"));
         assert!(prompt.contains("Validation repair action contract is active"));
-        assert!(prompt.contains("exactly one repair action"));
+        assert!(prompt.contains("exactly one targeted repair action"));
         assert!(prompt.contains("one focused source edit"));
         assert!(!prompt.contains("bounded write"));
         assert!(!prompt.contains("patch/write_file"));
@@ -4304,6 +4333,7 @@ mod tests {
             command_family: "cargo clippy".to_string(),
             status: Some(101),
             failure_text: "error[E0422]: cannot find struct `TextStyle`".to_string(),
+            failure_details: vec!["src/main.rs:12:5".to_string()],
             repeated_command_family_count: 1,
             repeated_failure_summary_count: 1,
         };
@@ -4342,8 +4372,10 @@ mod tests {
 
         let prompt = validation_repair_no_action_prompt(&second);
         assert!(prompt.contains("Validation repair escalation is active"));
+        assert!(prompt.contains("Failure details:"));
+        assert!(prompt.contains("src/main.rs:12:5"));
         assert!(prompt.contains("src/main.rs (3)"));
-        assert!(prompt.contains("exactly one repair action"));
+        assert!(prompt.contains("exactly one targeted repair action"));
         assert!(prompt.contains("apply one focused patch"));
         assert!(prompt.contains("write_file only after reading the complete file"));
         assert!(!prompt.contains("bounded write"));
@@ -4366,6 +4398,7 @@ mod tests {
             command_family: "cargo clippy".to_string(),
             status: Some(101),
             failure_text: "error[E0422]: cannot find struct `TextStyle`".to_string(),
+            failure_details: Vec::new(),
             repeated_command_family_count: 1,
             repeated_failure_summary_count: 1,
         };
