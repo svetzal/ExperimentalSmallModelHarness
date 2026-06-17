@@ -271,11 +271,14 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     let mut action_boundary_no_action_tracker = ActionBoundaryNoActionTracker::default();
     let mut repair_no_action_tracker = RepairNoActionTracker::default();
     let mut final_response_only_next_turn = false;
+    let mut requested_validation_ledger =
+        RequestedValidationLedger::new(requested_validation_commands.clone());
     let requested_validation_completed_write_operations = 0usize;
     let mut exhausted_iterations = true;
     let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     for turn in 1..=config.max_iterations {
         let policy_before_turn = scope.policy_snapshot();
+        let requested_validation_ledger_before_turn = requested_validation_ledger.clone();
         let active_tools = if final_response_only_next_turn {
             &no_tools
         } else {
@@ -323,6 +326,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             requested_validation_pending_after_write: !requested_validation_commands.is_empty()
                 && policy_before_turn.total_write_operations
                     > requested_validation_completed_write_operations,
+            requested_validation_ledger: requested_validation_ledger.clone(),
         })
         .await
         {
@@ -346,6 +350,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         let repair_depth_hard_stop = turn_result.repair_depth_hard_stop;
         let thinking_chars_this_turn = turn_result.thinking_chars;
         let response = turn_result.response;
+        requested_validation_ledger = turn_result.requested_validation_ledger;
         messages = turn_result.messages;
         trace.event(
             "agent.turn.finished",
@@ -364,7 +369,15 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             &policy_before_turn,
             &policy,
             &requested_validation_commands,
-        );
+        )
+        .filter(|_| requested_validation_commands.is_empty())
+        .or_else(|| {
+            (!requested_validation_commands.is_empty()
+                && !requested_validation_ledger_before_turn.is_satisfied()
+                && requested_validation_ledger.is_satisfied())
+            .then(|| requested_validation_ledger.latest_successful_validation())
+            .flatten()
+        });
         trace.event(
             "agent.context.turn_pressure",
             serde_json::json!({
@@ -636,6 +649,20 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             ));
             continue;
         }
+        if is_done_response(&final_summary) && !requested_validation_ledger.can_accept_done() {
+            trace.event(
+                "agent.validation.done_rejected",
+                serde_json::json!({
+                    "turn": turn,
+                    "response": final_summary,
+                    "ledger": requested_validation_ledger,
+                }),
+            )?;
+            messages.push(LlmMessage::user(done_rejected_prompt(
+                &requested_validation_ledger,
+            )));
+            continue;
+        }
         if is_terminal_response(&final_summary) {
             exhausted_iterations = false;
             break;
@@ -782,6 +809,13 @@ fn is_terminal_response(response: &str) -> bool {
             .any(|line| line.eq_ignore_ascii_case("DONE"))
 }
 
+fn is_done_response(response: &str) -> bool {
+    response
+        .lines()
+        .map(str::trim)
+        .any(|line| line.eq_ignore_ascii_case("DONE"))
+}
+
 fn is_fail_response(response: &str) -> bool {
     response
         .lines()
@@ -792,6 +826,197 @@ fn is_fail_response(response: &str) -> bool {
                 .map(|(head, _)| head.eq_ignore_ascii_case("FAIL"))
                 .unwrap_or_else(|| line.eq_ignore_ascii_case("FAIL"))
         })
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct RequestedValidationLedger {
+    generation: usize,
+    entries: Vec<RequestedValidationEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct RequestedValidationEntry {
+    command: String,
+    status: RequestedValidationStatus,
+    observed_command: Option<String>,
+    status_code: Option<i32>,
+    generation: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RequestedValidationStatus {
+    Pending,
+    Passed,
+    Failed,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct RequestedValidationObservation {
+    command: String,
+    matched_requested_command: Option<String>,
+    status: RequestedValidationStatus,
+    status_code: Option<i32>,
+    generation: usize,
+    source_mutation: bool,
+}
+
+impl RequestedValidationLedger {
+    fn new(commands: Vec<String>) -> Self {
+        Self {
+            generation: 0,
+            entries: commands
+                .into_iter()
+                .map(|command| RequestedValidationEntry {
+                    command,
+                    status: RequestedValidationStatus::Pending,
+                    observed_command: None,
+                    status_code: None,
+                    generation: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn note_source_mutation(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.generation += 1;
+        for entry in &mut self.entries {
+            if entry.status == RequestedValidationStatus::Passed {
+                entry.status = RequestedValidationStatus::Stale;
+            }
+        }
+    }
+
+    fn observe_tool_result(
+        &mut self,
+        result: &ToolCallRunResult,
+    ) -> Option<RequestedValidationObservation> {
+        let value = serde_json::from_str::<serde_json::Value>(&result.content).ok()?;
+        let source_mutation = value
+            .get("shell_mutation_requires_validation")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if source_mutation {
+            self.note_source_mutation();
+        }
+        if value
+            .get("validation_probe")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return source_mutation.then(|| RequestedValidationObservation {
+                command: value
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("shell command")
+                    .to_string(),
+                matched_requested_command: None,
+                status: RequestedValidationStatus::Stale,
+                status_code: value
+                    .get("status")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|status| i32::try_from(status).ok()),
+                generation: self.generation,
+                source_mutation,
+            });
+        }
+
+        let command = value
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("validation command")
+            .to_string();
+        let status_code = value
+            .get("status")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|status| i32::try_from(status).ok());
+        let matched_index = self.entries.iter().position(|entry| {
+            validation_matches_requested_command(&command, std::slice::from_ref(&entry.command))
+        });
+        let Some(index) = matched_index else {
+            return Some(RequestedValidationObservation {
+                command,
+                matched_requested_command: None,
+                status: if result.ok && !source_mutation {
+                    RequestedValidationStatus::Passed
+                } else {
+                    RequestedValidationStatus::Failed
+                },
+                status_code,
+                generation: self.generation,
+                source_mutation,
+            });
+        };
+
+        let status = if result.ok
+            && value.get("success").and_then(serde_json::Value::as_bool) == Some(true)
+            && !source_mutation
+        {
+            RequestedValidationStatus::Passed
+        } else {
+            RequestedValidationStatus::Failed
+        };
+        let matched_requested_command = self.entries[index].command.clone();
+        self.entries[index].status = status;
+        self.entries[index].observed_command = Some(command.clone());
+        self.entries[index].status_code = status_code;
+        self.entries[index].generation = Some(self.generation);
+
+        Some(RequestedValidationObservation {
+            command,
+            matched_requested_command: Some(matched_requested_command),
+            status,
+            status_code,
+            generation: self.generation,
+            source_mutation,
+        })
+    }
+
+    fn is_satisfied(&self) -> bool {
+        !self.entries.is_empty()
+            && self.entries.iter().all(|entry| {
+                entry.status == RequestedValidationStatus::Passed
+                    && entry.generation == Some(self.generation)
+            })
+    }
+
+    fn can_accept_done(&self) -> bool {
+        self.entries.is_empty() || self.is_satisfied()
+    }
+
+    fn latest_successful_validation(&self) -> Option<SuccessfulValidationSnapshot> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.status == RequestedValidationStatus::Passed
+                    && entry.generation == Some(self.generation)
+            })
+            .map(|entry| SuccessfulValidationSnapshot {
+                command: entry
+                    .observed_command
+                    .clone()
+                    .unwrap_or_else(|| entry.command.clone()),
+                command_family: validation_command_family(&entry.command),
+                status: entry.status_code,
+                total_shell_probes: 0,
+                total_write_operations: self.generation,
+            })
+    }
+
+    fn incomplete_entries(&self) -> Vec<&RequestedValidationEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.status != RequestedValidationStatus::Passed
+                    || entry.generation != Some(self.generation)
+            })
+            .collect()
+    }
 }
 
 fn should_prompt_validation_repair(policy: &ToolPolicySnapshot, response: &str) -> bool {
@@ -861,11 +1086,13 @@ fn is_requested_validation_command_line(command: &str) -> bool {
         "cargo check",
         "cargo clippy",
         "cargo fmt",
+        "cargo run",
         "./cargo test",
         "./cargo build",
         "./cargo check",
         "./cargo clippy",
         "./cargo fmt",
+        "./cargo run",
         "npm test",
         "npm run test",
         "pnpm test",
@@ -907,6 +1134,26 @@ fn normalize_validation_command(command: &str) -> String {
     parts.join(" ")
 }
 
+fn validation_command_family(command: &str) -> String {
+    let normalized = normalize_validation_command(command);
+    let parts = normalized.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["cargo", "clippy", ..] => "cargo clippy".to_string(),
+        ["cargo", "fmt", ..] => "cargo fmt".to_string(),
+        ["cargo", "build", ..] => "cargo build".to_string(),
+        ["cargo", "test", ..] => "cargo test".to_string(),
+        ["cargo", "run", ..] => "cargo run".to_string(),
+        ["./cargo", "clippy", ..] => "./cargo clippy".to_string(),
+        ["./cargo", "fmt", ..] => "./cargo fmt".to_string(),
+        ["./cargo", "build", ..] => "./cargo build".to_string(),
+        ["./cargo", "test", ..] => "./cargo test".to_string(),
+        ["./cargo", "run", ..] => "./cargo run".to_string(),
+        [head, second, ..] => format!("{head} {second}"),
+        [head] => (*head).to_string(),
+        [] => "validation".to_string(),
+    }
+}
+
 fn successful_validation_done_prompt(validation: &SuccessfulValidationSnapshot) -> String {
     format!(
         "The requested validation command has passed after the source edits.\n\
@@ -916,6 +1163,30 @@ fn successful_validation_done_prompt(validation: &SuccessfulValidationSnapshot) 
          Reply exactly DONE if the requested task is complete, or exactly FAIL with one concise blocker.",
         command = validation.command,
         command_family = validation.command_family,
+    )
+}
+
+fn done_rejected_prompt(ledger: &RequestedValidationLedger) -> String {
+    let incomplete = ledger
+        .incomplete_entries()
+        .into_iter()
+        .map(|entry| {
+            let status = match entry.status {
+                RequestedValidationStatus::Pending => "missing",
+                RequestedValidationStatus::Passed => "stale",
+                RequestedValidationStatus::Failed => "failed",
+                RequestedValidationStatus::Stale => "stale",
+            };
+            format!("- {} ({status})", entry.command)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "DONE is not accepted yet. Required validation is incomplete for the \
+         latest source state:\n{incomplete}\n\
+         Run only the missing, stale, or failed validation commands above. \
+         Reply DONE only after every listed command passes after the latest \
+         source mutation. Reply FAIL only if blocked."
     )
 }
 
@@ -1028,6 +1299,7 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     turn: usize,
     requested_validation_commands: &'a [String],
     requested_validation_pending_after_write: bool,
+    requested_validation_ledger: RequestedValidationLedger,
 }
 
 #[derive(Debug)]
@@ -1038,6 +1310,7 @@ struct StreamResponseResult {
     repair_no_content_interrupted: bool,
     action_boundary_interrupted: Option<ActionBoundaryInterrupt>,
     repair_depth_hard_stop: Option<RepairDepthDecision>,
+    requested_validation_ledger: RequestedValidationLedger,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1251,6 +1524,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         turn,
         requested_validation_commands,
         requested_validation_pending_after_write,
+        requested_validation_ledger,
     } = request;
     trace.event(
         "agent.stream.started",
@@ -1274,6 +1548,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let mut inspection_loop_tracker = InspectionLoopTracker::default();
     let mut final_response_only_after_validation: Option<SuccessfulValidationSnapshot> = None;
     let mut requested_validation_pending_after_write = requested_validation_pending_after_write;
+    let mut requested_validation_ledger = requested_validation_ledger;
     let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     let correlation_id = format!(
         "harness-turn-{turn}-{}",
@@ -1328,6 +1603,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 repair_no_content_interrupted,
                 action_boundary_interrupted,
                 repair_depth_hard_stop: Some(decision),
+                requested_validation_ledger,
             });
         }
         let projection = progress_projection_override.clone().unwrap_or_else(|| {
@@ -1822,6 +2098,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 repair_no_content_interrupted,
                 action_boundary_interrupted,
                 repair_depth_hard_stop: None,
+                requested_validation_ledger,
             });
         }
 
@@ -1881,13 +2158,40 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             }
             if is_meaningful_source_edit(call, &tool_result) {
                 requested_validation_pending_after_write = true;
+                requested_validation_ledger.note_source_mutation();
             }
+            let requested_validation_observation =
+                requested_validation_ledger.observe_tool_result(&tool_result);
+            if let Some(observation) = &requested_validation_observation {
+                if observation.source_mutation {
+                    requested_validation_pending_after_write = true;
+                }
+                trace.event(
+                    "agent.validation.ledger_observed",
+                    serde_json::json!({
+                        "turn": turn,
+                        "llm_call_depth": depth,
+                        "tool_call_id": &call.id,
+                        "tool_name": &call.name,
+                        "observation": observation,
+                        "ledger": &requested_validation_ledger,
+                    }),
+                )?;
+            }
+            let successful_validation = successful_validation_from_tool_result(
+                &tool_result,
+                requested_validation_commands,
+                requested_validation_pending_after_write,
+            );
+            let should_terminalize_for_validation = if requested_validation_commands.is_empty() {
+                successful_validation.clone()
+            } else if requested_validation_ledger.is_satisfied() {
+                requested_validation_ledger.latest_successful_validation()
+            } else {
+                None
+            };
             if final_response_only_after_validation.is_none()
-                && let Some(validation) = successful_validation_from_tool_result(
-                    &tool_result,
-                    requested_validation_commands,
-                    requested_validation_pending_after_write,
-                )
+                && let Some(validation) = should_terminalize_for_validation
             {
                 trace.event(
                     "agent.validation.success_terminal_prompted",
@@ -3957,6 +4261,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap_err();
@@ -4015,6 +4320,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap_err();
@@ -4063,6 +4369,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap_err();
@@ -4106,6 +4413,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap_err();
@@ -4155,6 +4463,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap();
@@ -4209,6 +4518,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap();
@@ -4254,6 +4564,7 @@ mod tests {
             turn: 5,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap();
@@ -4301,6 +4612,7 @@ mod tests {
             turn: 5,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap();
@@ -4356,6 +4668,7 @@ mod tests {
             turn: 5,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap();
@@ -4410,6 +4723,7 @@ mod tests {
             turn: 6,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap();
@@ -4467,6 +4781,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap_err();
@@ -4547,6 +4862,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap();
@@ -4607,6 +4923,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap();
@@ -4658,6 +4975,7 @@ mod tests {
             turn: 1,
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
+            requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
         .unwrap();
@@ -4763,12 +5081,16 @@ Run:
 
 ```sh
 cargo test test_deterministic_simulation_terminates_and_reports_summary
+cargo run -- --simulate 600
 ```
 "#;
 
         assert_eq!(
             requested_validation_commands(task),
-            vec!["cargo test test_deterministic_simulation_terminates_and_reports_summary"]
+            vec![
+                "cargo test test_deterministic_simulation_terminates_and_reports_summary",
+                "cargo run -- --simulate 600",
+            ]
         );
     }
 
@@ -5380,6 +5702,66 @@ cargo test test_deterministic_simulation_terminates_and_reports_summary
         assert!(
             trace.contains("\"requested_validation_commands\":[\"./cargo test focused_summary\"]")
         );
+    }
+
+    #[tokio::test]
+    async fn fixture_rejects_done_until_all_requested_validation_passes() {
+        let fixture = AgentFixture::new(
+            "Edit existing source.\n\nRun:\n\n```sh\n./cargo build\n./cargo test\n```\n",
+        );
+        fixture.write_fake_cargo(0, "ok");
+        std::fs::create_dir_all(fixture.workspace.join("src")).unwrap();
+        std::fs::write(
+            fixture.workspace.join("src/lib.rs"),
+            "pub fn answer() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "edit_file",
+                HashMap::from([
+                    ("path".to_string(), json!("src/lib.rs")),
+                    (
+                        "edits".to_string(),
+                        json!([
+                            {
+                                "kind": "replace_exact",
+                                "old": "    1\n",
+                                "new": "    42\n"
+                            }
+                        ]),
+                    ),
+                ]),
+            )],
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("./cargo build"))]),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 3).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.validation.done_rejected\""));
+        assert!(trace.contains("./cargo test"));
+        let prompts = trace_payloads(&trace, "agent.validation.success_terminal_prompted");
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert_eq!(prompts[0]["validation"]["command"], "./cargo test");
+        let tool_counts = gateway.tool_counts();
+        assert!(
+            tool_counts.len() >= 5,
+            "expected at least five model calls, got {tool_counts:?}"
+        );
+        assert!(tool_counts[2] > 0, "{tool_counts:?}");
+        assert!(tool_counts[3] > 0, "{tool_counts:?}");
+        assert_eq!(tool_counts[4], 0, "{tool_counts:?}");
     }
 
     #[tokio::test]

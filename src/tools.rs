@@ -372,7 +372,6 @@ impl ToolScope {
         let mut first_source_mutation = false;
         let mut first_post_validation_repair_action = false;
         let mut active_repair = None;
-        let total_write_operations;
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         if policy.consecutive_writes_without_shell >= MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
             bail!("write budget exhausted: run a shell validation probe before editing again");
@@ -401,7 +400,7 @@ impl ToolScope {
                 .or_insert(0) += 1;
         }
         policy.total_write_operations += 1;
-        total_write_operations = policy.total_write_operations;
+        let total_write_operations = policy.total_write_operations;
         drop(policy);
         if first_source_mutation {
             self.trace.event(
@@ -439,7 +438,6 @@ impl ToolScope {
         let mut first_source_mutation = false;
         let mut first_post_validation_repair_action = false;
         let mut active_repair = None;
-        let total_write_operations;
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         if !source_paths.is_empty() && !policy.emitted_first_source_mutation {
             policy.emitted_first_source_mutation = true;
@@ -465,7 +463,7 @@ impl ToolScope {
                 .or_insert(0) += 1;
         }
         policy.total_write_operations += 1;
-        total_write_operations = policy.total_write_operations;
+        let total_write_operations = policy.total_write_operations;
         drop(policy);
         if first_source_mutation {
             let _ = self.trace.event(
