@@ -1301,7 +1301,7 @@ impl LlmTool for EditFileTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "edit_file".to_string(),
-                description: "Apply one or more structured text edits to an existing UTF-8 file under the active experiment root. Use replace_exact for a unique snippet, replace_lines/delete_lines for known line ranges, insert_before/insert_after for a unique anchor, and replace_between for a bounded block between unique anchors. Insert operations are line-aware: when the anchor is a complete line, inserted text is placed on adjacent complete lines instead of being concatenated onto the anchor line. replace_between is also line-aware for preserved end anchors and returns a boundary preview."
+                description: "Apply one or more structured text edits to an existing UTF-8 file under the active experiment root. Use replace_exact for a unique snippet, replace_lines/delete_lines for known line ranges, insert_before/insert_after for a unique anchor, and replace_between for a bounded block between unique anchors. Insert operations are line-aware: when the anchor is a complete line, or the anchor is the non-whitespace suffix of an indented line, inserted text is placed on adjacent complete lines instead of being concatenated onto the anchor line. replace_between is also line-aware for preserved end anchors and returns a boundary preview."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -1996,11 +1996,18 @@ fn line_aware_insertion(
     text: &str,
 ) -> NormalizedInsertion {
     let anchor_end = anchor_offset + anchor_len;
-    let anchor_at_line_start = anchor_offset == 0 || content[..anchor_offset].ends_with('\n');
+    let line_start = content[..anchor_offset]
+        .rfind('\n')
+        .map(|offset| offset + '\n'.len_utf8())
+        .unwrap_or(0);
+    let line_prefix_before_anchor = &content[line_start..anchor_offset];
+    let anchor_at_line_start = anchor_offset == line_start;
     let anchor_at_line_end = anchor_end == content.len() || content[anchor_end..].starts_with('\n');
     let anchor_is_complete_line = anchor_at_line_start && anchor_at_line_end;
+    let anchor_is_indented_line_suffix =
+        anchor_at_line_end && line_prefix_before_anchor.trim().is_empty();
 
-    if !anchor_is_complete_line {
+    if !anchor_is_complete_line && !anchor_is_indented_line_suffix {
         return NormalizedInsertion {
             offset: if kind == "insert_before" {
                 anchor_offset
@@ -2031,7 +2038,7 @@ fn line_aware_insertion(
             normalized.push('\n');
         }
         NormalizedInsertion {
-            offset: anchor_offset,
+            offset: line_start,
             text: normalized,
         }
     }
@@ -2954,6 +2961,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_file_insert_after_indented_line_suffix_anchor_starts_next_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(
+            &file,
+            "pub struct SimulationSummary {\n    pub invaders_remaining: usize,\n    pub steps: usize,\n}\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool { scope };
+        let result = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "insert_after",
+                            "anchor": "pub invaders_remaining: usize,",
+                            "text": "    pub projectiles_remaining: usize,"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "pub struct SimulationSummary {\n    pub invaders_remaining: usize,\n    pub projectiles_remaining: usize,\n    pub steps: usize,\n}\n"
+        );
+        assert_eq!(result["edits_applied"][0]["line_boundary_normalized"], true);
+    }
+
+    #[tokio::test]
     async fn edit_file_insert_before_complete_line_anchor_ends_inserted_line() {
         let temp = tempfile::tempdir().unwrap();
         let scope = restricted_scope(&temp);
@@ -2982,6 +3026,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "one\ninserted\ntwo\nthree\n"
+        );
+        assert_eq!(result["edits_applied"][0]["line_boundary_normalized"], true);
+    }
+
+    #[tokio::test]
+    async fn edit_file_insert_before_indented_line_suffix_anchor_uses_line_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(&file, "one\n    two\nthree\n").unwrap();
+
+        let tool = EditFileTool { scope };
+        let result = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "insert_before",
+                            "anchor": "two",
+                            "text": "inserted"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "one\ninserted\n    two\nthree\n"
         );
         assert_eq!(result["edits_applied"][0]["line_boundary_normalized"], true);
     }
