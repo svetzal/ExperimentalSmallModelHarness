@@ -205,6 +205,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     let goal = tokio::fs::read_to_string(&goal_file)
         .await
         .with_context(|| format!("reading goal file {}", goal_file.display()))?;
+    let requested_validation_commands = requested_validation_commands(&goal);
     let tool_root = tool_root
         .canonicalize()
         .with_context(|| format!("canonicalizing tool root {}", tool_root.display()))?;
@@ -229,6 +230,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             "action_boundary_interrupt_tokens": config.action_boundary_interrupt_tokens,
             "assembly_policy": config.transcript_policy.as_str(),
             "transcript_policy": config.transcript_policy,
+            "requested_validation_commands": &requested_validation_commands,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
             "harness_package_version": env!("CARGO_PKG_VERSION"),
             "harness_source_state": harness_source_state(),
@@ -269,6 +271,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     let mut action_boundary_no_action_tracker = ActionBoundaryNoActionTracker::default();
     let mut repair_no_action_tracker = RepairNoActionTracker::default();
     let mut final_response_only_next_turn = false;
+    let requested_validation_completed_write_operations = 0usize;
     let mut exhausted_iterations = true;
     let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     for turn in 1..=config.max_iterations {
@@ -316,6 +319,10 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             runner_activity_override: None,
             trace: &trace,
             turn,
+            requested_validation_commands: &requested_validation_commands,
+            requested_validation_pending_after_write: !requested_validation_commands.is_empty()
+                && policy_before_turn.total_write_operations
+                    > requested_validation_completed_write_operations,
         })
         .await
         {
@@ -353,8 +360,11 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         let wrote_this_turn =
             policy.total_write_operations > policy_before_turn.total_write_operations;
         let probed_this_turn = policy.total_shell_probes > policy_before_turn.total_shell_probes;
-        let terminalize_after_validation =
-            should_terminalize_after_successful_validation(&policy_before_turn, &policy);
+        let terminalize_after_validation = should_terminalize_after_successful_validation(
+            &policy_before_turn,
+            &policy,
+            &requested_validation_commands,
+        );
         trace.event(
             "agent.context.turn_pressure",
             serde_json::json!({
@@ -544,6 +554,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                             "turn": turn,
                             "tool_calls_this_turn": tool_calls_this_turn,
                             "validation": validation,
+                            "requested_validation_commands": &requested_validation_commands,
                         }),
                     )?;
                     final_response_only_next_turn = true;
@@ -636,6 +647,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                     "turn": turn,
                     "tool_calls_this_turn": tool_calls_this_turn,
                     "validation": validation,
+                    "requested_validation_commands": &requested_validation_commands,
                 }),
             )?;
             final_response_only_next_turn = true;
@@ -789,6 +801,7 @@ fn should_prompt_validation_repair(policy: &ToolPolicySnapshot, response: &str) 
 fn should_terminalize_after_successful_validation(
     before: &ToolPolicySnapshot,
     after: &ToolPolicySnapshot,
+    requested_validation_commands: &[String],
 ) -> Option<SuccessfulValidationSnapshot> {
     let validation = after.latest_successful_validation_after_write.as_ref()?;
     if validation.total_shell_probes <= before.total_shell_probes {
@@ -797,7 +810,101 @@ fn should_terminalize_after_successful_validation(
     if after.validation_required_after_write || after.validation_repair.is_some() {
         return None;
     }
+    if !validation_matches_requested_command(&validation.command, requested_validation_commands) {
+        return None;
+    }
     Some(validation.clone())
+}
+
+fn requested_validation_commands(goal: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut in_fence = false;
+    let mut shell_fence = false;
+
+    for line in goal.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if in_fence {
+                in_fence = false;
+                shell_fence = false;
+            } else {
+                in_fence = true;
+                let info = trimmed.trim_start_matches('`').trim().to_ascii_lowercase();
+                shell_fence = matches!(
+                    info.as_str(),
+                    "" | "sh" | "shell" | "bash" | "zsh" | "console" | "text"
+                );
+            }
+            continue;
+        }
+
+        if !in_fence || !shell_fence {
+            continue;
+        }
+        let command = trimmed.trim_start_matches('$').trim();
+        if is_requested_validation_command_line(command) {
+            let normalized = normalize_validation_command(command);
+            if !normalized.is_empty() && !commands.contains(&normalized) {
+                commands.push(normalized);
+            }
+        }
+    }
+
+    commands
+}
+
+fn is_requested_validation_command_line(command: &str) -> bool {
+    let normalized = normalize_validation_command(command);
+    [
+        "cargo test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "cargo fmt",
+        "./cargo test",
+        "./cargo build",
+        "./cargo check",
+        "./cargo clippy",
+        "./cargo fmt",
+        "npm test",
+        "npm run test",
+        "pnpm test",
+        "yarn test",
+        "pytest",
+        "python -m pytest",
+        "go test",
+        "mix test",
+    ]
+    .iter()
+    .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
+}
+
+fn validation_matches_requested_command(command: &str, requested: &[String]) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+    let actual = normalize_validation_command(command);
+    requested
+        .iter()
+        .any(|expected| actual == *expected || actual.starts_with(&format!("{expected} ")))
+}
+
+fn normalize_validation_command(command: &str) -> String {
+    let command = command
+        .split_once('|')
+        .map(|(head, _)| head)
+        .unwrap_or(command)
+        .trim();
+    let mut parts = command.split_whitespace().collect::<Vec<_>>();
+    while parts.last().is_some_and(|part| {
+        matches!(
+            *part,
+            "2>&1" | "1>&2" | ">/dev/null" | "1>/dev/null" | "2>/dev/null"
+        )
+    }) {
+        parts.pop();
+    }
+    parts.join(" ")
 }
 
 fn successful_validation_done_prompt(validation: &SuccessfulValidationSnapshot) -> String {
@@ -919,6 +1026,8 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     runner_activity_override: Option<RunnerActivitySample>,
     trace: &'a TraceRecorder,
     turn: usize,
+    requested_validation_commands: &'a [String],
+    requested_validation_pending_after_write: bool,
 }
 
 #[derive(Debug)]
@@ -1140,6 +1249,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         runner_activity_override,
         trace,
         turn,
+        requested_validation_commands,
+        requested_validation_pending_after_write,
     } = request;
     trace.event(
         "agent.stream.started",
@@ -1162,6 +1273,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         expected_output_tokens.saturating_mul(NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER);
     let mut inspection_loop_tracker = InspectionLoopTracker::default();
     let mut final_response_only_after_validation: Option<SuccessfulValidationSnapshot> = None;
+    let mut requested_validation_pending_after_write = requested_validation_pending_after_write;
     let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     let correlation_id = format!(
         "harness-turn-{turn}-{}",
@@ -1767,8 +1879,15 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 trace.event("agent.inspection_loop.hard_failed", &decision)?;
                 anyhow::bail!("{}", inspection_loop_failure_summary(&decision));
             }
+            if is_meaningful_source_edit(call, &tool_result) {
+                requested_validation_pending_after_write = true;
+            }
             if final_response_only_after_validation.is_none()
-                && let Some(validation) = successful_validation_from_tool_result(&tool_result)
+                && let Some(validation) = successful_validation_from_tool_result(
+                    &tool_result,
+                    requested_validation_commands,
+                    requested_validation_pending_after_write,
+                )
             {
                 trace.event(
                     "agent.validation.success_terminal_prompted",
@@ -1778,6 +1897,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         "tool_call_id": &call.id,
                         "tool_name": &call.name,
                         "validation": &validation,
+                        "requested_validation_commands": requested_validation_commands,
                         "scope": "in_turn",
                     }),
                 )?;
@@ -1785,6 +1905,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     &validation,
                 )));
                 final_response_only_after_validation = Some(validation);
+                requested_validation_pending_after_write = false;
             }
         }
         compact_retained_tool_results(
@@ -2905,6 +3026,8 @@ fn is_validation_probe_result(result: &ToolCallRunResult) -> bool {
 
 fn successful_validation_from_tool_result(
     result: &ToolCallRunResult,
+    requested_validation_commands: &[String],
+    requested_validation_pending_after_write: bool,
 ) -> Option<SuccessfulValidationSnapshot> {
     if !result.ok {
         return None;
@@ -2920,10 +3043,16 @@ fn successful_validation_from_tool_result(
     if value.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
         return None;
     }
-    if value
+    let clears_pending_source_writes = value
         .get("validation_probe_clears_pending_source_writes")
         .and_then(serde_json::Value::as_bool)
-        != Some(true)
+        == Some(true);
+    if requested_validation_commands.is_empty() && !clears_pending_source_writes {
+        return None;
+    }
+    if !requested_validation_commands.is_empty()
+        && !clears_pending_source_writes
+        && !requested_validation_pending_after_write
     {
         return None;
     }
@@ -2934,12 +3063,16 @@ fn successful_validation_from_tool_result(
     {
         return None;
     }
+    let command = value
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("validation command")
+        .to_string();
+    if !validation_matches_requested_command(&command, requested_validation_commands) {
+        return None;
+    }
     Some(SuccessfulValidationSnapshot {
-        command: value
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("validation command")
-            .to_string(),
+        command,
         command_family: value
             .get("command_family")
             .and_then(serde_json::Value::as_str)
@@ -3822,6 +3955,8 @@ mod tests {
             }),
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap_err();
@@ -3878,6 +4013,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap_err();
@@ -3924,6 +4061,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap_err();
@@ -3965,6 +4104,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap_err();
@@ -4012,6 +4153,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap();
@@ -4064,6 +4207,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap();
@@ -4107,6 +4252,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 5,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap();
@@ -4152,6 +4299,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 5,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap();
@@ -4205,6 +4354,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 5,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap();
@@ -4257,6 +4408,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 6,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap();
@@ -4312,6 +4465,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap_err();
@@ -4390,6 +4545,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap();
@@ -4448,6 +4605,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap();
@@ -4497,6 +4656,8 @@ mod tests {
             runner_activity_override: None,
             trace: &trace,
             turn: 1,
+            requested_validation_commands: &[],
+            requested_validation_pending_after_write: false,
         })
         .await
         .unwrap();
@@ -4569,7 +4730,7 @@ mod tests {
             total_write_operations: 1,
         });
 
-        let decision = should_terminalize_after_successful_validation(&before, &after);
+        let decision = should_terminalize_after_successful_validation(&before, &after, &[]);
 
         assert_eq!(
             decision.map(|validation| validation.command),
@@ -4578,11 +4739,75 @@ mod tests {
 
         let mut dirty_after = after.clone();
         dirty_after.validation_required_after_write = true;
-        assert!(should_terminalize_after_successful_validation(&before, &dirty_after).is_none());
+        assert!(
+            should_terminalize_after_successful_validation(&before, &dirty_after, &[]).is_none()
+        );
 
         let mut stale_before = before;
         stale_before.total_shell_probes = 1;
-        assert!(should_terminalize_after_successful_validation(&stale_before, &after).is_none());
+        assert!(
+            should_terminalize_after_successful_validation(&stale_before, &after, &[]).is_none()
+        );
+    }
+
+    #[test]
+    fn requested_validation_parser_extracts_shell_validation_commands() {
+        let task = r#"
+Edit the existing Rust project.
+
+```rust
+fn cargo_test_is_not_a_command() {}
+```
+
+Run:
+
+```sh
+cargo test test_deterministic_simulation_terminates_and_reports_summary
+```
+"#;
+
+        assert_eq!(
+            requested_validation_commands(task),
+            vec!["cargo test test_deterministic_simulation_terminates_and_reports_summary"]
+        );
+    }
+
+    #[test]
+    fn successful_validation_terminalization_requires_requested_command_match() {
+        let before = repair_policy_snapshot(1, 0, None, BTreeMap::new());
+        let requested = vec![
+            "cargo test test_deterministic_simulation_terminates_and_reports_summary".to_string(),
+        ];
+        let mut after = repair_policy_snapshot(1, 1, None, BTreeMap::new());
+        after.latest_successful_validation_after_write = Some(SuccessfulValidationSnapshot {
+            command: "cargo build 2>&1".to_string(),
+            command_family: "cargo build".to_string(),
+            status: Some(0),
+            total_shell_probes: 1,
+            total_write_operations: 1,
+        });
+
+        assert!(
+            should_terminalize_after_successful_validation(&before, &after, &requested).is_none()
+        );
+
+        after.latest_successful_validation_after_write = Some(SuccessfulValidationSnapshot {
+            command: "cargo test test_deterministic_simulation_terminates_and_reports_summary 2>&1"
+                .to_string(),
+            command_family: "cargo test".to_string(),
+            status: Some(0),
+            total_shell_probes: 1,
+            total_write_operations: 1,
+        });
+
+        assert_eq!(
+            should_terminalize_after_successful_validation(&before, &after, &requested)
+                .map(|validation| validation.command),
+            Some(
+                "cargo test test_deterministic_simulation_terminates_and_reports_summary 2>&1"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -5091,6 +5316,70 @@ mod tests {
         let trace = std::fs::read_to_string(summary.trace_file).unwrap();
         assert!(trace.contains("\"kind\":\"agent.validation.success_terminal_prompted\""));
         assert!(trace.contains("\"scope\":\"in_turn\""));
+    }
+
+    #[tokio::test]
+    async fn fixture_waits_for_requested_validation_before_terminalizing() {
+        let fixture = AgentFixture::new(
+            "Edit existing source.\n\nRun:\n\n```sh\n./cargo test focused_summary\n```\n",
+        );
+        fixture.write_fake_cargo(0, "ok");
+        std::fs::create_dir_all(fixture.workspace.join("src")).unwrap();
+        std::fs::write(
+            fixture.workspace.join("src/lib.rs"),
+            "pub fn answer() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "edit_file",
+                HashMap::from([
+                    ("path".to_string(), json!("src/lib.rs")),
+                    (
+                        "edits".to_string(),
+                        json!([
+                            {
+                                "kind": "replace_exact",
+                                "old": "    1\n",
+                                "new": "    42\n"
+                            }
+                        ]),
+                    ),
+                ]),
+            )],
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("./cargo build"))]),
+            )],
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("./cargo test focused_summary"))]),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 2).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        let tool_counts = gateway.tool_counts();
+        assert!(
+            tool_counts.len() >= 4,
+            "expected at least four model calls, got {tool_counts:?}"
+        );
+        assert!(tool_counts[0] > 0, "{tool_counts:?}");
+        assert!(tool_counts[1] > 0, "{tool_counts:?}");
+        assert!(tool_counts[2] > 0, "{tool_counts:?}");
+        assert_eq!(tool_counts[3], 0, "{tool_counts:?}");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        let prompts = trace_payloads(&trace, "agent.validation.success_terminal_prompted");
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert_eq!(
+            prompts[0]["validation"]["command"],
+            "./cargo test focused_summary"
+        );
+        assert!(
+            trace.contains("\"requested_validation_commands\":[\"./cargo test focused_summary\"]")
+        );
     }
 
     #[tokio::test]

@@ -1883,12 +1883,15 @@ impl ShellCommandTool {
                 }),
             );
         }
+        let policy_snapshot = self.scope.policy_snapshot();
         Ok(json!({
             "cwd": self.scope.relative_display(&cwd),
             "command": command,
             "command_family": command_family,
             "validation_probe": validation_probe,
             "validation_probe_clears_pending_source_writes": validation_probe_clears_pending_source_writes,
+            "total_shell_probes": policy_snapshot.total_shell_probes,
+            "total_write_operations": policy_snapshot.total_write_operations,
             "status": output.status.code(),
             "success": output.status.success(),
             "stdout": stdout.content,
