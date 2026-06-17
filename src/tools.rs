@@ -1301,7 +1301,7 @@ impl LlmTool for EditFileTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "edit_file".to_string(),
-                description: "Apply one or more structured text edits to an existing UTF-8 file under the active experiment root. Use replace_exact for a unique snippet, replace_lines/delete_lines for known line ranges, insert_before/insert_after for a unique anchor, and replace_between for a bounded block between unique anchors. Insert operations are line-aware: when the anchor is a complete line, inserted text is placed on adjacent complete lines instead of being concatenated onto the anchor line."
+                description: "Apply one or more structured text edits to an existing UTF-8 file under the active experiment root. Use replace_exact for a unique snippet, replace_lines/delete_lines for known line ranges, insert_before/insert_after for a unique anchor, and replace_between for a bounded block between unique anchors. Insert operations are line-aware: when the anchor is a complete line, inserted text is placed on adjacent complete lines instead of being concatenated onto the anchor line. replace_between is also line-aware for preserved end anchors and returns a boundary preview."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -1539,7 +1539,17 @@ impl EditFileTool {
                     verify_expected_context(object, index, &selected)?;
                     let start_line = line_number_at_byte(&content, replace_start);
                     let end_line = line_number_at_byte(&content, replace_end);
-                    content.replace_range(replace_start..replace_end, new);
+                    let normalized = line_aware_replace_between_replacement(
+                        &content,
+                        replace_end,
+                        include_end,
+                        &selected,
+                        new,
+                    );
+                    content.replace_range(replace_start..replace_end, &normalized.text);
+                    let boundary_offset = replace_start + normalized.text.len();
+                    let boundary_preview = (!include_end)
+                        .then(|| boundary_preview_around_byte(&content, boundary_offset));
                     json!({
                         "index": index,
                         "kind": kind,
@@ -1551,6 +1561,9 @@ impl EditFileTool {
                         "end_line": end_line,
                         "old_bytes": selected.len(),
                         "new_bytes": new.len(),
+                        "normalized_new_bytes": normalized.text.len(),
+                        "line_boundary_normalized": normalized.line_boundary_normalized,
+                        "boundary_preview": boundary_preview,
                         "bytes_delta": content.len() as isize - before_edit_len as isize,
                     })
                 }
@@ -1960,6 +1973,12 @@ struct NormalizedInsertion {
     text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedReplacement {
+    text: String,
+    line_boundary_normalized: bool,
+}
+
 fn line_aware_insertion(
     content: &str,
     anchor_offset: usize,
@@ -2007,6 +2026,60 @@ fn line_aware_insertion(
             text: normalized,
         }
     }
+}
+
+fn line_aware_replace_between_replacement(
+    content: &str,
+    replace_end: usize,
+    include_end: bool,
+    selected: &str,
+    new: &str,
+) -> NormalizedReplacement {
+    let mut text = new.to_string();
+    let next_preserved_text = &content[replace_end..];
+    let block_replacement = selected.contains('\n') || new.contains('\n');
+    let should_normalize = !include_end
+        && block_replacement
+        && !text.is_empty()
+        && !text.ends_with('\n')
+        && !next_preserved_text.is_empty()
+        && !next_preserved_text.starts_with('\n');
+    if should_normalize {
+        text.push('\n');
+    }
+    NormalizedReplacement {
+        text,
+        line_boundary_normalized: should_normalize,
+    }
+}
+
+fn boundary_preview_around_byte(content: &str, byte_index: usize) -> Value {
+    let lines = split_lines_preserving_newlines(content);
+    let mut byte_cursor = 0usize;
+    let mut boundary_line_index = lines.len().saturating_sub(1);
+    for (index, line) in lines.iter().enumerate() {
+        if byte_index <= byte_cursor + line.len() {
+            boundary_line_index = index;
+            break;
+        }
+        byte_cursor += line.len();
+    }
+    let start = boundary_line_index.saturating_sub(2);
+    let end = (boundary_line_index + 3).min(lines.len());
+    let preview = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            json!({
+                "line": start + offset + 1,
+                "text": line.trim_end_matches('\n'),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "boundary_byte": byte_index,
+        "lines": preview,
+    })
 }
 
 fn line_number_at_byte(content: &str, byte_index: usize) -> usize {
@@ -2921,6 +2994,67 @@ mod tests {
         );
         assert_eq!(result["edits_applied"][0]["start_line"], 2);
         assert_eq!(result["edits_applied"][0]["end_line"], 5);
+        assert_eq!(
+            result["edits_applied"][0]["line_boundary_normalized"],
+            false
+        );
+        assert!(
+            result["edits_applied"][0]["boundary_preview"]["lines"]
+                .as_array()
+                .is_some_and(|lines| lines.iter().any(|line| line["text"] == json!("// Tests")))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_between_normalizes_preserved_end_anchor_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = restricted_scope(&temp);
+        std::fs::create_dir_all(temp.path().join("workspace/src")).unwrap();
+        let file = temp.path().join("workspace/src/lib.rs");
+        std::fs::write(
+            &file,
+            "before\nimpl std::fmt::Display for SimulationSummary {\n    old\n}\n// \u{2500}\u{2500}\u{2500} Tests\nmod tests {}\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool { scope };
+        let result = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("workspace/src/lib.rs")),
+                (
+                    "edits".to_string(),
+                    json!([
+                        {
+                            "kind": "replace_between",
+                            "start_anchor": "impl std::fmt::Display for SimulationSummary {",
+                            "end_anchor": "// \u{2500}\u{2500}\u{2500} Tests",
+                            "include_start": true,
+                            "include_end": false,
+                            "expected": "old",
+                            "new": "impl std::fmt::Display for SimulationSummary {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"ok\")\n    }\n}"
+                        }
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "before\nimpl std::fmt::Display for SimulationSummary {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"ok\")\n    }\n}\n// \u{2500}\u{2500}\u{2500} Tests\nmod tests {}\n"
+        );
+        assert_eq!(result["edits_applied"][0]["line_boundary_normalized"], true);
+        assert_eq!(
+            result["edits_applied"][0]["normalized_new_bytes"],
+            json!("impl std::fmt::Display for SimulationSummary {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"ok\")\n    }\n}\n".len())
+        );
+        assert!(
+            result["edits_applied"][0]["boundary_preview"]["lines"]
+                .as_array()
+                .is_some_and(|lines| lines
+                    .iter()
+                    .any(|line| line["text"] == json!("// \u{2500}\u{2500}\u{2500} Tests")))
+        );
     }
 
     #[tokio::test]
