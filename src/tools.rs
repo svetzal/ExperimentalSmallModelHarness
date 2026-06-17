@@ -1818,8 +1818,17 @@ impl ShellCommandTool {
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
         let validation_probe = is_validation_probe(command);
+        let policy_before_command = self.scope.policy_snapshot();
+        if policy_before_command.validation_required_after_write
+            && !validation_probe
+            && is_known_shell_mutation_command(command)
+        {
+            bail!(
+                "shell command appears to mutate files while validation is required after source edits; run a validation probe before further cleanup, then use edit_file for any remaining source edits"
+            );
+        }
         let validation_probe_clears_pending_source_writes =
-            validation_probe && self.scope.policy_snapshot().validation_required_after_write;
+            validation_probe && policy_before_command.validation_required_after_write;
         let command_family = command_family(command);
         let before_mutation_snapshot = match self.scope.shell_mutation_snapshot() {
             Ok(snapshot) => Some(snapshot),
@@ -2312,6 +2321,29 @@ fn validate_shell_command(command: &str, root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_known_shell_mutation_command(command: &str) -> bool {
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = normalized.to_ascii_lowercase();
+    if lowered.contains("sed -i")
+        || lowered.contains("perl -i")
+        || lowered.contains("ruby -i")
+        || lowered.contains("python -i")
+    {
+        return true;
+    }
+
+    let redirection_mutation = [" > ", " 1> ", " >> ", " 1>> "]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+    let file_write_call = (lowered.contains("python ") || lowered.contains("python3 "))
+        && (lowered.contains(".write(")
+            || lowered.contains("write_text(")
+            || lowered.contains("open(")
+                && (lowered.contains(", 'w'") || lowered.contains(", \"w\"")));
+
+    redirection_mutation || file_write_call
 }
 
 fn is_validation_probe(command: &str) -> bool {
@@ -3488,6 +3520,68 @@ test result: FAILED. 20 passed; 1 failed; finished in 0.00s
 
         assert_eq!(result["validation_probe"], false);
         assert_eq!(scope.policy_snapshot().writes_since_shell_probe, 1);
+    }
+
+    #[tokio::test]
+    async fn mutating_shell_command_is_rejected_while_validation_is_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        let file = temp.path().join("src/lib.rs");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        scope
+            .note_write_intent(std::slice::from_ref(&scope.root.join("src/lib.rs")))
+            .unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+
+        let error = tool
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("sed -i '1d' src/lib.rs"),
+            )]))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("appears to mutate files"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+        assert_eq!(scope.policy_snapshot().total_write_operations, 1);
+    }
+
+    #[tokio::test]
+    async fn validation_probe_is_allowed_while_validation_is_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"pending-validation\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        scope
+            .note_write_intent(std::slice::from_ref(&scope.root.join("src/lib.rs")))
+            .unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+
+        let result = tool
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("cargo test"),
+            )]))
+            .await
+            .unwrap();
+
+        assert_eq!(result["validation_probe"], true);
+        assert_eq!(result["success"], true);
+        assert_eq!(scope.policy_snapshot().total_shell_probes, 1);
     }
 
     #[tokio::test]
