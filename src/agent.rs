@@ -1079,6 +1079,9 @@ fn requested_validation_commands(goal: &str) -> Vec<String> {
 }
 
 fn is_requested_validation_command_line(command: &str) -> bool {
+    if validation_command_masks_failure(command) {
+        return false;
+    }
     let normalized = normalize_validation_command(command);
     [
         "cargo test",
@@ -1107,6 +1110,9 @@ fn is_requested_validation_command_line(command: &str) -> bool {
 }
 
 fn validation_matches_requested_command(command: &str, requested: &[String]) -> bool {
+    if validation_command_masks_failure(command) {
+        return false;
+    }
     if requested.is_empty() {
         return true;
     }
@@ -1114,6 +1120,32 @@ fn validation_matches_requested_command(command: &str, requested: &[String]) -> 
     requested
         .iter()
         .any(|expected| actual == *expected || actual.starts_with(&format!("{expected} ")))
+}
+
+fn validation_command_masks_failure(command: &str) -> bool {
+    let spaced = command
+        .replace("||", " || ")
+        .replace("&&", " && ")
+        .replace(';', " ; ");
+    let parts = spaced.split_whitespace().collect::<Vec<_>>();
+    parts.iter().enumerate().any(|(index, part)| {
+        let part = part.to_ascii_lowercase();
+        let next = parts.get(index + 1).map(|value| value.to_ascii_lowercase());
+        let after_next = parts.get(index + 2).map(|value| value.to_ascii_lowercase());
+        match part.as_str() {
+            "||" => {
+                matches!(next.as_deref(), Some("true" | ":"))
+                    || (matches!(next.as_deref(), Some("exit"))
+                        && matches!(after_next.as_deref(), Some("0")))
+            }
+            ";" => {
+                matches!(next.as_deref(), Some("true"))
+                    || (matches!(next.as_deref(), Some("exit"))
+                        && matches!(after_next.as_deref(), Some("0")))
+            }
+            _ => false,
+        }
+    })
 }
 
 fn normalize_validation_command(command: &str) -> String {
@@ -5095,6 +5127,50 @@ cargo run -- --simulate 600
     }
 
     #[test]
+    fn requested_validation_parser_ignores_masked_success_commands() {
+        let task = r#"
+Run:
+
+```sh
+cargo build || true
+cargo test
+cargo run -- --version-check ; true
+```
+"#;
+
+        assert_eq!(
+            requested_validation_commands(task),
+            vec!["cargo test".to_string()]
+        );
+    }
+
+    #[test]
+    fn validation_matching_rejects_masked_success_commands() {
+        let requested = vec!["cargo build".to_string()];
+
+        assert!(!validation_matches_requested_command(
+            "cargo build 2>&1 || true",
+            &requested
+        ));
+        assert!(!validation_matches_requested_command(
+            "cargo build || exit 0",
+            &requested
+        ));
+        assert!(!validation_matches_requested_command(
+            "cargo build || :",
+            &requested
+        ));
+        assert!(!validation_matches_requested_command(
+            "cargo build ; true",
+            &requested
+        ));
+        assert!(validation_matches_requested_command(
+            "cargo build 2>&1",
+            &requested
+        ));
+    }
+
+    #[test]
     fn successful_validation_terminalization_requires_requested_command_match() {
         let before = repair_policy_snapshot(1, 0, None, BTreeMap::new());
         let requested = vec![
@@ -5129,6 +5205,24 @@ cargo run -- --simulate 600
                 "cargo test test_deterministic_simulation_terminates_and_reports_summary 2>&1"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn successful_validation_terminalization_rejects_masked_success_commands() {
+        let before = repair_policy_snapshot(1, 0, None, BTreeMap::new());
+        let requested = vec!["cargo build".to_string()];
+        let mut after = repair_policy_snapshot(1, 1, None, BTreeMap::new());
+        after.latest_successful_validation_after_write = Some(SuccessfulValidationSnapshot {
+            command: "cargo build 2>&1 || true".to_string(),
+            command_family: "cargo build".to_string(),
+            status: Some(0),
+            total_shell_probes: 1,
+            total_write_operations: 1,
+        });
+
+        assert!(
+            should_terminalize_after_successful_validation(&before, &after, &requested).is_none()
         );
     }
 
