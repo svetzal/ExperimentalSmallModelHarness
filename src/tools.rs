@@ -549,7 +549,7 @@ impl ToolScope {
             .writes_since_shell_probe_paths
             .keys()
             .any(|path| path_requires_validation_after_write(path));
-        let cleared_pending_source_writes = had_pending_source_writes;
+        let cleared_pending_source_writes = had_pending_source_writes && success;
         let first_validation_probe = !policy.emitted_first_validation_probe;
         if first_validation_probe {
             policy.emitted_first_validation_probe = true;
@@ -565,9 +565,11 @@ impl ToolScope {
         } else {
             None
         };
-        policy.consecutive_writes_without_shell = 0;
-        policy.writes_since_shell_probe = 0;
-        policy.writes_since_shell_probe_paths.clear();
+        if success {
+            policy.consecutive_writes_without_shell = 0;
+            policy.writes_since_shell_probe = 0;
+            policy.writes_since_shell_probe_paths.clear();
+        }
         policy.total_shell_probes += 1;
         let total_shell_probes = policy.total_shell_probes;
         let total_write_operations = policy.total_write_operations;
@@ -1858,8 +1860,6 @@ impl ShellCommandTool {
                 "shell command appears to mutate files while validation is required after source edits; run a validation probe before further cleanup, then use edit_file for any remaining source edits"
             );
         }
-        let validation_probe_clears_pending_source_writes =
-            validation_probe && policy_before_command.validation_required_after_write;
         let command_family = command_family(command);
         let before_mutation_snapshot = match self.scope.shell_mutation_snapshot() {
             Ok(snapshot) => Some(snapshot),
@@ -1924,6 +1924,9 @@ impl ShellCommandTool {
         } else {
             None
         };
+        let validation_probe_clears_pending_source_writes = validation_probe
+            && policy_before_command.validation_required_after_write
+            && output.status.success();
         self.scope.note_sensed_shell_mutation(&shell_mutation_paths);
         if shell_mutation_sensed {
             let _ = self.scope.trace.event(
@@ -3628,8 +3631,50 @@ test result: FAILED. 20 passed; 1 failed; finished in 0.00s
         assert!(trace.contains("\"command_family\":\"cargo check\""));
         assert!(trace.contains("\"success\":false"));
         assert!(trace.contains("\"had_pending_source_writes\":true"));
-        assert!(trace.contains("\"cleared_pending_source_writes\":true"));
+        assert!(trace.contains("\"cleared_pending_source_writes\":false"));
         assert!(trace.contains("\"src/lib.rs\":1"));
+        assert!(scope.policy_snapshot().validation_required_after_write);
+    }
+
+    #[tokio::test]
+    async fn successful_validation_probe_clears_pending_source_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"successful-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        scope
+            .note_write_intent(std::slice::from_ref(&scope.root.join("src/lib.rs")))
+            .unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+        let result = tool
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("cargo check --help"),
+            )]))
+            .await
+            .unwrap();
+
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+
+        assert_eq!(result["validation_probe"], true);
+        assert_eq!(result["success"], true);
+        assert_eq!(
+            result["validation_probe_clears_pending_source_writes"],
+            true
+        );
+        assert!(trace.contains("\"cleared_pending_source_writes\":true"));
+        assert!(!scope.policy_snapshot().validation_required_after_write);
     }
 
     #[tokio::test]
