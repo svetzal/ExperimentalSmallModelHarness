@@ -374,6 +374,23 @@ impl ToolScope {
         let mut active_repair = None;
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         if policy.consecutive_writes_without_shell >= MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
+            let consecutive_writes_without_shell = policy.consecutive_writes_without_shell;
+            let writes_since_shell_probe = policy.writes_since_shell_probe;
+            let writes_since_shell_probe_paths = policy.writes_since_shell_probe_paths.clone();
+            let total_write_operations = policy.total_write_operations;
+            drop(policy);
+            self.trace.event(
+                "agent.write_budget.exhausted",
+                json!({
+                    "attempted_paths": relative_paths,
+                    "attempted_source_paths": source_paths,
+                    "consecutive_writes_without_shell": consecutive_writes_without_shell,
+                    "writes_since_shell_probe": writes_since_shell_probe,
+                    "writes_since_shell_probe_paths": writes_since_shell_probe_paths,
+                    "total_write_operations": total_write_operations,
+                    "required_action": "shell_validation_probe",
+                }),
+            )?;
             bail!("write budget exhausted: run a shell validation probe before editing again");
         }
         if !source_paths.is_empty() && !policy.emitted_first_source_mutation {
@@ -527,10 +544,12 @@ impl ToolScope {
         let failure_details = failure_details(&stderr.content, &stdout.content);
         let success = output.status.success();
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
+        let pending_paths_before_probe = policy.writes_since_shell_probe_paths.clone();
         let had_pending_source_writes = policy
             .writes_since_shell_probe_paths
             .keys()
             .any(|path| path_requires_validation_after_write(path));
+        let cleared_pending_source_writes = had_pending_source_writes;
         let first_validation_probe = !policy.emitted_first_validation_probe;
         if first_validation_probe {
             policy.emitted_first_validation_probe = true;
@@ -575,6 +594,20 @@ impl ToolScope {
                 }),
             )?;
         }
+        self.trace.event(
+            "agent.validation_probe.observed",
+            json!({
+                "command": command,
+                "command_family": &command_family,
+                "status": output.status.code(),
+                "success": success,
+                "had_pending_source_writes": had_pending_source_writes,
+                "cleared_pending_source_writes": cleared_pending_source_writes,
+                "pending_paths_before_probe": pending_paths_before_probe,
+                "total_shell_probes": total_shell_probes,
+                "total_write_operations": total_write_operations,
+            }),
+        )?;
         if first_post_validation_repair_action {
             self.trace.event(
                 "agent.stage.first_post_validation_repair_action",
@@ -3424,6 +3457,29 @@ mod tests {
     }
 
     #[test]
+    fn traces_write_budget_exhaustion() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let source_path = scope.root.join("src/main.rs");
+        for _ in 0..MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
+            scope
+                .note_write_intent(std::slice::from_ref(&source_path))
+                .unwrap();
+        }
+
+        let error = scope
+            .note_write_intent(std::slice::from_ref(&source_path))
+            .unwrap_err()
+            .to_string();
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+
+        assert!(error.contains("write budget exhausted"));
+        assert!(trace.contains("\"kind\":\"agent.write_budget.exhausted\""));
+        assert!(trace.contains("\"required_action\":\"shell_validation_probe\""));
+        assert!(trace.contains("\"attempted_source_paths\":[\"src/main.rs\"]"));
+    }
+
+    #[test]
     fn tracks_writes_since_last_shell_probe() {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
@@ -3547,6 +3603,33 @@ test result: FAILED. 20 passed; 1 failed; finished in 0.00s
         assert_eq!(repair.command_family, "cargo test");
         assert_eq!(repair.repeated_command_family_count, 1);
         assert!(!repair.failure_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn traces_validation_probe_observation() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        scope
+            .note_write_intent(std::slice::from_ref(&scope.root.join("src/lib.rs")))
+            .unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+        tool.shell(&HashMap::from([(
+            "command".to_string(),
+            json!("cargo check --manifest-path missing/Cargo.toml"),
+        )]))
+        .await
+        .unwrap();
+
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+
+        assert!(trace.contains("\"kind\":\"agent.validation_probe.observed\""));
+        assert!(trace.contains("\"command_family\":\"cargo check\""));
+        assert!(trace.contains("\"success\":false"));
+        assert!(trace.contains("\"had_pending_source_writes\":true"));
+        assert!(trace.contains("\"cleared_pending_source_writes\":true"));
+        assert!(trace.contains("\"src/lib.rs\":1"));
     }
 
     #[tokio::test]
