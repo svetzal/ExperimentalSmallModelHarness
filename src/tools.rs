@@ -2369,7 +2369,9 @@ fn is_known_shell_mutation_command(command: &str) -> bool {
     let lowered = normalized.to_ascii_lowercase();
     if lowered.contains("sed -i")
         || lowered.contains("perl -i")
+        || has_in_place_flag(&lowered, "perl")
         || lowered.contains("ruby -i")
+        || has_in_place_flag(&lowered, "ruby")
         || lowered.contains("python -i")
     {
         return true;
@@ -2387,8 +2389,58 @@ fn is_known_shell_mutation_command(command: &str) -> bool {
     redirection_mutation || file_write_call
 }
 
+fn has_in_place_flag(command: &str, program: &str) -> bool {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    tokens.windows(2).any(|window| {
+        window[0] == program
+            && window[1].starts_with('-')
+            && window[1].chars().skip(1).any(|flag| flag == 'i')
+    })
+}
+
+fn command_detection_text(command: &str) -> String {
+    let mut detected = Vec::new();
+    let mut heredoc_end = None;
+
+    for line in command.lines() {
+        let trimmed = line.trim();
+        if let Some(end) = &heredoc_end {
+            if trimmed == end {
+                heredoc_end = None;
+            }
+            continue;
+        }
+
+        if let Some((prefix, marker)) = split_heredoc_start(line) {
+            if !prefix.trim().is_empty() {
+                detected.push(prefix.trim().to_string());
+            }
+            heredoc_end = Some(marker);
+            continue;
+        }
+
+        detected.push(trimmed.to_string());
+    }
+
+    detected.join("\n")
+}
+
+fn split_heredoc_start(line: &str) -> Option<(&str, String)> {
+    let (prefix, suffix) = line.split_once("<<")?;
+    let marker = suffix
+        .trim_start_matches('-')
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch| ch == '\'' || ch == '"')
+        .to_string();
+    if marker.is_empty() {
+        return None;
+    }
+    Some((prefix, marker))
+}
+
 fn is_validation_probe(command: &str) -> bool {
-    let lowered = command.to_ascii_lowercase();
+    let lowered = command_detection_text(command).to_ascii_lowercase();
     let trimmed = lowered.trim();
     if trimmed.starts_with("echo ")
         || trimmed == "pwd"
@@ -2434,7 +2486,7 @@ fn is_validation_probe(command: &str) -> bool {
 }
 
 fn command_family(command: &str) -> String {
-    let lowered = command.to_ascii_lowercase();
+    let lowered = command_detection_text(command).to_ascii_lowercase();
     let trimmed = lowered.trim();
     for family in [
         "cargo fmt",
@@ -3534,6 +3586,9 @@ mod tests {
         assert!(is_validation_probe("pytest tests"));
         assert!(!is_validation_probe("echo \"test\""));
         assert!(!is_validation_probe("pwd && ls -la"));
+        assert!(!is_validation_probe(
+            "tee README.md << 'EOF'\n```sh\ncargo test\n```\nEOF"
+        ));
     }
 
     #[test]
@@ -3543,6 +3598,10 @@ mod tests {
             "cargo clippy"
         );
         assert_eq!(command_family("python -m pytest tests"), "python -m pytest");
+        assert_eq!(
+            command_family("tee README.md << 'EOF'\ncargo test\nEOF"),
+            "tee"
+        );
         assert_eq!(
             failure_summary("", " \nerror[E0425]: cannot find value `x`\nnext"),
             "error[E0425]: cannot find value `x`"
@@ -3749,6 +3808,36 @@ test result: FAILED. 20 passed; 1 failed; finished in 0.00s
 
         assert!(error.to_string().contains("appears to mutate files"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+        assert_eq!(scope.policy_snapshot().total_write_operations, 1);
+    }
+
+    #[tokio::test]
+    async fn perl_in_place_shell_command_is_rejected_while_validation_is_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        let file = temp.path().join("src/lib.rs");
+        std::fs::write(&file, "pub fn value() -> i32 { 1 }\n").unwrap();
+        scope
+            .note_write_intent(std::slice::from_ref(&scope.root.join("src/lib.rs")))
+            .unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+
+        let error = tool
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("perl -pi -e 's/1/2/' src/lib.rs"),
+            )]))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("appears to mutate files"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "pub fn value() -> i32 { 1 }\n"
+        );
         assert_eq!(scope.policy_snapshot().total_write_operations, 1);
     }
 
