@@ -25,6 +25,7 @@ const MAX_SHELL_TIMEOUT_SECS: u64 = 1800;
 const PATCH_TIMEOUT_SECS: u64 = 300;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const MAX_SHELL_MUTATION_HASH_BYTES: u64 = 2_000_000;
+const FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct ToolScope {
@@ -43,6 +44,7 @@ struct ToolPolicyState {
     total_write_operations: usize,
     total_shell_probes: usize,
     validation_repair: Option<ValidationRepairState>,
+    validation_repair_write_allowance: usize,
     validation_repair_read_paths: BTreeMap<String, usize>,
     repeated_command_failures: HashMap<String, usize>,
     repeated_failure_summaries: HashMap<String, usize>,
@@ -372,26 +374,41 @@ impl ToolScope {
         let mut first_source_mutation = false;
         let mut first_post_validation_repair_action = false;
         let mut active_repair = None;
+        let mut repair_allowance_used = None;
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         if policy.consecutive_writes_without_shell >= MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
-            let consecutive_writes_without_shell = policy.consecutive_writes_without_shell;
-            let writes_since_shell_probe = policy.writes_since_shell_probe;
-            let writes_since_shell_probe_paths = policy.writes_since_shell_probe_paths.clone();
-            let total_write_operations = policy.total_write_operations;
-            drop(policy);
-            self.trace.event(
-                "agent.write_budget.exhausted",
-                json!({
-                    "attempted_paths": relative_paths,
-                    "attempted_source_paths": source_paths,
-                    "consecutive_writes_without_shell": consecutive_writes_without_shell,
-                    "writes_since_shell_probe": writes_since_shell_probe,
-                    "writes_since_shell_probe_paths": writes_since_shell_probe_paths,
-                    "total_write_operations": total_write_operations,
-                    "required_action": "shell_validation_probe",
-                }),
-            )?;
-            bail!("write budget exhausted: run a shell validation probe before editing again");
+            let use_repair_allowance = !source_paths.is_empty()
+                && policy.validation_repair.is_some()
+                && policy.validation_repair_write_allowance > 0;
+            if use_repair_allowance {
+                policy.validation_repair_write_allowance -= 1;
+                repair_allowance_used = Some((
+                    policy.validation_repair_write_allowance,
+                    policy
+                        .validation_repair
+                        .as_ref()
+                        .map(ValidationRepairSnapshot::from),
+                ));
+            } else {
+                let consecutive_writes_without_shell = policy.consecutive_writes_without_shell;
+                let writes_since_shell_probe = policy.writes_since_shell_probe;
+                let writes_since_shell_probe_paths = policy.writes_since_shell_probe_paths.clone();
+                let total_write_operations = policy.total_write_operations;
+                drop(policy);
+                self.trace.event(
+                    "agent.write_budget.exhausted",
+                    json!({
+                        "attempted_paths": relative_paths,
+                        "attempted_source_paths": source_paths,
+                        "consecutive_writes_without_shell": consecutive_writes_without_shell,
+                        "writes_since_shell_probe": writes_since_shell_probe,
+                        "writes_since_shell_probe_paths": writes_since_shell_probe_paths,
+                        "total_write_operations": total_write_operations,
+                        "required_action": "shell_validation_probe",
+                    }),
+                )?;
+                bail!("write budget exhausted: run a shell validation probe before editing again");
+            }
         }
         if !source_paths.is_empty() && !policy.emitted_first_source_mutation {
             policy.emitted_first_source_mutation = true;
@@ -419,6 +436,17 @@ impl ToolScope {
         policy.total_write_operations += 1;
         let total_write_operations = policy.total_write_operations;
         drop(policy);
+        if let Some((remaining, active_repair)) = repair_allowance_used {
+            self.trace.event(
+                "agent.validation.repair_write_allowance.used",
+                json!({
+                    "paths": source_paths,
+                    "remaining": remaining,
+                    "total_write_operations": total_write_operations,
+                    "active_repair": active_repair,
+                }),
+            )?;
+        }
         if first_source_mutation {
             self.trace.event(
                 "agent.stage.first_source_mutation",
@@ -569,6 +597,7 @@ impl ToolScope {
             policy.consecutive_writes_without_shell = 0;
             policy.writes_since_shell_probe = 0;
             policy.writes_since_shell_probe_paths.clear();
+            policy.validation_repair_write_allowance = 0;
         }
         policy.total_shell_probes += 1;
         let total_shell_probes = policy.total_shell_probes;
@@ -629,6 +658,7 @@ impl ToolScope {
 
         if success {
             let previous = policy.validation_repair.take();
+            policy.validation_repair_write_allowance = 0;
             policy.validation_repair_read_paths.clear();
             drop(policy);
             if previous.is_some() {
@@ -670,10 +700,26 @@ impl ToolScope {
         };
         let snapshot = ValidationRepairSnapshot::from(&repair);
         policy.validation_repair = Some(repair);
+        let granted_repair_write_allowance = had_pending_source_writes;
+        if granted_repair_write_allowance {
+            policy.validation_repair_write_allowance = FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE;
+        }
         policy.validation_repair_read_paths.clear();
         drop(policy);
         self.trace
             .event("agent.validation.repair_required", &snapshot)?;
+        if granted_repair_write_allowance {
+            self.trace.event(
+                "agent.validation.repair_write_allowance.granted",
+                json!({
+                    "command": command,
+                    "command_family": snapshot.command_family,
+                    "status": snapshot.status,
+                    "allowance": FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE,
+                    "pending_paths_before_probe": pending_paths_before_probe,
+                }),
+            )?;
+        }
         Ok(Some(snapshot))
     }
 
@@ -3665,6 +3711,50 @@ test result: FAILED. 20 passed; 1 failed; finished in 0.00s
         assert_eq!(repair.command_family, "cargo test");
         assert_eq!(repair.repeated_command_family_count, 1);
         assert!(!repair.failure_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_pending_validation_grants_one_repair_write_without_clearing() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let source_path = scope.root.join("src/lib.rs");
+        for _ in 0..MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
+            scope
+                .note_write_intent(std::slice::from_ref(&source_path))
+                .unwrap();
+        }
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+
+        let result = tool
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("cargo check --manifest-path missing/Cargo.toml"),
+            )]))
+            .await
+            .unwrap();
+
+        assert_eq!(result["validation_probe"], true);
+        assert_eq!(result["success"], false);
+        assert_eq!(
+            result["validation_probe_clears_pending_source_writes"],
+            false
+        );
+        assert!(scope.policy_snapshot().validation_required_after_write);
+        scope
+            .note_write_intent(std::slice::from_ref(&source_path))
+            .unwrap();
+        let error = scope
+            .note_write_intent(std::slice::from_ref(&source_path))
+            .unwrap_err()
+            .to_string();
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+
+        assert!(error.contains("write budget exhausted"));
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_write_allowance.granted\""));
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_write_allowance.used\""));
+        assert!(scope.policy_snapshot().validation_required_after_write);
     }
 
     #[tokio::test]
