@@ -30,6 +30,8 @@ const MAX_SHELL_TIMEOUT_SECS: u64 = 1800;
 const PATCH_TIMEOUT_SECS: u64 = 300;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const MAX_SHELL_MUTATION_HASH_BYTES: u64 = 2_000_000;
+const MISMATCH_CONTEXT_BEFORE_BYTES: usize = 16;
+const MISMATCH_CONTEXT_AFTER_BYTES: usize = 32;
 #[cfg(test)]
 const MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL: usize =
     crate::runtime::MAX_CONSECUTIVE_WRITES_WITHOUT_PROBE;
@@ -825,31 +827,28 @@ impl ToolScope {
             bail!("probe {probe_id:?} is not executable through the assertion effect");
         };
         let unresolved = self.resolve_existing_or_new(&path)?;
-        let result = async {
-            let canonical = unresolved
-                .canonicalize()
-                .with_context(|| format!("resolving asserted file {path:?}"))?;
-            if !canonical.starts_with(&*self.root) {
-                bail!("asserted file escapes the tool scope through a symlink");
+        let result =
+            async {
+                let canonical = unresolved
+                    .canonicalize()
+                    .with_context(|| format!("resolving asserted file {path:?}"))?;
+                if !canonical.starts_with(&*self.root) {
+                    bail!("asserted file escapes the tool scope through a symlink");
+                }
+                self.check_read(&canonical)?;
+                let bytes = tokio::fs::read(&canonical)
+                    .await
+                    .with_context(|| format!("reading asserted file {path:?}"))?;
+                let actual = String::from_utf8(bytes)
+                    .with_context(|| format!("asserted file {path:?} is not valid UTF-8"))?;
+                Ok::<Option<String>, anyhow::Error>((actual != expected).then(|| {
+                    exact_text_mismatch_detail(&path, expected.as_bytes(), actual.as_bytes())
+                }))
             }
-            self.check_read(&canonical)?;
-            let bytes = tokio::fs::read(&canonical)
-                .await
-                .with_context(|| format!("reading asserted file {path:?}"))?;
-            let actual = String::from_utf8(bytes)
-                .with_context(|| format!("asserted file {path:?} is not valid UTF-8"))?;
-            Ok::<bool, anyhow::Error>(actual == expected)
-        }
-        .await;
+            .await;
         let (success, failure_details) = match result {
-            Ok(true) => (true, Vec::new()),
-            Ok(false) => (
-                false,
-                vec![format!(
-                    "exact UTF-8 content mismatch for {path:?}: expected {} bytes",
-                    expected.len()
-                )],
-            ),
+            Ok(None) => (true, Vec::new()),
+            Ok(Some(detail)) => (false, vec![detail]),
             Err(error) => (false, vec![error.to_string()]),
         };
         self.note_assertion_result(probe_id, &path, success, &failure_details)?;
@@ -1009,6 +1008,42 @@ impl ToolScope {
             })
             .collect())
     }
+}
+
+fn exact_text_mismatch_detail(path: &str, expected: &[u8], actual: &[u8]) -> String {
+    let first_difference = expected
+        .iter()
+        .zip(actual)
+        .position(|(expected, actual)| expected != actual)
+        .unwrap_or_else(|| expected.len().min(actual.len()));
+    let expected_excerpt = bounded_escaped_byte_excerpt(expected, first_difference);
+    let actual_excerpt = bounded_escaped_byte_excerpt(actual, first_difference);
+    format!(
+        "exact UTF-8 content mismatch for {path:?}: expected {} bytes, actual {} bytes; \
+first differing byte {first_difference}; expected {expected_excerpt}; actual {actual_excerpt}",
+        expected.len(),
+        actual.len()
+    )
+}
+
+fn bounded_escaped_byte_excerpt(bytes: &[u8], first_difference: usize) -> String {
+    let start = first_difference.saturating_sub(MISMATCH_CONTEXT_BEFORE_BYTES);
+    let end = bytes
+        .len()
+        .min(first_difference.saturating_add(MISMATCH_CONTEXT_AFTER_BYTES));
+    let escaped = bytes[start..end]
+        .iter()
+        .map(|byte| match byte {
+            b'\n' => "\\n".to_string(),
+            b'\r' => "\\r".to_string(),
+            b'\t' => "\\t".to_string(),
+            b'\\' => "\\\\".to_string(),
+            b'\"' => "\\\"".to_string(),
+            0x20..=0x7e => char::from(*byte).to_string(),
+            _ => format!("\\x{byte:02x}"),
+        })
+        .collect::<String>();
+    format!("bytes[{start}..{end}] \"{escaped}\"")
 }
 
 pub fn coding_tools(scope: &ToolScope) -> Vec<Box<dyn LlmTool>> {
@@ -2746,6 +2781,12 @@ mod tests {
             .unwrap();
         let failed = scope.execute_probe("brief-exact").await.unwrap();
         assert_eq!(failed["success"], false);
+        assert_eq!(
+            failed["failure_details"][0],
+            "exact UTF-8 content mismatch for \"brief.md\": expected 9 bytes, actual 6 \
+bytes; first differing byte 0; expected bytes[0..9] \"expected\\n\"; actual \
+bytes[0..6] \"wrong\\n\""
+        );
         assert!(!scope.runtime_state_snapshot().terminal_readiness);
 
         std::fs::write(temp.path().join("brief.md"), "expected\n").unwrap();
@@ -2771,6 +2812,34 @@ mod tests {
         assert!(trace.contains(r#""probe_id":"brief-exact""#));
         assert!(trace.contains(r#""assertion_kind":"file_text_equals""#));
         assert!(trace.contains(r#""path":"brief.md""#));
+    }
+
+    #[test]
+    fn exact_mismatch_detail_is_bounded_and_reports_length_only_suffixes() {
+        let shared = "a".repeat(80);
+        let expected = format!("{shared}EXPECTED-SECRET-SUFFIX-{}", "x".repeat(80));
+        let actual = format!("{shared}actual-short");
+
+        let detail = exact_text_mismatch_detail("out.txt", expected.as_bytes(), actual.as_bytes());
+
+        assert!(detail.contains("expected 183 bytes, actual 92 bytes"));
+        assert!(detail.contains("first differing byte 80"));
+        assert!(detail.contains("expected bytes[64..112]"));
+        assert!(detail.contains("actual bytes[64..92]"));
+        assert!(!detail.contains("SECRET-SUFFIX-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+        assert!(!detail.contains(&expected));
+    }
+
+    #[test]
+    fn exact_mismatch_detail_escapes_non_ascii_bytes_deterministically() {
+        let detail =
+            exact_text_mismatch_detail("out.txt", "café\n".as_bytes(), "cafe\n".as_bytes());
+        assert_eq!(
+            detail,
+            "exact UTF-8 content mismatch for \"out.txt\": expected 6 bytes, actual 5 bytes; \
+first differing byte 3; expected bytes[0..6] \"caf\\xc3\\xa9\\n\"; actual \
+bytes[0..5] \"cafe\\n\""
+        );
     }
 
     #[test]
