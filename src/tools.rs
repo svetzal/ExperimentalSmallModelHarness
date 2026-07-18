@@ -368,7 +368,7 @@ impl ToolScope {
             .collect::<Vec<_>>();
         let source_paths = relative_paths
             .iter()
-            .filter(|path| path_requires_validation_after_write(path))
+            .filter(|path| crate::profile::coding::path_requires_validation_after_write(path))
             .cloned()
             .collect::<Vec<_>>();
         let mut first_source_mutation = false;
@@ -477,7 +477,7 @@ impl ToolScope {
         }
         let source_paths = paths
             .iter()
-            .filter(|path| path_requires_validation_after_write(path))
+            .filter(|path| crate::profile::coding::path_requires_validation_after_write(path))
             .cloned()
             .collect::<Vec<_>>();
         let mut first_source_mutation = false;
@@ -567,16 +567,17 @@ impl ToolScope {
         stdout: &CapturedOutput,
         stderr: &CapturedOutput,
     ) -> Result<Option<ValidationRepairSnapshot>> {
-        let command_family = command_family(command);
+        let command_family = crate::profile::coding::command_family(command);
         let failure_text = failure_summary(&stderr.content, &stdout.content);
-        let failure_details = failure_details(&stderr.content, &stdout.content);
+        let failure_details =
+            crate::profile::coding::failure_details(&stderr.content, &stdout.content);
         let success = output.status.success();
         let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
         let pending_paths_before_probe = policy.writes_since_shell_probe_paths.clone();
         let had_pending_source_writes = policy
             .writes_since_shell_probe_paths
             .keys()
-            .any(|path| path_requires_validation_after_write(path));
+            .any(|path| crate::profile::coding::path_requires_validation_after_write(path));
         let cleared_pending_source_writes = had_pending_source_writes && success;
         let first_validation_probe = !policy.emitted_first_validation_probe;
         if first_validation_probe {
@@ -768,7 +769,7 @@ impl ToolScope {
             validation_required_after_write: policy
                 .writes_since_shell_probe_paths
                 .keys()
-                .any(|path| path_requires_validation_after_write(path)),
+                .any(|path| crate::profile::coding::path_requires_validation_after_write(path)),
             total_write_operations: policy.total_write_operations,
             total_shell_probes: policy.total_shell_probes,
             validation_repair: policy
@@ -1141,38 +1142,6 @@ fn collect_tree(
     Ok(())
 }
 
-fn path_requires_validation_after_write(path: &str) -> bool {
-    let path = Path::new(path);
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(
-        file_name.as_str(),
-        ".gitignore"
-            | ".ignore"
-            | "readme"
-            | "license"
-            | "licence"
-            | "changelog"
-            | "contributors"
-            | "authors"
-    ) {
-        return false;
-    }
-    if matches!(
-        path.extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("md" | "markdown" | "txt" | "rst" | "adoc")
-    ) {
-        return false;
-    }
-    true
-}
-
 fn load_gitignore(root: &Path) -> Result<Gitignore> {
     let mut builder = GitignoreBuilder::new(root);
     let gitignore_path = root.join(".gitignore");
@@ -1216,7 +1185,7 @@ fn collect_shell_mutation_snapshot(
             collect_shell_mutation_snapshot(scope, &path, gitignore, snapshot)?;
         } else if metadata.is_file() {
             let relative = scope.relative_display(&path);
-            if path_requires_validation_after_write(&relative) {
+            if crate::profile::coding::path_requires_validation_after_write(&relative) {
                 snapshot.insert(relative, file_fingerprint(&path, &metadata)?);
             }
         }
@@ -1229,22 +1198,7 @@ fn is_shell_mutation_snapshot_excluded(relative: &Path) -> bool {
         let Component::Normal(name) = component else {
             return false;
         };
-        matches!(
-            name.to_string_lossy().as_ref(),
-            ".git"
-                | ".hg"
-                | ".jj"
-                | ".svn"
-                | ".venv"
-                | "venv"
-                | "target"
-                | "node_modules"
-                | ".next"
-                | ".pytest_cache"
-                | ".mypy_cache"
-                | "coverage"
-                | "dist"
-        )
+        crate::profile::coding::is_ignored_dir(&name.to_string_lossy())
     })
 }
 
@@ -1896,17 +1850,17 @@ impl ShellCommandTool {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
-        let validation_probe = is_validation_probe(command);
+        let validation_probe = crate::profile::coding::is_validation_probe(command);
         let policy_before_command = self.scope.policy_snapshot();
         if policy_before_command.validation_required_after_write
             && !validation_probe
-            && is_known_shell_mutation_command(command)
+            && crate::profile::coding::is_known_shell_mutation_command(command)
         {
             bail!(
                 "shell command appears to mutate files while validation is required after source edits; run a validation probe before further cleanup, then use edit_file for any remaining source edits"
             );
         }
-        let command_family = command_family(command);
+        let command_family = crate::profile::coding::command_family(command);
         let before_mutation_snapshot = match self.scope.shell_mutation_snapshot() {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
@@ -2273,12 +2227,12 @@ fn select_lines(content: &str, line_start: Option<u64>, line_end: Option<u64>) -
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct LimitedText {
-    content: String,
-    truncated: bool,
+pub(crate) struct LimitedText {
+    pub(crate) content: String,
+    pub(crate) truncated: bool,
 }
 
-fn limit_text(content: &str, max_bytes: usize) -> LimitedText {
+pub(crate) fn limit_text(content: &str, max_bytes: usize) -> LimitedText {
     if content.len() <= max_bytes {
         return LimitedText {
             content: content.to_string(),
@@ -2410,168 +2364,6 @@ fn validate_shell_command(command: &str, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_known_shell_mutation_command(command: &str) -> bool {
-    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lowered = normalized.to_ascii_lowercase();
-    if lowered.contains("sed -i")
-        || lowered.contains("perl -i")
-        || has_in_place_flag(&lowered, "perl")
-        || lowered.contains("ruby -i")
-        || has_in_place_flag(&lowered, "ruby")
-        || lowered.contains("python -i")
-    {
-        return true;
-    }
-
-    let redirection_mutation = [" > ", " 1> ", " >> ", " 1>> "]
-        .iter()
-        .any(|needle| lowered.contains(needle));
-    let file_write_call = (lowered.contains("python ") || lowered.contains("python3 "))
-        && (lowered.contains(".write(")
-            || lowered.contains("write_text(")
-            || lowered.contains("open(")
-                && (lowered.contains(", 'w'") || lowered.contains(", \"w\"")));
-
-    redirection_mutation || file_write_call
-}
-
-fn has_in_place_flag(command: &str, program: &str) -> bool {
-    let tokens = command.split_whitespace().collect::<Vec<_>>();
-    tokens.windows(2).any(|window| {
-        window[0] == program
-            && window[1].starts_with('-')
-            && window[1].chars().skip(1).any(|flag| flag == 'i')
-    })
-}
-
-fn command_detection_text(command: &str) -> String {
-    let mut detected = Vec::new();
-    let mut heredoc_end = None;
-
-    for line in command.lines() {
-        let trimmed = line.trim();
-        if let Some(end) = &heredoc_end {
-            if trimmed == end {
-                heredoc_end = None;
-            }
-            continue;
-        }
-
-        if let Some((prefix, marker)) = split_heredoc_start(line) {
-            if !prefix.trim().is_empty() {
-                detected.push(prefix.trim().to_string());
-            }
-            heredoc_end = Some(marker);
-            continue;
-        }
-
-        detected.push(trimmed.to_string());
-    }
-
-    detected.join("\n")
-}
-
-fn split_heredoc_start(line: &str) -> Option<(&str, String)> {
-    let (prefix, suffix) = line.split_once("<<")?;
-    let marker = suffix
-        .trim_start_matches('-')
-        .split_whitespace()
-        .next()?
-        .trim_matches(|ch| ch == '\'' || ch == '"')
-        .to_string();
-    if marker.is_empty() {
-        return None;
-    }
-    Some((prefix, marker))
-}
-
-/// Whether the executor recognizes `command` as a validation probe. Exposed
-/// `pub(crate)` so `contract`'s explicit-contract validator can cross-check
-/// declared probe commands without duplicating this list (see
-/// `GENERALIZATION_PLAN.md` Slice 2).
-pub(crate) fn is_validation_probe(command: &str) -> bool {
-    let lowered = command_detection_text(command).to_ascii_lowercase();
-    let trimmed = lowered.trim();
-    if trimmed.starts_with("echo ")
-        || trimmed == "pwd"
-        || trimmed.starts_with("pwd ")
-        || trimmed.starts_with("ls ")
-        || trimmed == "ls"
-        || trimmed.starts_with("cat ")
-        || trimmed.starts_with("sed ")
-        || trimmed.starts_with("rg ")
-        || trimmed.starts_with("grep ")
-        || trimmed.starts_with("find ")
-        || trimmed.starts_with("head ")
-        || trimmed.starts_with("tail ")
-    {
-        return false;
-    }
-
-    [
-        "cargo build",
-        "cargo check",
-        "cargo test",
-        "cargo run",
-        "cargo clippy",
-        "cargo fmt",
-        "npm test",
-        "npm run",
-        "pnpm test",
-        "pnpm run",
-        "yarn test",
-        "yarn run",
-        "pytest",
-        "python -m pytest",
-        "go test",
-        "make test",
-        "make check",
-        "make build",
-        "mvn test",
-        "gradle test",
-        "./gradlew test",
-    ]
-    .iter()
-    .any(|needle| trimmed.contains(needle))
-}
-
-fn command_family(command: &str) -> String {
-    let lowered = command_detection_text(command).to_ascii_lowercase();
-    let trimmed = lowered.trim();
-    for family in [
-        "cargo fmt",
-        "cargo clippy",
-        "cargo test",
-        "cargo build",
-        "cargo check",
-        "cargo run",
-        "npm test",
-        "npm run",
-        "pnpm test",
-        "pnpm run",
-        "yarn test",
-        "yarn run",
-        "python -m pytest",
-        "pytest",
-        "go test",
-        "make test",
-        "make check",
-        "make build",
-        "mvn test",
-        "gradle test",
-        "./gradlew test",
-    ] {
-        if trimmed.contains(family) {
-            return family.to_string();
-        }
-    }
-    trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
-}
-
 fn failure_summary(stderr: &str, stdout: &str) -> String {
     let source = if stderr.trim().is_empty() {
         stdout
@@ -2584,62 +2376,6 @@ fn failure_summary(stderr: &str, stdout: &str) -> String {
         .find(|line| !line.is_empty())
         .map(|line| limit_text(line, 240).content)
         .unwrap_or_else(|| "validation command failed without output".to_string())
-}
-
-fn failure_details(stderr: &str, stdout: &str) -> Vec<String> {
-    let combined = [stdout, stderr]
-        .into_iter()
-        .filter(|source| !source.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let lines = combined.lines().map(str::trim).collect::<Vec<_>>();
-    let mut details = Vec::new();
-
-    for line in &lines {
-        if line.starts_with("---- ") && line.ends_with(" stdout ----") {
-            push_unique_detail(
-                &mut details,
-                line.trim_start_matches("---- ")
-                    .trim_end_matches(" stdout ----")
-                    .trim(),
-            );
-            continue;
-        }
-        if line.starts_with("thread '") && line.contains(" panicked at ") {
-            push_unique_detail(&mut details, line);
-            continue;
-        }
-        if line.starts_with("error[") || line.starts_with("error:") || line.starts_with("FAILED") {
-            push_unique_detail(&mut details, line);
-        }
-    }
-
-    if let Some(failures_index) = lines.iter().position(|line| *line == "failures:") {
-        for line in lines.iter().skip(failures_index + 1) {
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with("test result:") {
-                break;
-            }
-            if !line.contains(':') && !line.starts_with('-') {
-                push_unique_detail(&mut details, line);
-            }
-        }
-    }
-
-    details
-        .into_iter()
-        .take(8)
-        .map(|detail| limit_text(&detail, 240).content)
-        .collect()
-}
-
-fn push_unique_detail(details: &mut Vec<String>, detail: &str) {
-    let trimmed = detail.trim();
-    if !trimmed.is_empty() && !details.iter().any(|existing| existing == trimmed) {
-        details.push(trimmed.to_string());
-    }
 }
 
 fn fallback_text(fallbacks: &[PatchFallbackSnapshot]) -> String {
@@ -3629,63 +3365,16 @@ mod tests {
         assert!(!snapshot.validation_required_after_write);
     }
 
-    #[test]
-    fn classifies_validation_probe_commands() {
-        assert!(is_validation_probe("cargo check 2>&1 | tail -30"));
-        assert!(is_validation_probe("cargo run -- --simulate 600"));
-        assert!(is_validation_probe("pytest tests"));
-        assert!(!is_validation_probe("echo \"test\""));
-        assert!(!is_validation_probe("pwd && ls -la"));
-        assert!(!is_validation_probe(
-            "tee README.md << 'EOF'\n```sh\ncargo test\n```\nEOF"
-        ));
-    }
+    // `is_validation_probe`/`command_family`/`failure_details` moved to
+    // `crate::profile::coding` in Slice 3, along with their unit tests
+    // (`recognizes_cargo_and_pytest_probes`, `normalizes_command_families`,
+    // `extracts_targeted_cargo_test_failure_details`).
 
     #[test]
-    fn summarizes_validation_command_families_and_failures() {
-        assert_eq!(
-            command_family("cargo clippy --all-targets -- -D warnings"),
-            "cargo clippy"
-        );
-        assert_eq!(command_family("python -m pytest tests"), "python -m pytest");
-        assert_eq!(
-            command_family("tee README.md << 'EOF'\ncargo test\nEOF"),
-            "tee"
-        );
+    fn summarizes_generic_failure_text() {
         assert_eq!(
             failure_summary("", " \nerror[E0425]: cannot find value `x`\nnext"),
             "error[E0425]: cannot find value `x`"
-        );
-    }
-
-    #[test]
-    fn extracts_targeted_cargo_test_failure_details() {
-        let stdout = r#"
-running 21 tests
-test tests::test_invader_shot_removed_when_leaving_bottom_edge ... FAILED
-
-failures:
-
----- tests::test_invader_shot_removed_when_leaving_bottom_edge stdout ----
-
-thread 'tests::test_invader_shot_removed_when_leaving_bottom_edge' (31479173) panicked at src/lib.rs:739:9:
-Invader shot should be removed when leaving bottom edge
-
-failures:
-    tests::test_invader_shot_removed_when_leaving_bottom_edge
-
-test result: FAILED. 20 passed; 1 failed; finished in 0.00s
-"#;
-
-        let details = failure_details("", stdout);
-
-        assert!(details
-            .iter()
-            .any(|detail| detail == "tests::test_invader_shot_removed_when_leaving_bottom_edge"));
-        assert!(
-            details
-                .iter()
-                .any(|detail| detail.contains("src/lib.rs:739:9"))
         );
     }
 

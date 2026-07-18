@@ -1,0 +1,1 @@
+You modified files after the most recent shell probe and did not provide final text. Do not edit again yet. Run the validation ladder now: cargo fmt --check, then cargo clippy, then focused tests, then broad tests. Use timeout_secs 1800 for cargo build or cargo test. Reply DONE only if validation passes.

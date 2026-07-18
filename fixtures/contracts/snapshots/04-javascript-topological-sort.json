@@ -56,6 +56,10 @@
     "fail_token": "FAIL"
   },
   "adapter_kind": "legacy_coding",
+  "profile": {
+    "id": "coding",
+    "version": "coding_profile.v1"
+  },
   "defaults_provenance": {
     "declared_fields": [
       "guidance",

@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 ///   intent from absent fields.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct HarnessSourceState {
-    /// Absolute path to the harness's own `Cargo.toml` directory at build
+    /// Absolute path to the harness's own crate manifest directory at build
     /// time (`CARGO_MANIFEST_DIR`).
     pub manifest_dir: String,
     /// The harness's own git commit SHA, if determinable.

@@ -1,0 +1,11 @@
+Complete this benchmark task inside the generated project workspace.
+
+SAMPLE_GOAL_PLACEHOLDER
+
+Required harness behavior:
+- You are already operating inside the generated project's workspace directory.
+- Inspect the project root first.
+- Create a project-appropriate .gitignore early unless this task explicitly forbids additional files.
+- Build or update the Rust project at the current tool root, not in a nested workspace/ directory.
+- Run at least one deterministic validation command.
+- Leave generated project files at the tool root and use DONE only after validation.

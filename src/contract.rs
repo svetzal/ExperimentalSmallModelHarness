@@ -10,9 +10,11 @@
 //! rules, terminal-token detection, or artifact-classification semantics.
 //! Two adapters populate a [`ResolvedRunContract`]:
 //!
-//! - The **legacy coding adapter** ([`resolve_legacy_coding_contract`])
-//!   wraps today's shell-fence scraping so existing `task.md` files keep
-//!   working unchanged.
+//! - The **legacy coding adapter**
+//!   ([`crate::profile::coding::resolve_legacy_coding_contract`], moved
+//!   there in Slice 3 — see `GENERALIZATION_PLAN.md`) wraps today's
+//!   shell-fence scraping so existing `task.md` files keep working
+//!   unchanged.
 //! - The **explicit adapter** ([`resolve_explicit_contract`]) parses a
 //!   `SuppliedExplicitContract` JSON document, validates it fully before any
 //!   effect, and resolves it using declared probe IDs/commands instead of
@@ -20,13 +22,17 @@
 //!
 //! Both adapters produce the same [`ResolvedRunContract`] shape, so the
 //! runtime (and `analyze-trace`) can reason about one representation
-//! regardless of which adapter supplied it.
+//! regardless of which adapter supplied it. All domain-specific policy
+//! (worker prompt text, validation-command recognition tables, artifact
+//! classification defaults) lives behind `crate::profile::DomainProfile`;
+//! this module stays generic.
 
-use crate::agent::{normalize_validation_command, validation_command_masks_failure};
-use crate::tools::is_validation_probe;
+use crate::agent::validation_command_masks_failure;
+use crate::profile::ProfileRef;
+use crate::profile::coding::is_validation_probe;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Schema marker embedded in every resolved contract. Bump this (e.g.
@@ -84,47 +90,22 @@ pub struct ArtifactClass {
     pub exempt_extensions: Vec<String>,
 }
 
-/// Descriptive mirror of `tools::path_requires_validation_after_write`'s
-/// exemption lists. This intentionally duplicates that runtime data until
-/// Slice 3 makes the runtime consult the contract directly instead of its
-/// own hardcoded lists — two sources of truth is expected drift for this
-/// slice, not a bug.
+/// A named class of writable artifact and the exemption lists that
+/// determine whether a write to it requires validation. Generic shape only
+/// — the actual coding-profile contents live in
+/// `crate::profile::coding::default_artifact_classes`
+/// (`GENERALIZATION_PLAN.md` Slice 3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutableArtifactClasses {
     pub classes: Vec<ArtifactClass>,
 }
 
-impl Default for MutableArtifactClasses {
-    fn default() -> Self {
-        Self {
-            classes: vec![ArtifactClass {
-                name: "documentation".to_string(),
-                exempt_file_names: vec![
-                    ".gitignore".to_string(),
-                    ".ignore".to_string(),
-                    "readme".to_string(),
-                    "license".to_string(),
-                    "licence".to_string(),
-                    "changelog".to_string(),
-                    "contributors".to_string(),
-                    "authors".to_string(),
-                ],
-                exempt_extensions: vec![
-                    "md".to_string(),
-                    "markdown".to_string(),
-                    "txt".to_string(),
-                    "rst".to_string(),
-                    "adoc".to_string(),
-                ],
-            }],
-        }
-    }
-}
-
-/// Descriptive mirror of the requested-validation ledger's evidence
-/// freshness rules (`note_source_mutation` plus generation-gated
-/// freshness). Does not invent new unhonored policy: this slice does not
-/// make the runtime consult these fields.
+/// The requested-validation ledger's evidence freshness rules
+/// (`note_source_mutation` plus generation-gated freshness). Generic shape
+/// only — the actual coding-profile contents live in
+/// `crate::profile::coding::default_evidence_invalidation`
+/// (`GENERALIZATION_PLAN.md` Slice 3). Does not invent new unhonored
+/// policy: this slice does not make the runtime consult these fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceInvalidation {
     pub invalidated_by_source_mutation: bool,
@@ -133,16 +114,6 @@ pub struct EvidenceInvalidation {
     /// invalidates prior validation evidence. Every name here must exist in
     /// the sibling `mutable_artifact_classes`.
     pub tracked_artifact_classes: Vec<String>,
-}
-
-impl Default for EvidenceInvalidation {
-    fn default() -> Self {
-        Self {
-            invalidated_by_source_mutation: true,
-            generation_gated_freshness: true,
-            tracked_artifact_classes: vec!["documentation".to_string()],
-        }
-    }
 }
 
 /// Subset of `AgentRunConfig` fields the runtime already uses, carried as
@@ -213,6 +184,13 @@ pub struct ResolvedRunContract {
     pub budgets: Budgets,
     pub terminal: Terminal,
     pub adapter_kind: AdapterKind,
+    /// Which domain profile resolved this contract. Additive Slice-3 schema
+    /// change (`GENERALIZATION_PLAN.md`): `#[serde(default)]` back-fills
+    /// contracts persisted before this field existed as `"coding"` (this
+    /// crate's only profile at the time) via `ProfileRef::default`, so
+    /// `SCHEMA_VERSION` stays `run_contract.v1` rather than bumping to v2.
+    #[serde(default)]
+    pub profile: ProfileRef,
     pub defaults_provenance: DefaultsProvenance,
 }
 
@@ -282,159 +260,12 @@ pub fn supplied_contract_for(source: &ContractSource) -> SuppliedContract {
 pub fn resolve_contract(source: ContractSource, budgets: Budgets) -> Result<ResolvedRunContract> {
     match source {
         ContractSource::Legacy { goal_text, .. } => {
-            Ok(resolve_legacy_coding_contract(&goal_text, budgets))
+            Ok(crate::profile::select_profile().resolve_legacy_contract(&goal_text, budgets))
         }
         ContractSource::Explicit { json_text, .. } => {
             resolve_explicit_contract(&json_text, budgets)
         }
     }
-}
-
-// LEGACY: remove when explicit contracts replace shell-fence scraping for
-// the coding profile (see GENERALIZATION_PLAN.md Slice 3).
-fn resolve_legacy_coding_contract(goal_text: &str, budgets: Budgets) -> ResolvedRunContract {
-    let commands = requested_validation_commands(goal_text);
-    let probes = synthesize_probe_ids(&commands);
-    ResolvedRunContract {
-        schema_version: SCHEMA_VERSION.to_string(),
-        guidance: goal_text.to_string(),
-        read_scope: Scope::Unrestricted,
-        write_scope: Scope::Unrestricted,
-        mutable_artifact_classes: MutableArtifactClasses::default(),
-        evidence_invalidation: EvidenceInvalidation::default(),
-        probes,
-        budgets,
-        terminal: Terminal::default(),
-        adapter_kind: AdapterKind::LegacyCoding,
-        defaults_provenance: DefaultsProvenance {
-            declared_fields: vec!["guidance".to_string(), "probes".to_string()],
-            defaulted_fields: vec![
-                "read_scope".to_string(),
-                "write_scope".to_string(),
-                "mutable_artifact_classes".to_string(),
-                "evidence_invalidation".to_string(),
-                "terminal".to_string(),
-                "budgets".to_string(),
-            ],
-        },
-    }
-}
-
-// LEGACY: remove when explicit contracts replace shell-fence scraping for
-// the coding profile (see GENERALIZATION_PLAN.md Slice 3). Moved verbatim
-// from `agent.rs`; behavior is unchanged.
-fn requested_validation_commands(goal: &str) -> Vec<String> {
-    let mut commands = Vec::new();
-    let mut in_fence = false;
-    let mut shell_fence = false;
-
-    for line in goal.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            if in_fence {
-                in_fence = false;
-                shell_fence = false;
-            } else {
-                in_fence = true;
-                let info = trimmed.trim_start_matches('`').trim().to_ascii_lowercase();
-                shell_fence = matches!(
-                    info.as_str(),
-                    "" | "sh" | "shell" | "bash" | "zsh" | "console" | "text"
-                );
-            }
-            continue;
-        }
-
-        if !in_fence || !shell_fence {
-            continue;
-        }
-        let command = trimmed.trim_start_matches('$').trim();
-        if is_requested_validation_command_line(command) {
-            let normalized = normalize_validation_command(command);
-            if !normalized.is_empty() && !commands.contains(&normalized) {
-                commands.push(normalized);
-            }
-        }
-    }
-
-    commands
-}
-
-// LEGACY: see `requested_validation_commands` above.
-fn is_requested_validation_command_line(command: &str) -> bool {
-    if validation_command_masks_failure(command) {
-        return false;
-    }
-    let normalized = normalize_validation_command(command);
-    [
-        "cargo test",
-        "cargo build",
-        "cargo check",
-        "cargo clippy",
-        "cargo fmt",
-        "cargo run",
-        "./cargo test",
-        "./cargo build",
-        "./cargo check",
-        "./cargo clippy",
-        "./cargo fmt",
-        "./cargo run",
-        "npm test",
-        "npm run test",
-        "pnpm test",
-        "yarn test",
-        "pytest",
-        "python -m pytest",
-        "go test",
-        "mix test",
-    ]
-    .iter()
-    .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
-}
-
-/// Synthesize stable, descriptive probe IDs from ordered probe commands: a
-/// slug of the normalized command, with a `-2`, `-3`, ... ordinal suffix on
-/// collision (first occurrence keeps the bare slug). IDs are descriptive
-/// only — ledger matching always stays on the normalized command string.
-fn synthesize_probe_ids(commands: &[String]) -> Vec<Probe> {
-    let mut seen_counts: HashMap<String, usize> = HashMap::new();
-    commands
-        .iter()
-        .map(|command| {
-            let base = slugify(command);
-            let base = if base.is_empty() {
-                "probe".to_string()
-            } else {
-                base
-            };
-            let count = seen_counts.entry(base.clone()).or_insert(0);
-            *count += 1;
-            let id = if *count == 1 {
-                base
-            } else {
-                format!("{base}-{count}")
-            };
-            Probe {
-                id,
-                command: command.clone(),
-            }
-        })
-        .collect()
-}
-
-fn slugify(input: &str) -> String {
-    let mut slug = String::new();
-    let mut last_dash = false;
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            slug.push('-');
-            last_dash = true;
-        }
-    }
-    slug.trim_matches('-').to_string()
 }
 
 fn resolve_explicit_contract(
@@ -468,7 +299,7 @@ fn resolve_explicit_contract(
         }
         None => {
             defaulted.push("mutable_artifact_classes".to_string());
-            MutableArtifactClasses::default()
+            crate::profile::select_profile().default_artifact_classes()
         }
     };
 
@@ -479,7 +310,7 @@ fn resolve_explicit_contract(
         }
         None => {
             defaulted.push("evidence_invalidation".to_string());
-            EvidenceInvalidation::default()
+            crate::profile::select_profile().default_evidence_invalidation()
         }
     };
     validate_artifact_invalidation_consistency(&mutable_artifact_classes, &evidence_invalidation)?;
@@ -517,6 +348,7 @@ fn resolve_explicit_contract(
         budgets,
         terminal,
         adapter_kind: AdapterKind::Explicit,
+        profile: crate::profile::select_profile().profile_ref(),
         defaults_provenance: DefaultsProvenance {
             declared_fields: declared,
             defaulted_fields: defaulted,
@@ -657,50 +489,10 @@ mod tests {
         )
     }
 
-    // Moved from agent.rs alongside `requested_validation_commands`.
-    #[test]
-    fn requested_validation_parser_collects_ordered_shell_commands() {
-        let task = r#"
-Edit the existing Rust project.
-
-```rust
-fn cargo_test_is_not_a_command() {}
-```
-
-Run:
-
-```sh
-cargo test test_deterministic_simulation_terminates_and_reports_summary
-cargo run -- --simulate 600
-```
-"#;
-
-        assert_eq!(
-            requested_validation_commands(task),
-            vec![
-                "cargo test test_deterministic_simulation_terminates_and_reports_summary",
-                "cargo run -- --simulate 600",
-            ]
-        );
-    }
-
-    #[test]
-    fn requested_validation_parser_ignores_masked_success_commands() {
-        let task = r#"
-Run:
-
-```sh
-cargo build || true
-cargo test
-cargo run -- --version-check ; true
-```
-"#;
-
-        assert_eq!(
-            requested_validation_commands(task),
-            vec!["cargo test".to_string()]
-        );
-    }
+    // The shell-fence scraper itself (`requested_validation_commands`) moved
+    // to `crate::profile::coding` in Slice 3, along with its unit tests; the
+    // tests below stay here because they exercise `resolve_contract`, the
+    // generic entry point.
 
     #[test]
     fn schema_marker_present_and_round_trips() {
@@ -1002,5 +794,35 @@ cargo run -- --version-check ; true
             let snapshot: ResolvedRunContract = serde_json::from_str(&snapshot_text).unwrap();
             assert_eq!(resolved_once, snapshot, "{task_name}: snapshot drifted");
         }
+    }
+
+    #[test]
+    fn resolved_contract_carries_the_coding_profile_ref() {
+        let resolved = legacy("```sh\ncargo test\n```\n");
+        assert_eq!(resolved.profile.id, "coding");
+        assert_eq!(resolved.profile.version, "coding_profile.v1");
+    }
+
+    #[test]
+    fn contract_json_missing_profile_field_back_fills_as_coding() {
+        // Migration/back-compat: a contract persisted before Slice 3 added
+        // `profile` has no such field in its JSON at all. `#[serde(default)]`
+        // must still deserialize it, filling in the coding profile via
+        // `ProfileRef::default`.
+        let resolved = legacy("```sh\ncargo test\n```\n");
+        let mut value = serde_json::to_value(&resolved).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("profile")
+            .expect("fixture must have had a profile field to remove");
+        assert!(
+            !value.to_string().contains("\"profile\""),
+            "profile field must actually be absent from the JSON under test"
+        );
+
+        let parsed: ResolvedRunContract = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.profile.id, "coding");
+        assert_eq!(parsed.profile.version, "coding_profile.v1");
     }
 }

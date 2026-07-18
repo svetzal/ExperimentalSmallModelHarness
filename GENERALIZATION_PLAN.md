@@ -261,6 +261,60 @@ condition above, proven without running any model.
 Exit condition: the runtime core contains no Rust, Cargo, Bevy, or test-runner
 names, while the coding profile preserves current demo behavior.
 
+**Slice 3 status: complete (2026-07-17).** All Rust/Cargo-flavored (and
+legacy other-language) literals moved verbatim out of `agent.rs`, `tools.rs`,
+and `contract.rs` into a new `src/profile/` module: `src/profile/mod.rs`
+defines the `DomainProfile` trait (system/run guidance, post-write
+validation-nudge text, repair-ladder suffix, probe recognition, command-family
+normalization, path/dir/inspection/mutation classification, failure-detail
+parsing, the legacy contract adapter, default artifact classes and evidence
+invalidation, and action-intent phrases) plus a stable `ProfileRef { id,
+version }` identity and `select_profile()`; `src/profile/coding.rs` owns every
+moved behavior for the one profile that exists today
+(`CODING_PROFILE_ID = "coding"`, `CODING_PROFILE_VERSION =
+"coding_profile.v1"`), including the coding-focused unit tests (legacy
+shell-fence scraper, cargo/pytest probe recognition, artifact classification,
+family normalization) that are explicitly allowed to name languages and
+tools. `ResolvedRunContract` gained an additive `pub profile: ProfileRef`
+field (`#[serde(default)]`, so contracts persisted before this field existed
+still deserialize with `profile.id == "coding"` via `ProfileRef::default`);
+`SCHEMA_VERSION` stayed `run_contract.v1` since the change is additive and
+defaulted, not breaking. `contract.rs` now dispatches to
+`crate::profile::coding`/`crate::profile::select_profile()` instead of
+embedding coding literals or a `MutableArtifactClasses`/`EvidenceInvalidation`
+`Default` impl. The five committed snapshots in
+`fixtures/contracts/snapshots/*.json` were regenerated via `cargo run --
+resolve-contract` and now carry `"profile":{"id":"coding","version":"coding_profile.v1"}`
+as the only diff from their Slice 2 contents. New `fixtures/prompts/{system,run,
+post_write_nudge,post_write_nudge_after_empty_turn,repair}.txt` capture the
+actual runtime worker/system prompt, run guidance, both post-write nudge
+wordings, and the repair-ladder suffix verbatim, diffed byte-for-byte by
+parity tests in `src/profile/coding.rs`'s `#[cfg(test)] mod tests`. A new
+`tests/structural_coupling.rs` reads each core production source file, strips
+`#[cfg(test)] mod tests { ... }` blocks, and asserts the case-insensitive,
+word-boundary-aware absence of cargo/bevy/rust/rustc/rustfmt/clippy/pytest/
+npm/pnpm/yarn/"go test"/gradle/mvn/"mix test"/rspec (excluding
+`src/profile/**`, `src/baseline.rs`, `fixtures/**`, and `baseline/**`, and
+naturally excluding build-time identifiers like `CARGO_MANIFEST_DIR` since
+"cargo" only appears there as a sub-word of a larger identifier, not a
+standalone word) — reintroducing a forbidden token in `agent.rs` was verified
+to fail this guard before being removed again. The one genuine discrepancy
+found during extraction was two copies of `path_requires_validation_after_write`
+(`agent.rs` and `tools.rs`) written as different early-return shapes over the
+same exemption tables; they were logically identical (verified by inspection
+and by the consolidated single copy's existing test coverage passing
+unchanged), so they collapsed into one `crate::profile::coding` function
+rather than picking one as "more correct." The exit condition —
+`cargo test --test structural_coupling` passes, `cargo run --
+resolve-contract` is deterministic and now shows the profile field,
+`cargo run -- summarize-matrix` still reports `30`/`24`/`6`, and
+`cargo run -- analyze-trace fixtures/traces/*.jsonl` is byte-identical across
+repeated invocations — was verified with exactly those four commands, plus
+`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D
+warnings`, and `cargo test` (177 unit/integration tests plus 3 structural
+tests, all green), with `git diff --stat Cargo.toml Cargo.lock` empty
+throughout.
+
 ### Slice 4: Separate State From Effects
 
 - Represent significant model, tool, mutation, probe, and stop observations as

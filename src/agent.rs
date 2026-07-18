@@ -290,11 +290,12 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     )?;
 
     let scope = ToolScope::new(tool_root.clone(), Arc::clone(&trace))?;
-    let system_prompt = system_prompt();
+    let profile = crate::profile::select_profile();
+    let system_prompt = profile.system_guidance();
     let tools = coding_tools(&scope);
     let mut messages = vec![
         LlmMessage::system(system_prompt),
-        LlmMessage::user(run_prompt(&goal)),
+        LlmMessage::user(profile.run_guidance(&goal)),
     ];
     let num_predict = config
         .num_predict
@@ -502,10 +503,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 )?;
                 final_summary = format!("turn {turn} modified files without follow-up validation");
                 messages.push(LlmMessage::user(
-                    "You modified files after the most recent shell probe and did not provide final text. \
-                     Do not edit again yet. Run the validation ladder now: cargo fmt --check, \
-                     then cargo clippy, then focused tests, then broad tests. Use timeout_secs 1800 \
-                     for cargo build or cargo test. Reply DONE only if validation passes.",
+                    crate::profile::select_profile().post_write_validation_nudge(false),
                 ));
                 continue;
             }
@@ -685,10 +683,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 }),
             )?;
             messages.push(LlmMessage::user(
-                "You modified files after the most recent shell probe. Do not edit again yet. \
-                 Run the validation ladder now: cargo fmt --check, then cargo clippy, \
-                 then focused tests, then broad tests. Use timeout_secs 1800 for cargo build \
-                 or cargo test. Reply DONE only if validation passes.",
+                crate::profile::select_profile().post_write_validation_nudge(true),
             ));
             continue;
         }
@@ -1012,7 +1007,7 @@ impl RequestedValidationLedger {
                     .observed_command
                     .clone()
                     .unwrap_or_else(|| entry.command.clone()),
-                command_family: validation_command_family(&entry.command),
+                command_family: crate::profile::coding::validation_command_family(&entry.command),
                 status: entry.status_code,
                 total_shell_probes: 0,
                 total_write_operations: self.generation,
@@ -1107,26 +1102,6 @@ pub(crate) fn normalize_validation_command(command: &str) -> String {
         parts.pop();
     }
     parts.join(" ")
-}
-
-pub(crate) fn validation_command_family(command: &str) -> String {
-    let normalized = normalize_validation_command(command);
-    let parts = normalized.split_whitespace().collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["cargo", "clippy", ..] => "cargo clippy".to_string(),
-        ["cargo", "fmt", ..] => "cargo fmt".to_string(),
-        ["cargo", "build", ..] => "cargo build".to_string(),
-        ["cargo", "test", ..] => "cargo test".to_string(),
-        ["cargo", "run", ..] => "cargo run".to_string(),
-        ["./cargo", "clippy", ..] => "./cargo clippy".to_string(),
-        ["./cargo", "fmt", ..] => "./cargo fmt".to_string(),
-        ["./cargo", "build", ..] => "./cargo build".to_string(),
-        ["./cargo", "test", ..] => "./cargo test".to_string(),
-        ["./cargo", "run", ..] => "./cargo run".to_string(),
-        [head, second, ..] => format!("{head} {second}"),
-        [head] => (*head).to_string(),
-        [] => "validation".to_string(),
-    }
 }
 
 fn successful_validation_done_prompt(validation: &SuccessfulValidationSnapshot) -> String {
@@ -1227,29 +1202,6 @@ fn canonicalize_goal(experiment_dir: &Path, goal_file: &Path) -> Result<PathBuf>
         anyhow::bail!("goal file must be inside experiment dir");
     }
     Ok(canonical)
-}
-
-fn system_prompt() -> String {
-    [
-        "You are an adaptive coding harness instance built on Mojentic.",
-        "Use the provided tools to read files, write files, apply unified diffs, and run shell commands.",
-        "Use list_tree to map available files before guessing repository contents.",
-        "Use read_file line ranges and byte limits to keep context small.",
-        "All tool paths are relative to the generated project root.",
-        "Shell commands run from the generated project root by default.",
-        "Work in small steps. Verify with deterministic shell commands before claiming completion.",
-        "Create Cargo.toml, src/lib.rs, and other generated source at the tool root unless the task says otherwise.",
-        "Create a project-appropriate .gitignore unless the task explicitly forbids additional files.",
-        "Ignore generated build, dependency, cache, and virtual-environment directories such as target/, build/, dist/, node_modules/, .venv/, and __pycache__/. Do not list or inspect ignored paths unless explicitly needed.",
-        "Use timeout_secs 1800 for first cargo build, cargo test, or similarly expensive validation probes.",
-        "After a validation failure, repair narrowly: cite the failing command and failure text, inspect only relevant code, prefer edit_file for focused existing-source repairs, then rerun validation.",
-        "For Rust projects after edits, prefer this validation ladder: cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings, focused tests, then cargo test.",
-        "Use edit_file for existing source edits. Use write_file for new files, or for existing source only after reading the complete current file and preserving unrelated content.",
-        "Never end a turn with an empty response. Continue using tools, or reply DONE/FAIL as instructed.",
-        "When you have completed the task and verified it, answer exactly DONE.",
-        "If the task cannot be completed, answer exactly FAIL with one concise reason.",
-    ]
-    .join("\n")
 }
 
 struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
@@ -3218,14 +3170,17 @@ fn action_intent_signal(thinking: &str) -> bool {
         "implement",
         "create",
         "add ",
-        "run cargo",
         "call write_file",
         "use write_file",
         "call edit_file",
         "use edit_file",
     ]
     .iter()
-    .any(|phrase| text.contains(phrase));
+    .any(|phrase| text.contains(phrase))
+        || crate::profile::select_profile()
+            .action_intent_phrases()
+            .iter()
+            .any(|phrase| text.contains(phrase));
     intent && action
 }
 
@@ -3265,7 +3220,8 @@ fn inspection_signature(call: &LlmToolCall) -> Option<String> {
         }
         "shell_command" => {
             let command = call.arguments.get("command")?.as_str()?;
-            is_inspection_shell_command(command)
+            crate::profile::select_profile()
+                .is_inspection_shell_command(command)
                 .then(|| format!("shell_command:{}", normalize_shell_command(command)))
         }
         _ => None,
@@ -3281,13 +3237,13 @@ fn is_meaningful_source_edit(call: &LlmToolCall, result: &ToolCallRunResult) -> 
             .arguments
             .get("path")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(path_requires_validation_after_write),
+            .is_some_and(crate::profile::coding::path_requires_validation_after_write),
         "patch_file" => true,
         "write_file" => call
             .arguments
             .get("path")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(path_requires_validation_after_write),
+            .is_some_and(crate::profile::coding::path_requires_validation_after_write),
         _ => false,
     }
 }
@@ -3366,49 +3322,8 @@ fn successful_validation_from_tool_result(
     })
 }
 
-fn is_inspection_shell_command(command: &str) -> bool {
-    let trimmed = command.trim().to_ascii_lowercase();
-    if trimmed.is_empty() || trimmed.contains("cargo ") || trimmed.contains("npm ") {
-        return false;
-    }
-    [
-        "cat ", "sed ", "head ", "tail ", "rg ", "grep ", "find ", "ls ", "wc ", "pwd",
-    ]
-    .iter()
-    .any(|prefix| trimmed == prefix.trim() || trimmed.starts_with(prefix))
-}
-
 fn normalize_shell_command(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn path_requires_validation_after_write(path: &str) -> bool {
-    let path = Path::new(path);
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(
-        file_name.as_str(),
-        ".gitignore"
-            | ".ignore"
-            | "readme"
-            | "license"
-            | "licence"
-            | "changelog"
-            | "contributors"
-            | "authors"
-    ) {
-        return false;
-    }
-    !matches!(
-        path.extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("md" | "markdown" | "txt" | "rst" | "adoc")
-    )
 }
 
 fn limit_preview(content: &str, max_chars: usize) -> String {
@@ -3500,19 +3415,6 @@ fn role_counts(messages: &[LlmMessage]) -> serde_json::Value {
         "assistant": assistant,
         "tool": tool,
     })
-}
-
-fn run_prompt(goal: &str) -> String {
-    format!(
-        "Complete this benchmark task inside the generated project workspace.\n\n{goal}\n\n\
-         Required harness behavior:\n\
-         - You are already operating inside the generated project's workspace directory.\n\
-         - Inspect the project root first.\n\
-         - Create a project-appropriate .gitignore early unless this task explicitly forbids additional files.\n\
-         - Build or update the Rust project at the current tool root, not in a nested workspace/ directory.\n\
-         - Run at least one deterministic validation command.\n\
-         - Leave generated project files at the tool root and use DONE only after validation."
-    )
 }
 
 fn empty_response_prompt(consecutive_empty_responses: usize) -> String {
@@ -3618,12 +3520,13 @@ fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
          apply one focused source edit with edit_file, run one deterministic diagnostic probe that narrows those exact details, \
          or reply FAIL with a concrete blocker. \
          Do not emit a text-only repair plan. Do not repeat broad inspection. \
-         If you edit, run the validation ladder immediately afterward: cargo fmt --check, cargo clippy, focused tests, then broad tests.",
+         {repair_ladder_suffix}",
         command = repair.command,
         failure_text = repair.failure_text,
         failure_details = failure_details,
         command_count = repair.repeated_command_family_count,
         summary_count = repair.repeated_failure_summary_count,
+        repair_ladder_suffix = crate::profile::select_profile().repair_ladder_suffix(),
     )
 }
 
