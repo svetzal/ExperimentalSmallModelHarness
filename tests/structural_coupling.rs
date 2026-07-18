@@ -242,6 +242,28 @@ fn core_runtime_has_no_second_domain_identity_or_benchmark_literals() {
 }
 
 #[test]
+fn resolved_run_orchestration_never_reselects_a_default_or_coding_profile() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let production =
+        strip_test_modules(&fs::read_to_string(repo_root.join("src/agent.rs")).unwrap());
+    let forbidden = [
+        "default_profile(",
+        "profile::coding",
+        "run_coding_agent",
+        "coding_tools",
+    ];
+    let found = forbidden
+        .iter()
+        .filter(|token| production.contains(**token))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        found.is_empty(),
+        "resolved run orchestration must use the contract-selected profile: {found:?}"
+    );
+}
+
+#[test]
 fn strip_test_modules_removes_nested_braces_and_keeps_surrounding_code() {
     let source = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn helper() { if true { 1 } else { 2 } }\n    const X: &str = \"cargo test\";\n}\nfn b() {}\n";
     let stripped = strip_test_modules(source);

@@ -303,7 +303,7 @@ pub fn supplied_contract_for(source: &ContractSource) -> SuppliedContract {
 pub fn resolve_contract(source: ContractSource, budgets: Budgets) -> Result<ResolvedRunContract> {
     match source {
         ContractSource::Legacy { goal_text, .. } => {
-            Ok(crate::profile::select_profile().resolve_legacy_contract(&goal_text, budgets))
+            Ok(crate::profile::default_profile().resolve_legacy_contract(&goal_text, budgets))
         }
         ContractSource::Explicit { json_text, .. } => {
             resolve_explicit_contract(&json_text, budgets)

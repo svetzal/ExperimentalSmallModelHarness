@@ -175,7 +175,7 @@ impl ToolScope {
             root,
             trace,
             AccessPolicy::default(),
-            crate::profile::select_profile().profile_ref(),
+            crate::profile::default_profile().profile_ref(),
         )
     }
 
@@ -192,7 +192,7 @@ impl ToolScope {
                 read_allow: parse_path_rules(read_allow)?,
                 write_allow: parse_path_rules(write_allow)?,
             },
-            crate::profile::select_profile().profile_ref(),
+            crate::profile::default_profile().profile_ref(),
         )
     }
 
@@ -1012,7 +1012,7 @@ impl ToolScope {
 }
 
 pub fn coding_tools(scope: &ToolScope) -> Vec<Box<dyn LlmTool>> {
-    tools_for_profile(scope, crate::profile::select_profile())
+    tools_for_profile(scope, crate::profile::default_profile())
 }
 
 pub fn tools_for_profile(scope: &ToolScope, profile: &dyn DomainProfile) -> Vec<Box<dyn LlmTool>> {

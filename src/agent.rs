@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::tools::coding_tools;
 use crate::tools::{
     SuccessfulValidationSnapshot, ToolPolicySnapshot, ToolScope, ValidationRepairSnapshot,
     tools_for_profile,
@@ -185,15 +183,15 @@ pub fn default_repair_exit_thinking_tokens() -> usize {
     DEFAULT_REPAIR_EXIT_THINKING_TOKENS
 }
 
-pub async fn run_coding_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
+pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
     let gateway = OllamaGateway::new();
     let tool_root = PathBuf::from(".")
         .canonicalize()
         .context("canonicalizing harness cwd")?;
-    run_coding_agent_with_gateway(config, &gateway, tool_root).await
+    run_agent_with_gateway(config, &gateway, tool_root).await
 }
 
-async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
+async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     config: AgentRunConfig,
     gateway: &G,
     tool_root: PathBuf,
@@ -339,8 +337,10 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
 
     let mut final_summary = String::new();
     let mut final_response_only_next_turn = false;
-    let mut requested_validation_ledger =
-        RequestedValidationLedger::new(requested_validation_commands.clone());
+    let mut requested_validation_ledger = RequestedValidationLedger::new_for_profile(
+        requested_validation_commands.clone(),
+        resolved_contract.profile.clone(),
+    );
     scope.observe_runtime(crate::runtime::RuntimeEvent::RunStarted);
     let requested_validation_completed_write_operations = 0usize;
     let mut exhausted_iterations = true;
@@ -843,7 +843,9 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                     decision,
                 )));
             } else {
-                messages.push(LlmMessage::user(validation_repair_prompt(repair)));
+                messages.push(LlmMessage::user(validation_repair_prompt_for_profile(
+                    repair, profile,
+                )));
             }
             continue;
         }
@@ -932,6 +934,8 @@ fn is_fail_response(response: &str) -> bool {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct RequestedValidationLedger {
+    #[serde(skip)]
+    profile: crate::profile::ProfileRef,
     generation: usize,
     entries: Vec<RequestedValidationEntry>,
 }
@@ -965,8 +969,14 @@ struct RequestedValidationObservation {
 }
 
 impl RequestedValidationLedger {
+    #[cfg(test)]
     fn new(commands: Vec<String>) -> Self {
+        Self::new_for_profile(commands, crate::profile::ProfileRef::default())
+    }
+
+    fn new_for_profile(commands: Vec<String>, profile: crate::profile::ProfileRef) -> Self {
         Self {
+            profile,
             generation: 0,
             entries: commands
                 .into_iter()
@@ -1099,7 +1109,9 @@ impl RequestedValidationLedger {
                     .observed_command
                     .clone()
                     .unwrap_or_else(|| entry.command.clone()),
-                command_family: crate::profile::coding::validation_command_family(&entry.command),
+                command_family: crate::profile::profile_by_ref(&self.profile)
+                    .expect("ledger profile was validated at contract resolution")
+                    .validation_command_family(&entry.command),
                 status: entry.status_code,
                 total_shell_probes: 0,
                 total_write_operations: self.generation,
@@ -1451,6 +1463,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let mut final_response_only_after_validation: Option<SuccessfulValidationSnapshot> = None;
     let mut requested_validation_pending_after_write = requested_validation_pending_after_write;
     let mut requested_validation_ledger = requested_validation_ledger;
+    let profile = crate::profile::profile_by_ref(&requested_validation_ledger.profile)?;
     let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     let correlation_id = format!(
         "harness-turn-{turn}-{}",
@@ -1721,7 +1734,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         }),
                     )?;
                     let call_thinking_estimated_tokens = estimate_tokens(call_thinking_chars);
-                    if action_intent_signal(&call_action_intent_buffer)
+                    if action_intent_signal_for_profile(&call_action_intent_buffer, profile)
                         && last_action_intent_hit_token.is_none_or(|last_hit_token| {
                             call_thinking_estimated_tokens
                                 >= last_hit_token + ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS
@@ -2053,12 +2066,13 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     "message_count_after_append": current_messages.len(),
                 }),
             )?;
-            if let Some(decision) = inspection_loop_tracker.observe(turn, depth, call, &tool_result)
+            if let Some(decision) =
+                inspection_loop_tracker.observe(turn, depth, call, &tool_result, profile)
             {
                 trace.event("agent.inspection_loop.hard_failed", &decision)?;
                 anyhow::bail!("{}", inspection_loop_failure_summary(&decision));
             }
-            if is_meaningful_source_edit(call, &tool_result) {
+            if is_meaningful_source_edit(call, &tool_result, profile) {
                 requested_validation_pending_after_write = true;
                 requested_validation_ledger.note_source_mutation();
             }
@@ -2338,17 +2352,18 @@ impl InspectionLoopTracker {
         llm_call_depth: usize,
         call: &LlmToolCall,
         result: &ToolCallRunResult,
+        profile: &dyn crate::profile::DomainProfile,
     ) -> Option<InspectionLoopDecision> {
         if self.runtime.meaningful_action_seen {
             return None;
         }
-        if is_meaningful_source_edit(call, result) || is_validation_probe_result(result) {
+        if is_meaningful_source_edit(call, result, profile) || is_validation_probe_result(result) {
             self.runtime.meaningful_action_seen = true;
             self.runtime.repeated_inspections.clear();
             return None;
         }
 
-        let signature = inspection_signature(call)?;
+        let signature = inspection_signature(call, profile)?;
         let event = crate::runtime::RuntimeEvent::Inspection {
             signature: signature.clone(),
         };
@@ -3146,7 +3161,10 @@ fn inspection_loop_failure_summary(decision: &InspectionLoopDecision) -> String 
     )
 }
 
-fn action_intent_signal(thinking: &str) -> bool {
+fn action_intent_signal_for_profile(
+    thinking: &str,
+    profile: &dyn crate::profile::DomainProfile,
+) -> bool {
     let text = thinking.to_ascii_lowercase();
     let intent = [
         "let me",
@@ -3175,11 +3193,16 @@ fn action_intent_signal(thinking: &str) -> bool {
     ]
     .iter()
     .any(|phrase| text.contains(phrase))
-        || crate::profile::select_profile()
+        || profile
             .action_intent_phrases()
             .iter()
             .any(|phrase| text.contains(phrase));
     intent && action
+}
+
+#[cfg(test)]
+fn action_intent_signal(thinking: &str) -> bool {
+    action_intent_signal_for_profile(thinking, crate::profile::default_profile())
 }
 
 fn push_bounded_buffer(buffer: &mut String, chunk: &str, max_chars: usize) {
@@ -3198,7 +3221,10 @@ fn push_bounded_buffer(buffer: &mut String, chunk: &str, max_chars: usize) {
     buffer.drain(..start);
 }
 
-fn inspection_signature(call: &LlmToolCall) -> Option<String> {
+fn inspection_signature(
+    call: &LlmToolCall,
+    profile: &dyn crate::profile::DomainProfile,
+) -> Option<String> {
     match call.name.as_str() {
         "read_file" => {
             let path = call.arguments.get("path")?.as_str()?.trim();
@@ -3218,7 +3244,7 @@ fn inspection_signature(call: &LlmToolCall) -> Option<String> {
         }
         "shell_command" => {
             let command = call.arguments.get("command")?.as_str()?;
-            crate::profile::select_profile()
+            profile
                 .is_inspection_shell_command(command)
                 .then(|| format!("shell_command:{}", normalize_shell_command(command)))
         }
@@ -3226,7 +3252,11 @@ fn inspection_signature(call: &LlmToolCall) -> Option<String> {
     }
 }
 
-fn is_meaningful_source_edit(call: &LlmToolCall, result: &ToolCallRunResult) -> bool {
+fn is_meaningful_source_edit(
+    call: &LlmToolCall,
+    result: &ToolCallRunResult,
+    profile: &dyn crate::profile::DomainProfile,
+) -> bool {
     if !result.ok {
         return false;
     }
@@ -3235,13 +3265,13 @@ fn is_meaningful_source_edit(call: &LlmToolCall, result: &ToolCallRunResult) -> 
             .arguments
             .get("path")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(crate::profile::coding::path_requires_validation_after_write),
+            .is_some_and(|path| profile.path_requires_validation_after_write(path)),
         "patch_file" => true,
         "write_file" => call
             .arguments
             .get("path")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(crate::profile::coding::path_requires_validation_after_write),
+            .is_some_and(|path| profile.path_requires_validation_after_write(path)),
         _ => false,
     }
 }
@@ -3506,7 +3536,10 @@ fn empty_response_decision(consecutive_empty_responses: usize) -> EmptyResponseD
     }
 }
 
-fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
+fn validation_repair_prompt_for_profile(
+    repair: &ValidationRepairSnapshot,
+    profile: &dyn crate::profile::DomainProfile,
+) -> String {
     let failure_details = repair_detail_text(repair);
     format!(
         "Validation repair action contract is active.\n\
@@ -3525,8 +3558,13 @@ fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
         failure_details = failure_details,
         command_count = repair.repeated_command_family_count,
         summary_count = repair.repeated_failure_summary_count,
-        repair_ladder_suffix = crate::profile::select_profile().repair_ladder_suffix(),
+        repair_ladder_suffix = profile.repair_ladder_suffix(),
     )
+}
+
+#[cfg(test)]
+fn validation_repair_prompt(repair: &ValidationRepairSnapshot) -> String {
+    validation_repair_prompt_for_profile(repair, crate::profile::default_profile())
 }
 
 fn validation_repair_no_action_prompt(decision: &RepairNoActionDecision) -> String {
@@ -3582,6 +3620,7 @@ fn repair_detail_text(repair: &ValidationRepairSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::coding_tools;
     use async_trait::async_trait;
     use futures::stream;
     use mojentic::llm::models::LlmGatewayResponse;
@@ -3632,6 +3671,36 @@ mod tests {
         assert!(!action_intent_signal(
             "Write operations are tracked by the harness."
         ));
+    }
+
+    #[test]
+    fn resolved_profile_controls_action_and_mutation_classification() {
+        let coding = crate::profile::default_profile();
+        let text = crate::profile::profile_by_ref(&crate::profile::ProfileRef {
+            id: crate::profile::text_transform::TEXT_TRANSFORM_PROFILE_ID.into(),
+            version: crate::profile::text_transform::TEXT_TRANSFORM_PROFILE_VERSION.into(),
+        })
+        .unwrap();
+        assert!(!action_intent_signal_for_profile(
+            "I will execute assertion now.",
+            coding
+        ));
+        assert!(action_intent_signal_for_profile(
+            "I will execute assertion now.",
+            text
+        ));
+        let call = LlmToolCall {
+            id: Some("write".into()),
+            name: "write_file".into(),
+            arguments: HashMap::from([("path".into(), json!("brief.md"))]),
+        };
+        let result = ToolCallRunResult {
+            ok: true,
+            content: "{}".into(),
+            duration_ms: 0,
+        };
+        assert!(!is_meaningful_source_edit(&call, &result, coding));
+        assert!(is_meaningful_source_edit(&call, &result, text));
     }
 
     #[test]
@@ -5835,7 +5904,7 @@ mod tests {
         }
 
         async fn run(&self, gateway: &ScriptedGateway, max_iterations: usize) -> AgentRunSummary {
-            run_coding_agent_with_gateway(
+            run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
                     goal_file: PathBuf::from("task.md"),
@@ -5864,7 +5933,7 @@ mod tests {
             gateway: &ScriptedGateway,
             max_iterations: usize,
         ) -> AgentRunSummary {
-            run_coding_agent_with_gateway(
+            run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
                     goal_file: PathBuf::from("task.md"),
@@ -5893,7 +5962,7 @@ mod tests {
             gateway: &ScriptedGateway,
             max_iterations: usize,
         ) -> AgentRunSummary {
-            run_coding_agent_with_gateway(
+            run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
                     goal_file: PathBuf::from("task.md"),
@@ -6376,7 +6445,7 @@ mod tests {
     }
 
     /// Mirrors the resolution-before-effect ordering in
-    /// `run_coding_agent_with_gateway`: contract resolution is the first
+    /// `run_agent_with_gateway`: contract resolution is the first
     /// fallible step, performed before `gateway` is touched at all.
     async fn resolve_contract_before_gateway_probe<G: LlmGateway + ?Sized>(
         source: crate::contract::ContractSource,

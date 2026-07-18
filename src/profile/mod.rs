@@ -121,7 +121,7 @@ pub trait DomainProfile: Send + Sync {
 /// Select the domain profile for a run. Only the coding profile exists this
 /// slice; the signature already takes no arguments so a future
 /// contract-driven selector can be introduced without changing callers.
-pub fn select_profile() -> &'static dyn DomainProfile {
+pub fn default_profile() -> &'static dyn DomainProfile {
     const PROFILE: CodingProfile = CodingProfile;
     &PROFILE
 }

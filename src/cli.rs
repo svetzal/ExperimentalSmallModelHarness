@@ -1,6 +1,6 @@
 use crate::agent::{
     AgentRunConfig, TranscriptPolicy, default_expected_output_tokens,
-    default_max_thinking_only_tokens, default_repair_exit_thinking_tokens, run_coding_agent,
+    default_max_thinking_only_tokens, default_repair_exit_thinking_tokens, run_agent,
 };
 use crate::baseline::{load_matrix_baseline, summarize_matrix};
 use crate::contract::{Budgets, ContractSource, resolve_contract};
@@ -20,7 +20,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the Mojentic-backed coding agent against an experiment directory.
+    /// Run the Mojentic-backed agent selected by the resolved contract profile.
     Run {
         /// Experiment root. Tool access is scoped to this directory.
         #[arg(long)]
@@ -141,7 +141,7 @@ pub async fn run() -> Result<()> {
             });
             let repair_exit_thinking_tokens =
                 repair_exit_thinking_tokens.unwrap_or_else(default_repair_exit_thinking_tokens);
-            let summary = run_coding_agent(AgentRunConfig {
+            let summary = run_agent(AgentRunConfig {
                 experiment_dir: experiment,
                 goal_file: goal,
                 contract_file: contract,
