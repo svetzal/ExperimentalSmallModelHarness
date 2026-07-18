@@ -136,6 +136,22 @@ ran, the probe passed or failed, and repair is permitted.
 Exit condition: expected metrics can be reproduced without reading narrative
 notes or using matrix-specific classification code.
 
+**Slice 0 status: complete (2026-07-17).** Harness provenance is now a typed
+`HarnessSourceState` (`src/provenance.rs`), captured once per run and carried
+in the `run.started` trace event, `AgentRunSummary`/`run.finished`, and
+`TraceAnalysis` — one canonical representation instead of an untyped,
+single-use JSON blob. The completed 30-cell matrix is preserved as
+machine-readable evidence in `baseline/matrix_baseline.json`, loaded and
+invariant-checked by `src/baseline.rs`. Five deterministic trace fixtures
+(`fixtures/traces/{pass,validation_repair_pass,action_boundary_stop,
+hidden_only_no_action_stop,environment_invalid_validation}.jsonl`) exercise a
+new canonical `RunOutcome` classification on `TraceAnalysis`, derived only
+from event kinds and metrics the runtime already emits (no new runtime
+policy). `cargo run -- analyze-trace fixtures/traces/*.jsonl` reproduces the
+same five classifications and populated `harness_source_state` byte-for-byte
+across repeated invocations, with no narrative-note reading or
+matrix-specific classification code involved — the exit condition above.
+
 ### Slice 1: Canonicalize Measurement
 
 - Add first action, tool call, artifact mutation, probe reach, probe pass,

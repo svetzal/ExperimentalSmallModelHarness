@@ -82,6 +82,7 @@ pub struct AgentRunSummary {
     pub action_boundary_interrupt_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
     pub final_summary: String,
+    pub harness_source_state: crate::provenance::HarnessSourceState,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +212,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         .with_context(|| format!("canonicalizing tool root {}", tool_root.display()))?;
 
     let trace = Arc::new(TraceRecorder::create(&experiment_dir.join("traces"))?);
+    let harness_source_state = crate::provenance::capture();
     trace.event(
         "run.started",
         serde_json::json!({
@@ -233,7 +235,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             "requested_validation_commands": &requested_validation_commands,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
             "harness_package_version": env!("CARGO_PKG_VERSION"),
-            "harness_source_state": harness_source_state(),
+            "harness_source_state": &harness_source_state,
         }),
     )?;
 
@@ -740,6 +742,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         action_boundary_interrupt_tokens: config.action_boundary_interrupt_tokens,
         transcript_policy: config.transcript_policy,
         final_summary,
+        harness_source_state,
     };
     trace.event("run.finished", &summary)?;
     Ok(summary)
@@ -766,39 +769,6 @@ fn trace_run_failed(
             "goal_file": goal_file,
         }),
     )
-}
-
-fn harness_source_state() -> serde_json::Value {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let git_head = std::process::Command::new("git")
-        .arg("-C")
-        .arg(manifest_dir)
-        .arg("rev-parse")
-        .arg("HEAD")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
-    let git_dirty = std::process::Command::new("git")
-        .arg("-C")
-        .arg(manifest_dir)
-        .arg("status")
-        .arg("--short")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty());
-
-    serde_json::json!({
-        "manifest_dir": manifest_dir,
-        "git_head": git_head,
-        "git_dirty": git_dirty,
-        "source_state_note": if git_head.is_some() {
-            "git metadata captured"
-        } else {
-            "not a git checkout or git unavailable"
-        },
-    })
 }
 
 fn is_terminal_response(response: &str) -> bool {

@@ -1,0 +1,8 @@
+{"timestamp":"2026-07-17T00:00:00Z","kind":"run.started","payload":{"model":"qwen3.6:35b-a3b-coding-nvfp4","goal_file":"/tmp/task.md","tool_root":"/tmp/experiment","max_tool_iterations":50,"context_window_tokens":8192,"packet_type":"multi-file-edit","expected_output_tokens":2048,"assembly_policy":"append_summarized_tool_transcript","transcript_policy":"summarized-transcript","harness_source_state":{"manifest_dir":"/repo","git_head":"abcdef0123456789abcdef0123456789abcdef01","git_dirty":false,"source_state_note":"git metadata captured"}}}
+{"timestamp":"2026-07-17T00:00:01Z","kind":"agent.turn.thinking_only_response","payload":{"turn":1,"consecutive_hidden_only_no_action_turns":1}}
+{"timestamp":"2026-07-17T00:00:02Z","kind":"agent.turn.hidden_only_no_action","payload":{"turn":1,"escalation_required":false}}
+{"timestamp":"2026-07-17T00:00:03Z","kind":"agent.turn.thinking_only_response","payload":{"turn":2,"consecutive_hidden_only_no_action_turns":2}}
+{"timestamp":"2026-07-17T00:00:04Z","kind":"agent.turn.hidden_only_no_action","payload":{"turn":2,"escalation_required":true}}
+{"timestamp":"2026-07-17T00:00:05Z","kind":"agent.turn.hidden_only_no_action_escalated","payload":{"turn":2,"consecutive_hidden_only_no_action_turns":2}}
+{"timestamp":"2026-07-17T00:00:06Z","kind":"agent.turn.hidden_only_no_action_hard_failed","payload":{"turn":2,"consecutive_hidden_only_no_action_turns":2,"final_summary":"turn 2 hidden-only reasoning escalated with no visible action"}}
+{"timestamp":"2026-07-17T00:00:07Z","kind":"run.finished","payload":{"final_summary":"turn 2 hidden-only reasoning escalated with no visible action"}}

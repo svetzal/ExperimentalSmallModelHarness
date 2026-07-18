@@ -1,6 +1,7 @@
+use crate::provenance::HarnessSourceState;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct TraceAnalysis {
     pub trace_file: PathBuf,
+    pub harness_source_state: Option<HarnessSourceState>,
     pub model: Option<String>,
     pub goal_file: Option<String>,
     pub tool_root: Option<String>,
@@ -43,6 +45,7 @@ pub struct TraceAnalysis {
     pub failed_tool_events: usize,
     pub validation_commands: Vec<ValidationCommandSummary>,
     pub final_summary_preview: Option<String>,
+    pub outcome: RunOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -51,6 +54,51 @@ pub struct ValidationCommandSummary {
     pub status: Option<i64>,
     pub success: Option<bool>,
     pub repair_required: bool,
+}
+
+/// A single canonical classification of how a run ended, derived
+/// deterministically from events and metrics the runtime already emits.
+///
+/// This is the Slice 0 exit-condition field: it lets the five representative
+/// traces (pass, validation-repair-then-pass, action-boundary stop,
+/// hidden-only/no-action stop, environment-invalid validation) be
+/// reproduced from canonical analyzer output alone, without reading
+/// narrative notes or invoking matrix-specific classification code.
+///
+/// Variants are checked in the order they are declared below; the first
+/// matching rule wins. See [`crate::trace_analysis::classify_outcome`] for
+/// the precedence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    /// The run's own trace parsing/execution failed (`run.failed`).
+    Failed,
+    /// Escalated after repeated hidden-reasoning turns at an action
+    /// boundary produced no source mutation or validation probe
+    /// (`agent.action_boundary.hard_failed`).
+    ActionBoundaryStop,
+    /// Escalated after repeated turns produced only hidden reasoning with no
+    /// visible action at all (`agent.turn.hidden_only_no_action_hard_failed`).
+    HiddenOnlyNoActionStop,
+    /// A validation probe could not execute in its environment at all,
+    /// rather than executing and failing. Detected via the POSIX shell
+    /// convention that exit code 127 means "command not found" — a general,
+    /// non-matrix-specific signal that the validation environment itself
+    /// (not the harness or the generated code) was invalid.
+    EnvironmentInvalidValidation,
+    /// The run finished, at least one validation probe required repair, and
+    /// a later probe then succeeded.
+    ValidationRepairPass,
+    /// The run finished and at least one validation probe succeeded.
+    Pass,
+    /// The run finished but no validation probe is recorded as having
+    /// succeeded.
+    Finished,
+    /// The trace ended without a terminal `run.finished`/`run.failed` event.
+    Unfinished,
+    /// No classifiable status could be determined.
+    #[default]
+    Unknown,
 }
 
 pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
@@ -65,6 +113,8 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
     };
     let mut first_timestamp = None;
     let mut last_timestamp = None;
+    let mut saw_action_boundary_hard_failed = false;
+    let mut saw_hidden_only_no_action_hard_failed = false;
 
     for (line_number, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
@@ -84,6 +134,12 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
             "run.finished" => apply_run_finished(&mut analysis, payload),
             "run.failed" => {
                 analysis.status = "failed".to_string();
+            }
+            "agent.action_boundary.hard_failed" => {
+                saw_action_boundary_hard_failed = true;
+            }
+            "agent.turn.hidden_only_no_action_hard_failed" => {
+                saw_hidden_only_no_action_hard_failed = true;
             }
             "llm.context_assembly.ledger" => apply_context_ledger(&mut analysis, payload),
             "llm.context_assembly.appended" => apply_context_append(&mut analysis, payload),
@@ -107,10 +163,69 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
     analysis.runtime_seconds = first_timestamp
         .zip(last_timestamp)
         .map(|(first, last)| (last - first).num_milliseconds() as f64 / 1000.0);
+    analysis.outcome = classify_outcome(
+        &analysis,
+        saw_action_boundary_hard_failed,
+        saw_hidden_only_no_action_hard_failed,
+    );
     Ok(analysis)
 }
 
+/// Deterministically classify how a run ended from already-collected
+/// analysis state. See [`RunOutcome`] for the meaning of each variant; rules
+/// are checked in the order below and the first match wins.
+fn classify_outcome(
+    analysis: &TraceAnalysis,
+    saw_action_boundary_hard_failed: bool,
+    saw_hidden_only_no_action_hard_failed: bool,
+) -> RunOutcome {
+    if analysis.status == "failed" {
+        return RunOutcome::Failed;
+    }
+    if saw_action_boundary_hard_failed {
+        return RunOutcome::ActionBoundaryStop;
+    }
+    if saw_hidden_only_no_action_hard_failed {
+        return RunOutcome::HiddenOnlyNoActionStop;
+    }
+    let environment_invalid = analysis
+        .validation_commands
+        .iter()
+        .any(|probe| probe.success == Some(false) && probe.status == Some(127));
+    if environment_invalid {
+        return RunOutcome::EnvironmentInvalidValidation;
+    }
+    if analysis.status == "finished" {
+        let repair_then_pass = analysis
+            .validation_commands
+            .iter()
+            .position(|probe| probe.repair_required)
+            .is_some_and(|repair_index| {
+                analysis.validation_commands[repair_index + 1..]
+                    .iter()
+                    .any(|probe| probe.success == Some(true))
+            });
+        if repair_then_pass {
+            return RunOutcome::ValidationRepairPass;
+        }
+        let any_pass = analysis
+            .validation_commands
+            .iter()
+            .any(|probe| probe.success == Some(true));
+        if any_pass {
+            return RunOutcome::Pass;
+        }
+        return RunOutcome::Finished;
+    }
+    if analysis.status == "unfinished" {
+        return RunOutcome::Unfinished;
+    }
+    RunOutcome::Unknown
+}
+
 fn apply_run_started(analysis: &mut TraceAnalysis, payload: &Value) {
+    analysis.harness_source_state =
+        serde_json::from_value(payload["harness_source_state"].clone()).ok();
     analysis.model = value_string(payload, "model");
     analysis.goal_file = value_string(payload, "goal_file");
     analysis.tool_root = value_string(payload, "tool_root");
@@ -323,5 +438,111 @@ mod tests {
         assert_eq!(analysis.validation_commands.len(), 1);
         assert!(analysis.validation_commands[0].repair_required);
         assert_eq!(analysis.runtime_seconds, Some(6.0));
+        assert_eq!(analysis.outcome, RunOutcome::Finished);
+        assert!(analysis.harness_source_state.is_none());
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/traces")
+            .join(name)
+    }
+
+    #[test]
+    fn classifies_a_passing_run() {
+        let analysis = analyze_trace(fixture_path("pass.jsonl")).unwrap();
+
+        assert_eq!(analysis.outcome, RunOutcome::Pass);
+        assert_eq!(analysis.status, "finished");
+        assert_eq!(analysis.validation_commands.len(), 1);
+        assert_eq!(analysis.validation_commands[0].success, Some(true));
+    }
+
+    #[test]
+    fn classifies_a_repair_then_pass_run() {
+        let analysis = analyze_trace(fixture_path("validation_repair_pass.jsonl")).unwrap();
+
+        assert_eq!(analysis.outcome, RunOutcome::ValidationRepairPass);
+        assert_eq!(analysis.status, "finished");
+        assert_eq!(analysis.validation_commands.len(), 2);
+        assert!(analysis.validation_commands[0].repair_required);
+        assert_eq!(analysis.validation_commands[1].success, Some(true));
+    }
+
+    #[test]
+    fn classifies_an_action_boundary_stop() {
+        let analysis = analyze_trace(fixture_path("action_boundary_stop.jsonl")).unwrap();
+
+        assert_eq!(analysis.outcome, RunOutcome::ActionBoundaryStop);
+        assert_eq!(analysis.status, "finished");
+        assert_eq!(analysis.validation_commands.len(), 0);
+    }
+
+    #[test]
+    fn classifies_a_hidden_only_no_action_stop() {
+        let analysis = analyze_trace(fixture_path("hidden_only_no_action_stop.jsonl")).unwrap();
+
+        assert_eq!(analysis.outcome, RunOutcome::HiddenOnlyNoActionStop);
+        assert_eq!(analysis.status, "finished");
+        assert_eq!(analysis.validation_commands.len(), 0);
+    }
+
+    #[test]
+    fn classifies_an_environment_invalid_validation() {
+        let analysis = analyze_trace(fixture_path("environment_invalid_validation.jsonl")).unwrap();
+
+        assert_eq!(analysis.outcome, RunOutcome::EnvironmentInvalidValidation);
+        assert_eq!(analysis.status, "finished");
+        assert_eq!(analysis.validation_commands.len(), 1);
+        assert_eq!(analysis.validation_commands[0].status, Some(127));
+    }
+
+    #[test]
+    fn surfaces_harness_provenance_from_run_started() {
+        let analysis = analyze_trace(fixture_path("action_boundary_stop.jsonl")).unwrap();
+
+        let source_state = analysis
+            .harness_source_state
+            .expect("fixture carries harness_source_state");
+        assert_eq!(
+            source_state.git_head.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        assert_eq!(source_state.git_dirty, Some(true));
+    }
+
+    #[test]
+    fn classifies_missing_git_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-no-provenance.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-07-17T00:00:00Z","kind":"run.started","payload":{"model":"qwen","harness_source_state":{"manifest_dir":"/repo","git_head":null,"git_dirty":null,"source_state_note":"not a git checkout or git unavailable"}}}
+{"timestamp":"2026-07-17T00:00:01Z","kind":"run.finished","payload":{"final_summary":"DONE"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+        let source_state = analysis
+            .harness_source_state
+            .expect("null git fields still deserialize into a present HarnessSourceState");
+        assert_eq!(source_state.git_head, None);
+        assert_eq!(source_state.git_dirty, None);
+        assert_eq!(
+            source_state.source_state_note,
+            "not a git checkout or git unavailable"
+        );
+    }
+
+    #[test]
+    fn analyzer_output_is_deterministic_across_invocations() {
+        let first = analyze_trace(fixture_path("validation_repair_pass.jsonl")).unwrap();
+        let second = analyze_trace(fixture_path("validation_repair_pass.jsonl")).unwrap();
+
+        assert_eq!(
+            serde_json::to_string_pretty(&first).unwrap(),
+            serde_json::to_string_pretty(&second).unwrap()
+        );
     }
 }

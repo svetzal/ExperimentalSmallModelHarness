@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "description": "Slice 0 preserved architectural baseline: cross-model coding demo matrix (screening evidence, one replicate per cell).",
+  "evidence_class": "screening",
+  "replicates_per_cell": 1,
+  "planned_cells": 30,
+  "completed_cells": 30,
+  "independently_validated_cells": 24,
+  "tasks": ["rust", "python", "go", "javascript", "ruby"],
+  "model_configurations_screened": 6,
+  "configurations_passing_every_task": 4,
+  "configurations_failing_at_action_boundary": 2,
+  "documented_boundaries": [
+    {
+      "id": "hidden_only_all_tasks",
+      "classification": "hidden_only_no_action_stop",
+      "detail": "One configuration reached hidden-only no-action termination in all five tasks."
+    },
+    {
+      "id": "qwen_nvfp4_go_action_boundary",
+      "classification": "action_boundary_stop",
+      "model": "qwen3.6:35b-a3b-coding-nvfp4",
+      "task": "go",
+      "detail": "Repeated action-boundary interrupts on the Go task without source mutation or validation."
+    },
+    {
+      "id": "ruby_environment_invalid",
+      "classification": "environment_invalid_validation",
+      "task": "ruby",
+      "detail": "Original Ruby validation environment was invalid though harness and generated code were not; independent revalidation required."
+    }
+  ]
+}
