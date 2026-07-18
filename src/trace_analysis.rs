@@ -110,6 +110,8 @@ pub enum HardStopReason {
     ValidationRepairDepth,
     EmptyResponse,
     InspectionLoop,
+    ThinkingOnlyStream,
+    NoContentStream,
 }
 
 impl HardStopReason {
@@ -121,6 +123,8 @@ impl HardStopReason {
             HardStopReason::ValidationRepairDepth => "validation_repair_depth",
             HardStopReason::EmptyResponse => "empty_response",
             HardStopReason::InspectionLoop => "inspection_loop",
+            HardStopReason::ThinkingOnlyStream => "thinking_only_stream",
+            HardStopReason::NoContentStream => "no_content_stream",
         }
     }
 }
@@ -317,6 +321,12 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
             }
             events::AGENT_INSPECTION_LOOP_HARD_FAILED => {
                 set_hard_stop(&mut analysis, HardStopReason::InspectionLoop, kind);
+            }
+            events::LLM_THINKING_ONLY_STREAM_HARD_FAILED => {
+                set_hard_stop(&mut analysis, HardStopReason::ThinkingOnlyStream, kind);
+            }
+            events::LLM_NO_CONTENT_STREAM_HARD_FAILED => {
+                set_hard_stop(&mut analysis, HardStopReason::NoContentStream, kind);
             }
             events::AGENT_RUN_MANUAL_STOP => {
                 analysis.manual_stop.get_or_insert(ManualStop {
@@ -929,6 +939,21 @@ mod tests {
         assert_eq!(hard_stop.reason, HardStopReason::HiddenOnlyNoAction);
         assert_eq!(hard_stop.reason.as_str(), "hidden_only_no_action");
         assert_eq!(analysis.harness_completion, HarnessCompletion::HardStopped);
+    }
+
+    #[test]
+    fn classifies_thinking_only_stream_hard_stop_before_run_failure() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/traces_slice6/thinking_only_stream_stop.jsonl");
+        let analysis = analyze_trace(path).unwrap();
+        let hard_stop = analysis.hard_stop.expect("hard stop recorded");
+        assert_eq!(hard_stop.reason, HardStopReason::ThinkingOnlyStream);
+        assert_eq!(hard_stop.reason.as_str(), "thinking_only_stream");
+        assert_eq!(
+            hard_stop.evidence_event,
+            "llm.thinking_only_stream.hard_failed"
+        );
+        assert_eq!(analysis.status, "failed");
     }
 
     #[test]

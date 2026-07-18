@@ -236,6 +236,14 @@ pub const AGENT_TURN_EMPTY_RESPONSE_HARD_FAILED: &str = "agent.turn.empty_respon
 /// [`crate::trace_analysis::HardStopReason::InspectionLoop`].
 pub const AGENT_INSPECTION_LOOP_HARD_FAILED: &str = "agent.inspection_loop.hard_failed";
 
+/// A single model call exhausted its surfaced-reasoning allowance without
+/// assistant content or a completed tool call.
+pub const LLM_THINKING_ONLY_STREAM_HARD_FAILED: &str = "llm.thinking_only_stream.hard_failed";
+
+/// Provider metrics reported runaway output without assistant content,
+/// surfaced reasoning, or a completed tool call.
+pub const LLM_NO_CONTENT_STREAM_HARD_FAILED: &str = "llm.no_content_stream.hard_failed";
+
 /// Additive, documented-only event: **not currently emitted by the
 /// runtime**. Reserved for an explicit operator-initiated stop (as opposed
 /// to a runtime-detected hard-stop). Payload fields: `reason` (optional
