@@ -2,6 +2,7 @@ use crate::agent::{
     AgentRunConfig, TranscriptPolicy, default_expected_output_tokens,
     default_max_thinking_only_tokens, default_repair_exit_thinking_tokens, run_coding_agent,
 };
+use crate::baseline::{load_matrix_baseline, summarize_matrix};
 use crate::trace_analysis::analyze_trace;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -79,6 +80,11 @@ enum Command {
         #[arg(required = true)]
         traces: Vec<PathBuf>,
     },
+
+    /// Summarize the preserved 30-cell demo matrix baseline into canonical
+    /// counts (harness completion, independent validation, hard-stops,
+    /// environment corrections), replacing matrix-specific classification.
+    SummarizeMatrix,
 }
 
 pub async fn run() -> Result<()> {
@@ -138,6 +144,11 @@ pub async fn run() -> Result<()> {
                 .map(analyze_trace)
                 .collect::<Result<Vec<_>>>()?;
             println!("{}", serde_json::to_string_pretty(&summaries)?);
+        }
+        Command::SummarizeMatrix => {
+            let baseline = load_matrix_baseline();
+            let summary = summarize_matrix(&baseline.cells);
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
     }
     Ok(())

@@ -1,0 +1,5 @@
+{"timestamp":"2026-07-17T00:00:00Z","kind":"run.started","payload":{"model":"qwen3.6:35b-a3b-coding-nvfp4","goal_file":"/tmp/task.md","tool_root":"/tmp/experiment","max_tool_iterations":50,"context_window_tokens":8192,"packet_type":"multi-file-edit","expected_output_tokens":2048,"assembly_policy":"append_summarized_tool_transcript","transcript_policy":"summarized-transcript","harness_source_state":{"manifest_dir":"/repo","git_head":"abcdef0123456789abcdef0123456789abcdef01","git_dirty":false,"source_state_note":"git metadata captured"}}}
+{"timestamp":"2026-07-17T00:00:01Z","kind":"tool.write_file","payload":{"path":"src/lib.rs","bytes_written":120}}
+{"timestamp":"2026-07-17T00:00:02Z","kind":"tool.shell_command","payload":{"command":"cargo test","validation_probe":true,"status":0,"success":true,"repair_required":null}}
+{"timestamp":"2026-07-17T00:00:03Z","kind":"run.finished","payload":{"final_summary":"DONE"}}
+{"timestamp":"2026-07-17T00:00:04Z","kind":"agent.independent_validation.observed","payload":{"passed":true,"exit_status":0}}

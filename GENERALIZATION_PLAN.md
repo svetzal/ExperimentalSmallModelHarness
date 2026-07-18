@@ -167,6 +167,46 @@ tool availability, or stop policy.
 Exit condition: the analyzer accounts for all 30 matrix cells with the same
 pass/fail and hard-stop counts as the preserved results.
 
+**Slice 1 status: complete (2026-07-17).** `TraceAnalysis` now carries typed,
+additive measurements — `first_tool_call`, `first_productive_action`,
+`first_source_mutation`, `validation_probe_reached`,
+`validation_probe_passed` (each an `Option<Milestone>` naming the evidence
+event), `hard_stop` (a typed `HardStopReason`), `environment_stop`, and
+`manual_stop` — populated by backward-compatible adapters that prefer the
+runtime's existing canonical stage events
+(`agent.stage.first_source_mutation`, `agent.stage.first_validation_probe`,
+`agent.validation_probe.observed`) and fall back to inferring the same
+milestones from raw `tool.*` payloads for legacy traces. `src/runtime_events.rs`
+documents the stable event names and payload fields those adapters read,
+including two additive-only events (`agent.run.manual_stop`,
+`agent.independent_validation.observed`) that are documented but not yet
+emitted by the runtime. Three separate typed facts now replace the old
+single collapsed status: `harness_completion` (did the harness itself reach
+a terminal state, and which kind), `independent_validation` (external
+evidence only — `run.finished`/`DONE` never implies a pass; it stays
+`Unknown` without an explicit event or matrix record), and
+`environment_validity` (was the validation environment itself trustworthy).
+Eight new deterministic fixtures and analyzer tests exercise every new field,
+including a legacy trace with no canonical events at all (proving `DONE` does
+not become a pass) and an explicit manual stop.
+
+The matrix summarizer that used to live only in `Demos/Matrix/summarize.rb`
+is now `summarize_matrix` in `src/baseline.rs`, consuming a typed
+`MatrixCell` (`harness_completion` / `hard_stop` / `independent_validation` /
+`environment_validity` — the same enums `TraceAnalysis` uses) rather than
+re-deriving pass/fail from narrative text. `baseline/matrix_baseline.json`
+(schema v2) embeds all 30 cells transcribed verbatim from the read-only
+`Demos/Matrix/results.tsv` oracle. `cargo run -- summarize-matrix` reproduces,
+byte-identically across two consecutive invocations,
+`completed_cells: 30`, `independently_validated_passes: 24`,
+`independent_validation_failures: 6`, `hard_stops: 6`
+(`{"action_boundary": 1, "hidden_only_no_action": 5}`),
+`environment_corrections: 6` (all six `ruby-ini-parser` cells), and the exact
+six failing-cell identities and per-model/per-task pass tallies from
+`Demos/Matrix/results.tsv`/`results.md` — the exit condition above. No
+matrix-specific classification code remains necessary for reproduction.
+`src/agent.rs`, `src/tools.rs`, and `Cargo.lock` are unchanged by this slice.
+
 ### Slice 2: Introduce A Typed Run Contract
 
 - Parse explicit probe IDs and commands instead of scraping them from arbitrary

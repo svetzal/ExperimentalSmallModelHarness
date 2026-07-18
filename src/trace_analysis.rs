@@ -1,4 +1,5 @@
 use crate::provenance::HarnessSourceState;
+use crate::runtime_events as events;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,147 @@ pub struct TraceAnalysis {
     pub validation_commands: Vec<ValidationCommandSummary>,
     pub final_summary_preview: Option<String>,
     pub outcome: RunOutcome,
+
+    // Slice 1 canonical measurements. Each `Milestone` records the first
+    // occurrence of a named canonical event; `None` means the trace carries
+    // no evidence for that measurement (legacy trace, or the milestone never
+    // happened), not that it definitely did not occur.
+    pub first_tool_call: Option<Milestone>,
+    pub first_productive_action: Option<Milestone>,
+    pub first_source_mutation: Option<Milestone>,
+    pub validation_probe_reached: Option<Milestone>,
+    pub validation_probe_passed: Option<Milestone>,
+    pub hard_stop: Option<HardStop>,
+    pub environment_stop: Option<EnvironmentStop>,
+    pub manual_stop: Option<ManualStop>,
+
+    /// Whether the harness itself reached a terminal state, and which kind.
+    /// Separate from [`Self::independent_validation`]: a run can be
+    /// [`HarnessCompletion::Finished`] while independent validation is still
+    /// [`IndependentValidation::Unknown`] — `DONE` is not a pass.
+    pub harness_completion: HarnessCompletion,
+    /// External evidence of whether the produced artifact actually passed
+    /// its independent validation. Remains [`IndependentValidation::Unknown`]
+    /// unless an explicit event
+    /// ([`crate::runtime_events::AGENT_INDEPENDENT_VALIDATION_OBSERVED`]) or
+    /// an explicit matrix result record supplies it.
+    pub independent_validation: IndependentValidation,
+    /// Whether the validation environment itself (as opposed to the
+    /// harness or the generated artifact) was valid.
+    pub environment_validity: EnvironmentValidity,
+}
+
+/// The first observed occurrence of a canonical measurement: which event
+/// kind supplied the evidence, and an optional human-readable detail.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Milestone {
+    pub evidence_event: String,
+    pub detail: Option<String>,
+}
+
+/// Why a run escalated to a hard stop. Each variant corresponds to exactly
+/// one runtime `*_hard_failed` event kind; see
+/// [`crate::runtime_events`] for the full mapping.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HardStopReason {
+    ActionBoundary,
+    HiddenOnlyNoAction,
+    ValidationRepair,
+    ValidationRepairDepth,
+    EmptyResponse,
+    InspectionLoop,
+}
+
+impl HardStopReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HardStopReason::ActionBoundary => "action_boundary",
+            HardStopReason::HiddenOnlyNoAction => "hidden_only_no_action",
+            HardStopReason::ValidationRepair => "validation_repair",
+            HardStopReason::ValidationRepairDepth => "validation_repair_depth",
+            HardStopReason::EmptyResponse => "empty_response",
+            HardStopReason::InspectionLoop => "inspection_loop",
+        }
+    }
+}
+
+/// A hard-stop escalation observed in the trace.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HardStop {
+    pub reason: HardStopReason,
+    pub evidence_event: String,
+}
+
+/// A validation probe that could not execute in its environment at all
+/// (POSIX exit code 127, "command not found"), rather than executing and
+/// failing on its own merits.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EnvironmentStop {
+    pub command: String,
+    pub status: i64,
+    pub evidence_event: String,
+}
+
+/// An explicit, operator-initiated stop. See
+/// [`crate::runtime_events::AGENT_RUN_MANUAL_STOP`] — documented and
+/// additive only; the runtime does not currently emit this event.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManualStop {
+    pub reason: Option<String>,
+    pub evidence_event: String,
+}
+
+/// Whether the harness itself reached a terminal state, and which kind.
+/// This is strictly about the harness's own control flow — it says nothing
+/// about whether the produced artifact was independently validated; see
+/// [`IndependentValidation`] for that separate fact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessCompletion {
+    /// `run.finished` was observed and no hard-stop or manual stop preceded it.
+    Finished,
+    /// A hard-stop escalation (`*_hard_failed`) terminated the run.
+    HardStopped,
+    /// An explicit manual stop terminated the run.
+    ManuallyStopped,
+    /// `run.failed` was observed.
+    Failed,
+    /// The trace ended without any terminal event.
+    #[default]
+    Unfinished,
+}
+
+/// Independent (external) evidence of whether the produced artifact passed
+/// its validation. This is deliberately never inferred from harness
+/// completion: `run.finished`/`DONE` means the harness stopped cleanly, not
+/// that anything was independently confirmed correct. It becomes known only
+/// from an explicit event
+/// ([`crate::runtime_events::AGENT_INDEPENDENT_VALIDATION_OBSERVED`]) or an
+/// explicit matrix result record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependentValidation {
+    Passed,
+    Failed,
+    #[default]
+    Unknown,
+}
+
+/// Whether the validation environment itself (as opposed to the harness or
+/// the generated artifact) was valid — a `command not found` probe failure
+/// indicates the environment, not the artifact, was untrustworthy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentValidity {
+    Valid,
+    Invalid,
+    /// The environment was initially invalid but a corrected revalidation
+    /// later confirmed the artifact (for example, a Homebrew Ruby
+    /// interpreter conflict resolved by an explicit system-Ruby rerun).
+    Corrected,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -129,17 +271,76 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
             last_timestamp = Some(timestamp);
         }
 
+        if kind.starts_with(events::TOOL_CALL_KIND_PREFIX) && kind != events::TOOL_PAYLOAD_MEASURED
+        {
+            analysis.first_tool_call.get_or_insert_with(|| Milestone {
+                evidence_event: kind.to_string(),
+                detail: value_string(payload, "path").or_else(|| value_string(payload, "command")),
+            });
+        }
+
         match kind {
-            "run.started" => apply_run_started(&mut analysis, payload),
-            "run.finished" => apply_run_finished(&mut analysis, payload),
-            "run.failed" => {
+            events::RUN_STARTED => apply_run_started(&mut analysis, payload),
+            events::RUN_FINISHED => apply_run_finished(&mut analysis, payload),
+            events::RUN_FAILED => {
                 analysis.status = "failed".to_string();
             }
-            "agent.action_boundary.hard_failed" => {
+            events::AGENT_ACTION_BOUNDARY_HARD_FAILED => {
                 saw_action_boundary_hard_failed = true;
+                set_hard_stop(&mut analysis, HardStopReason::ActionBoundary, kind);
             }
-            "agent.turn.hidden_only_no_action_hard_failed" => {
+            events::AGENT_TURN_HIDDEN_ONLY_NO_ACTION_HARD_FAILED => {
                 saw_hidden_only_no_action_hard_failed = true;
+                set_hard_stop(&mut analysis, HardStopReason::HiddenOnlyNoAction, kind);
+            }
+            events::AGENT_VALIDATION_REPAIR_HARD_FAILED => {
+                set_hard_stop(&mut analysis, HardStopReason::ValidationRepair, kind);
+            }
+            events::AGENT_VALIDATION_REPAIR_DEPTH_HARD_FAILED => {
+                set_hard_stop(&mut analysis, HardStopReason::ValidationRepairDepth, kind);
+            }
+            events::AGENT_TURN_EMPTY_RESPONSE_HARD_FAILED => {
+                set_hard_stop(&mut analysis, HardStopReason::EmptyResponse, kind);
+            }
+            events::AGENT_INSPECTION_LOOP_HARD_FAILED => {
+                set_hard_stop(&mut analysis, HardStopReason::InspectionLoop, kind);
+            }
+            events::AGENT_RUN_MANUAL_STOP => {
+                analysis.manual_stop.get_or_insert(ManualStop {
+                    reason: value_string(payload, "reason"),
+                    evidence_event: kind.to_string(),
+                });
+            }
+            events::AGENT_INDEPENDENT_VALIDATION_OBSERVED => {
+                analysis.independent_validation = if payload["passed"].as_bool() == Some(true) {
+                    IndependentValidation::Passed
+                } else {
+                    IndependentValidation::Failed
+                };
+            }
+            events::AGENT_STAGE_FIRST_SOURCE_MUTATION => {
+                note_productive_milestone(
+                    &mut analysis.first_source_mutation,
+                    &mut analysis.first_productive_action,
+                    kind,
+                    value_string(payload, "action"),
+                );
+            }
+            events::AGENT_STAGE_FIRST_VALIDATION_PROBE => {
+                note_productive_milestone(
+                    &mut analysis.validation_probe_reached,
+                    &mut analysis.first_productive_action,
+                    kind,
+                    value_string(payload, "command"),
+                );
+            }
+            events::AGENT_VALIDATION_PROBE_OBSERVED => {
+                if payload["success"].as_bool() == Some(true) {
+                    analysis.validation_probe_passed.get_or_insert(Milestone {
+                        evidence_event: kind.to_string(),
+                        detail: value_string(payload, "command"),
+                    });
+                }
             }
             "llm.context_assembly.ledger" => apply_context_ledger(&mut analysis, payload),
             "llm.context_assembly.appended" => apply_context_append(&mut analysis, payload),
@@ -148,9 +349,14 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
             }
             "llm.progress.status" => apply_progress_status(&mut analysis, payload),
             "llm.stream.metrics" => apply_stream_metrics(&mut analysis, payload),
-            "tool.payload.measured" => apply_tool_payload(&mut analysis, payload),
-            "tool.shell_command" => apply_shell_command(&mut analysis, payload),
-            kind if kind.starts_with("tool.") && is_failed_tool_payload(payload) => {
+            events::TOOL_PAYLOAD_MEASURED => apply_tool_payload(&mut analysis, payload),
+            events::TOOL_WRITE_FILE | events::TOOL_EDIT_FILE | events::TOOL_PATCH_FILE => {
+                apply_legacy_mutation(&mut analysis, kind, payload);
+            }
+            events::TOOL_SHELL_COMMAND => apply_shell_command(&mut analysis, kind, payload),
+            kind if kind.starts_with(events::TOOL_CALL_KIND_PREFIX)
+                && is_failed_tool_payload(payload) =>
+            {
                 analysis.failed_tool_events += 1;
             }
             _ => {}
@@ -168,7 +374,66 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
         saw_action_boundary_hard_failed,
         saw_hidden_only_no_action_hard_failed,
     );
+    analysis.harness_completion = classify_harness_completion(&analysis);
     Ok(analysis)
+}
+
+/// Record a hard-stop, first occurrence wins.
+fn set_hard_stop(analysis: &mut TraceAnalysis, reason: HardStopReason, kind: &str) {
+    analysis.hard_stop.get_or_insert(HardStop {
+        reason,
+        evidence_event: kind.to_string(),
+    });
+}
+
+/// Record a canonical milestone (source mutation or validation-probe-reach)
+/// and, on its first occurrence anywhere, also seed the overall
+/// first-productive-action milestone. First occurrence wins for both.
+fn note_productive_milestone(
+    slot: &mut Option<Milestone>,
+    productive_action: &mut Option<Milestone>,
+    kind: &str,
+    detail: Option<String>,
+) {
+    if slot.is_some() {
+        return;
+    }
+    let milestone = Milestone {
+        evidence_event: kind.to_string(),
+        detail,
+    };
+    productive_action.get_or_insert_with(|| milestone.clone());
+    *slot = Some(milestone);
+}
+
+/// Legacy adapter: when the canonical `agent.stage.first_source_mutation`
+/// event is absent from an older trace, infer first source mutation from the
+/// first observed file-mutating tool call instead.
+fn apply_legacy_mutation(analysis: &mut TraceAnalysis, kind: &str, payload: &Value) {
+    if analysis.first_source_mutation.is_none() {
+        note_productive_milestone(
+            &mut analysis.first_source_mutation,
+            &mut analysis.first_productive_action,
+            kind,
+            value_string(payload, "path"),
+        );
+    }
+}
+
+/// Finalize [`HarnessCompletion`] from state already collected during the
+/// scan: failure and stop signals take precedence over a clean finish.
+fn classify_harness_completion(analysis: &TraceAnalysis) -> HarnessCompletion {
+    if analysis.status == "failed" {
+        HarnessCompletion::Failed
+    } else if analysis.manual_stop.is_some() {
+        HarnessCompletion::ManuallyStopped
+    } else if analysis.hard_stop.is_some() {
+        HarnessCompletion::HardStopped
+    } else if analysis.status == "finished" {
+        HarnessCompletion::Finished
+    } else {
+        HarnessCompletion::Unfinished
+    }
 }
 
 /// Deterministically classify how a run ended from already-collected
@@ -346,14 +611,45 @@ fn apply_stream_metrics(analysis: &mut TraceAnalysis, payload: &Value) {
     }
 }
 
-fn apply_shell_command(analysis: &mut TraceAnalysis, payload: &Value) {
+fn apply_shell_command(analysis: &mut TraceAnalysis, kind: &str, payload: &Value) {
     if payload["validation_probe"].as_bool().unwrap_or(false) {
+        let command = payload["command"].as_str().unwrap_or_default().to_string();
+        let status = payload["status"].as_i64();
+        let success = payload["success"].as_bool();
         analysis.validation_commands.push(ValidationCommandSummary {
-            command: payload["command"].as_str().unwrap_or_default().to_string(),
-            status: payload["status"].as_i64(),
-            success: payload["success"].as_bool(),
+            command: command.clone(),
+            status,
+            success,
             repair_required: !payload["repair_required"].is_null(),
         });
+
+        // Legacy adapter: older traces may lack
+        // `agent.stage.first_validation_probe` / `agent.validation_probe.observed`.
+        // Infer the same milestones from the raw shell-command payload.
+        note_productive_milestone(
+            &mut analysis.validation_probe_reached,
+            &mut analysis.first_productive_action,
+            kind,
+            Some(command.clone()),
+        );
+        if success == Some(true) {
+            analysis.validation_probe_passed.get_or_insert(Milestone {
+                evidence_event: kind.to_string(),
+                detail: Some(command.clone()),
+            });
+        }
+
+        // POSIX convention: exit 127 means "command not found" — the
+        // validation environment itself was invalid, not the harness or the
+        // generated artifact.
+        if success == Some(false) && status == Some(127) {
+            analysis.environment_stop.get_or_insert(EnvironmentStop {
+                command,
+                status: 127,
+                evidence_event: kind.to_string(),
+            });
+            analysis.environment_validity = EnvironmentValidity::Invalid;
+        }
     }
     if is_failed_tool_payload(payload) {
         analysis.failed_tool_events += 1;
@@ -539,6 +835,153 @@ mod tests {
     fn analyzer_output_is_deterministic_across_invocations() {
         let first = analyze_trace(fixture_path("validation_repair_pass.jsonl")).unwrap();
         let second = analyze_trace(fixture_path("validation_repair_pass.jsonl")).unwrap();
+
+        assert_eq!(
+            serde_json::to_string_pretty(&first).unwrap(),
+            serde_json::to_string_pretty(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn populates_canonical_milestones_for_a_passing_run() {
+        let analysis = analyze_trace(fixture_path("pass.jsonl")).unwrap();
+
+        let first_tool_call = analysis.first_tool_call.expect("first tool call recorded");
+        assert_eq!(first_tool_call.evidence_event, "tool.write_file");
+
+        let mutation = analysis
+            .first_source_mutation
+            .clone()
+            .expect("first source mutation recorded");
+        assert_eq!(mutation.evidence_event, "tool.write_file");
+
+        let probe_reached = analysis
+            .validation_probe_reached
+            .expect("validation probe reach recorded");
+        assert_eq!(probe_reached.evidence_event, "tool.shell_command");
+
+        let probe_passed = analysis
+            .validation_probe_passed
+            .expect("validation probe pass recorded");
+        assert_eq!(probe_passed.evidence_event, "tool.shell_command");
+
+        // The first productive action is whichever of mutation/probe-reach
+        // happened first in trace order; here that is the source mutation.
+        assert_eq!(
+            analysis.first_productive_action,
+            analysis.first_source_mutation
+        );
+
+        assert_eq!(analysis.harness_completion, HarnessCompletion::Finished);
+        assert_eq!(
+            analysis.independent_validation,
+            IndependentValidation::Unknown
+        );
+        assert_eq!(analysis.environment_validity, EnvironmentValidity::Unknown);
+        assert!(analysis.hard_stop.is_none());
+        assert!(analysis.manual_stop.is_none());
+        assert!(analysis.environment_stop.is_none());
+    }
+
+    #[test]
+    fn classifies_hard_stop_reason_for_action_boundary() {
+        let analysis = analyze_trace(fixture_path("action_boundary_stop.jsonl")).unwrap();
+
+        let hard_stop = analysis.hard_stop.expect("hard stop recorded");
+        assert_eq!(hard_stop.reason, HardStopReason::ActionBoundary);
+        assert_eq!(hard_stop.reason.as_str(), "action_boundary");
+        assert_eq!(
+            hard_stop.evidence_event,
+            "agent.action_boundary.hard_failed"
+        );
+        assert_eq!(analysis.harness_completion, HarnessCompletion::HardStopped);
+        assert!(analysis.first_source_mutation.is_none());
+        assert!(analysis.validation_probe_reached.is_none());
+    }
+
+    #[test]
+    fn classifies_hard_stop_reason_for_hidden_only_no_action() {
+        let analysis = analyze_trace(fixture_path("hidden_only_no_action_stop.jsonl")).unwrap();
+
+        let hard_stop = analysis.hard_stop.expect("hard stop recorded");
+        assert_eq!(hard_stop.reason, HardStopReason::HiddenOnlyNoAction);
+        assert_eq!(hard_stop.reason.as_str(), "hidden_only_no_action");
+        assert_eq!(analysis.harness_completion, HarnessCompletion::HardStopped);
+    }
+
+    #[test]
+    fn classifies_an_environment_stop_from_exit_127() {
+        let analysis = analyze_trace(fixture_path("environment_invalid_validation.jsonl")).unwrap();
+
+        let environment_stop = analysis
+            .environment_stop
+            .expect("environment stop recorded");
+        assert_eq!(environment_stop.command, "rspec spec");
+        assert_eq!(environment_stop.status, 127);
+        assert_eq!(analysis.environment_validity, EnvironmentValidity::Invalid);
+        // The harness itself still finished cleanly; only the validation
+        // environment was invalid.
+        assert_eq!(analysis.harness_completion, HarnessCompletion::Finished);
+        assert!(analysis.hard_stop.is_none());
+    }
+
+    #[test]
+    fn classifies_an_explicit_manual_stop() {
+        let analysis = analyze_trace(fixture_path("manual_stop.jsonl")).unwrap();
+
+        let manual_stop = analysis.manual_stop.expect("manual stop recorded");
+        assert_eq!(
+            manual_stop.reason.as_deref(),
+            Some("operator requested stop")
+        );
+        assert_eq!(manual_stop.evidence_event, "agent.run.manual_stop");
+        assert_eq!(
+            analysis.harness_completion,
+            HarnessCompletion::ManuallyStopped
+        );
+        assert!(analysis.first_source_mutation.is_some());
+    }
+
+    #[test]
+    fn legacy_trace_with_only_a_terminal_summary_leaves_evidence_explicitly_absent() {
+        let analysis = analyze_trace(fixture_path("legacy_missing_evidence.jsonl")).unwrap();
+
+        assert!(analysis.first_tool_call.is_none());
+        assert!(analysis.first_productive_action.is_none());
+        assert!(analysis.first_source_mutation.is_none());
+        assert!(analysis.validation_probe_reached.is_none());
+        assert!(analysis.validation_probe_passed.is_none());
+        assert!(analysis.hard_stop.is_none());
+        assert!(analysis.environment_stop.is_none());
+        assert!(analysis.manual_stop.is_none());
+
+        // The harness finished (`DONE`), but that is not independent
+        // validation evidence: it must stay Unknown, not be inferred as a
+        // pass.
+        assert_eq!(analysis.harness_completion, HarnessCompletion::Finished);
+        assert_eq!(analysis.outcome, RunOutcome::Finished);
+        assert_eq!(
+            analysis.independent_validation,
+            IndependentValidation::Unknown
+        );
+        assert_eq!(analysis.environment_validity, EnvironmentValidity::Unknown);
+    }
+
+    #[test]
+    fn explicit_independent_validation_event_sets_the_typed_fact() {
+        let analysis =
+            analyze_trace(fixture_path("independent_validation_observed.jsonl")).unwrap();
+
+        assert_eq!(
+            analysis.independent_validation,
+            IndependentValidation::Passed
+        );
+    }
+
+    #[test]
+    fn canonical_measurement_fields_round_trip_deterministically() {
+        let first = analyze_trace(fixture_path("pass.jsonl")).unwrap();
+        let second = analyze_trace(fixture_path("pass.jsonl")).unwrap();
 
         assert_eq!(
             serde_json::to_string_pretty(&first).unwrap(),

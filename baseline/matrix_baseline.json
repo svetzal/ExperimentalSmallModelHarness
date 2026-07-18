@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "description": "Slice 0 preserved architectural baseline: cross-model coding demo matrix (screening evidence, one replicate per cell).",
   "evidence_class": "screening",
   "replicates_per_cell": 1,
@@ -28,6 +28,278 @@
       "classification": "environment_invalid_validation",
       "task": "ruby",
       "detail": "Original Ruby validation environment was invalid though harness and generated code were not; independent revalidation required."
+    }
+  ],
+  "cells": [
+    {
+      "model": "gemma4:31b-mlx",
+      "model_slug": "gemma4-31b-mlx",
+      "task": "rust-binary-search-tree",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "gemma4:31b-mlx",
+      "model_slug": "gemma4-31b-mlx",
+      "task": "python-expression-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "gemma4:31b-mlx",
+      "model_slug": "gemma4-31b-mlx",
+      "task": "go-shortest-path",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "gemma4:31b-mlx",
+      "model_slug": "gemma4-31b-mlx",
+      "task": "javascript-topological-sort",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "gemma4:31b-mlx",
+      "model_slug": "gemma4-31b-mlx",
+      "task": "ruby-ini-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "corrected"
+    },
+    {
+      "model": "gemma4:latest",
+      "model_slug": "gemma4-latest",
+      "task": "rust-binary-search-tree",
+      "harness_completion": "hard_stopped",
+      "hard_stop": "hidden_only_no_action",
+      "independent_validation": "failed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "gemma4:latest",
+      "model_slug": "gemma4-latest",
+      "task": "python-expression-parser",
+      "harness_completion": "hard_stopped",
+      "hard_stop": "hidden_only_no_action",
+      "independent_validation": "failed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "gemma4:latest",
+      "model_slug": "gemma4-latest",
+      "task": "go-shortest-path",
+      "harness_completion": "hard_stopped",
+      "hard_stop": "hidden_only_no_action",
+      "independent_validation": "failed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "gemma4:latest",
+      "model_slug": "gemma4-latest",
+      "task": "javascript-topological-sort",
+      "harness_completion": "hard_stopped",
+      "hard_stop": "hidden_only_no_action",
+      "independent_validation": "failed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "gemma4:latest",
+      "model_slug": "gemma4-latest",
+      "task": "ruby-ini-parser",
+      "harness_completion": "hard_stopped",
+      "hard_stop": "hidden_only_no_action",
+      "independent_validation": "failed",
+      "environment_validity": "corrected"
+    },
+    {
+      "model": "qwen3.6:35b-a3b-coding-nvfp4",
+      "model_slug": "qwen36-35b-nvfp4",
+      "task": "rust-binary-search-tree",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:35b-a3b-coding-nvfp4",
+      "model_slug": "qwen36-35b-nvfp4",
+      "task": "python-expression-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:35b-a3b-coding-nvfp4",
+      "model_slug": "qwen36-35b-nvfp4",
+      "task": "go-shortest-path",
+      "harness_completion": "hard_stopped",
+      "hard_stop": "action_boundary",
+      "independent_validation": "failed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:35b-a3b-coding-nvfp4",
+      "model_slug": "qwen36-35b-nvfp4",
+      "task": "javascript-topological-sort",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:35b-a3b-coding-nvfp4",
+      "model_slug": "qwen36-35b-nvfp4",
+      "task": "ruby-ini-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "corrected"
+    },
+    {
+      "model": "qwen3.6:27b-coding-bf16",
+      "model_slug": "qwen36-27b-bf16",
+      "task": "rust-binary-search-tree",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:27b-coding-bf16",
+      "model_slug": "qwen36-27b-bf16",
+      "task": "python-expression-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:27b-coding-bf16",
+      "model_slug": "qwen36-27b-bf16",
+      "task": "go-shortest-path",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:27b-coding-bf16",
+      "model_slug": "qwen36-27b-bf16",
+      "task": "javascript-topological-sort",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:27b-coding-bf16",
+      "model_slug": "qwen36-27b-bf16",
+      "task": "ruby-ini-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "corrected"
+    },
+    {
+      "model": "qwen3.6:27b-coding-mxfp8",
+      "model_slug": "qwen36-27b-mxfp8",
+      "task": "rust-binary-search-tree",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:27b-coding-mxfp8",
+      "model_slug": "qwen36-27b-mxfp8",
+      "task": "python-expression-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:27b-coding-mxfp8",
+      "model_slug": "qwen36-27b-mxfp8",
+      "task": "go-shortest-path",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:27b-coding-mxfp8",
+      "model_slug": "qwen36-27b-mxfp8",
+      "task": "javascript-topological-sort",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.6:27b-coding-mxfp8",
+      "model_slug": "qwen36-27b-mxfp8",
+      "task": "ruby-ini-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "corrected"
+    },
+    {
+      "model": "qwen3.5:122b",
+      "model_slug": "qwen35-122b",
+      "task": "rust-binary-search-tree",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.5:122b",
+      "model_slug": "qwen35-122b",
+      "task": "python-expression-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.5:122b",
+      "model_slug": "qwen35-122b",
+      "task": "go-shortest-path",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.5:122b",
+      "model_slug": "qwen35-122b",
+      "task": "javascript-topological-sort",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "valid"
+    },
+    {
+      "model": "qwen3.5:122b",
+      "model_slug": "qwen35-122b",
+      "task": "ruby-ini-parser",
+      "harness_completion": "finished",
+      "hard_stop": null,
+      "independent_validation": "passed",
+      "environment_validity": "corrected"
     }
   ]
 }
