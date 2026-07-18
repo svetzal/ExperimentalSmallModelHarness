@@ -528,6 +528,45 @@ default or be widened again. Before any cap policy decision, extend both the
 compare action exit, reprobe, exact success, stop class, and runtime
 distributions. Full evidence is under Experiments/Generation29/.
 
+### Slice 9: Test A Genuine 16K Generation Envelope
+
+- Hold the exact text packet, bounded diagnostic, model, prompt, transcript,
+  tools, repair policy, and all other budgets fixed.
+- Raise `num_predict` and the thinking-only threshold together from 8,192 to
+  16,384; the coupled change is necessary to expose a genuine doubled per-call
+  envelope.
+- Measure action exit and fresh reprobe separately from assertion, terminal,
+  and independent exact-file success.
+- Exclude the instrumentation smoke from the fixed efficacy count and report
+  runtime, cumulative generation, write denials, and stop classes.
+
+Exit condition: one valid smoke and a fixed n=3 cell reach natural harness
+terminal states; at least one fixed-cell exact success is required to support
+further 16,384 replication, while 0/3 rejects further widening for this packet.
+No permanent policy change is made at n=3.
+
+**Slice 9 status: complete; exact-efficacy threshold refuted (2026-07-18).**
+Generation30 reused Generation29's text contract, task, seed, expected bytes,
+model, diagnostic, and runtime settings, changing only the coupled generation
+envelope from 8,192 to 16,384. Post-failure action and fresh second probes
+improved from 2/3 to 3/3, and every run advanced the first differing byte.
+
+The registered fixed cell nevertheless produced 0/3 assertion passes, terminal
+DONE acceptances, and independent exact-file successes. Two runs naturally
+hard-stopped in validation repair; one exhausted validation-repair call depth
+after writing literal `\n` sequences. Runtime was 994-2,501 seconds, observed
+output was 56,599-132,478 tokens, and denied writes reached six. Context stayed
+green, with no manual, environment, or shell-tool stops.
+
+The excluded smoke did complete exactly after seven probes and eight successful
+writes in 1,791 seconds. This proves reachability at 16,384 but not repeatable
+efficacy. Under the registered rule, 0/3 rejects another widening step and
+removes both 8,192 and 16,384 from default-policy consideration on action-exit
+evidence alone. The next slice should classify why bounded exact-file feedback
+still produces structurally incorrect full-file rewrites, then test one repair
+representation or measurement intervention rather than another cap increase.
+Full evidence is under Experiments/Generation30/.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`
