@@ -404,6 +404,54 @@ exact-file passes. This is a Replicated Cell Signal for the narrow benchmark,
 not proof of broad cross-domain capability. Full evidence is under
 Experiments/Generation26/.
 
+### Slice 6: Eliminate Residual Default-Profile Coupling
+
+- Carry the resolved profile through live orchestration state instead of
+  reselecting a coding default inside action, inspection, mutation,
+  validation-family, or repair decisions.
+- Rename public run entry points so their names do not imply a coding-only
+  agent.
+- Guard production orchestration against default-profile reselection and
+  coding-profile/tool identifiers.
+- Replicate the text-transform profile on a structurally distinct task while
+  holding model and policy fixed.
+
+Exit condition: deterministic coding parity remains unchanged, production
+orchestration has one resolved profile authority, and a pre-registered n=3
+within-domain replication is classified without adapting policy from a single
+trace.
+
+**Slice 6 status: complete with a refuting replication (2026-07-18).** Commit
+76ea2a3 renamed the live runner to profile-neutral entry points and carries the
+resolved `DomainProfile` through action intent, inspection signatures,
+meaningful-mutation classification, validation-family labels, and repair
+guidance. Default profile selection remains only at explicit legacy/default
+construction boundaries. A structural guard strips tests and rejects
+`default_profile(`, `profile::coding`, `run_coding_agent`, and `coding_tools`
+from production `agent.rs`; a focused test demonstrates that a Markdown write
+invalidates text-transform evidence but not coding evidence.
+
+Deterministic parity passed with 200 unit/integration tests and seven
+structural tests, unchanged coding and text snapshots, a stable 30/24/6 matrix
+summary, byte-stable preserved trace analysis, and unchanged Cargo manifests.
+Commit 7c21a02 then added canonical analyzer reasons for already-emitted
+thinking-only and no-content stream hard-failure events after the first
+Generation27 smoke exposed that measurement gap.
+
+Generation27 changed only the text packet and exact assertion bytes. Its valid
+fixed n=3 cell reached first tool call, artifact mutation, and the declared
+assertion in 3/3 runs, but passed the assertion, received terminal DONE, and
+matched independent exact-file validation in 0/3. All three runs naturally
+ended at the classified thinking-only-stream cap with green context pressure
+and no manual, environment, or shell-tool event. This refutes the predicted
+2/3 success threshold and supports dependence on Generation26's simpler task
+shape for this packet. It does not isolate task complexity from a second live
+explanation: `file_text_equals` reported the expected byte count but no bounded
+mismatch location or excerpt, leaving exact repair under-informed. Policy and
+prompt remain unchanged. The next measurement is a deterministic bounded
+mismatch diagnostic followed by the same fixed cell under the adaptation
+embargo. Full evidence is under Experiments/Generation27/.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`
