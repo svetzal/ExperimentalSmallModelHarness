@@ -219,6 +219,38 @@ matrix-specific classification code remains necessary for reproduction.
 Exit condition: existing demos resolve to contracts equivalent to current
 behavior, proven by deterministic contract snapshots.
 
+**Slice 2 status: complete (2026-07-17).** Per-run inputs now flow through one
+typed, resolved `ResolvedRunContract` (`src/contract.rs`, `schema_version`
+`run_contract.v1`) carrying guidance, read/write `Scope`, mutable artifact
+classes (`doc-exempt-v1`, a descriptive snapshot of
+`path_requires_validation_after_write`), evidence invalidation, ordered
+`Probe`s (id + command, never re-sorted), the budgets the runtime already uses,
+terminal `done`/`fail` tokens, an `adapter_kind`, and path-free
+`defaults_provenance`. Two adapters resolve into that single type: a `// LEGACY`
+coding adapter that wraps the moved shell-fence scraper
+(`requested_validation_commands`) and synthesizes stable slugified probe IDs,
+and an explicit adapter that parses a declared-probe JSON contract and bypasses
+scraping. Explicit contracts are validated before any LLM/tool effect
+(duplicate/empty probe IDs, failure-masking or executor-unrecognized commands
+cross-checked against `tools::is_validation_probe`, root-escaping scopes,
+invalid terminal tokens, inconsistent artifact/invalidation references,
+malformed budgets), each with an actionable error.
+`run_coding_agent_with_gateway` makes exactly one `resolve_contract` call before
+`ToolScope::new` (kept unrestricted -- scope is descriptive data only) or any
+gateway call, feeds `contract.probes` into the ledger and `run.started` with
+byte-identical ordering, and traces both the supplied and resolved contracts via
+the additive `agent.contract.supplied`/`agent.contract.resolved` events
+(`src/runtime_events.rs`), consumed as additive `Option` fields on
+`TraceAnalysis`. A no-provider `resolve-contract` CLI subcommand doubles as the
+snapshot generator/check. `cargo run -- resolve-contract --goal
+fixtures/contracts/legacy/<task>/task.md` reproduces each committed snapshot in
+`fixtures/contracts/snapshots/*.json` byte-for-byte across repeated invocations
+(Ruby resolves to empty probes, exactly as today), an explicit cargo contract
+declaring the same probes resolves to the same normalized core as its legacy
+equivalent, `cargo run -- summarize-matrix` still reports `30`/`24`/`6` parity,
+and `cargo run -- analyze-trace fixtures/traces/*.jsonl` is unchanged -- the exit
+condition above, proven without running any model.
+
 ### Slice 3: Extract Coding Policy
 
 - Move Rust and Cargo guidance out of the core system prompt.

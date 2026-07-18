@@ -1,0 +1,73 @@
+{
+  "schema_version": "run_contract.v1",
+  "guidance": "# Go Weighted Shortest Path\n\nComplete the directed weighted graph implementation in `graph.go`.\n\n## Contract\n\n- `AddEdge(from, to, weight)` adds a directed edge.\n- `AddEdge` returns an error for a negative weight and must not add that edge.\n- `ShortestPath(start, goal)` returns the minimum-total-weight path, its cost,\n  and `true` when the goal is reachable.\n- The returned path includes both `start` and `goal`.\n- When `start == goal`, return `[start]`, cost `0`, and `true`, even for a node\n  with no edges.\n- For an unreachable goal, return `nil`, cost `0`, and `false`.\n- If equal-cost paths exist, return the lexicographically smaller complete path.\n- Do not mutate the graph while searching.\n- Use only the Go standard library.\n\nOnly change `graph.go`. Do not remove or weaken tests.\n\n## Validation\n\nRun from the project root:\n\n```sh\ngo test ./...\n```\n\nReply `DONE` only after validation passes. Reply `FAIL` only if blocked.\n",
+  "read_scope": {
+    "kind": "unrestricted"
+  },
+  "write_scope": {
+    "kind": "unrestricted"
+  },
+  "mutable_artifact_classes": {
+    "classes": [
+      {
+        "name": "documentation",
+        "exempt_file_names": [
+          ".gitignore",
+          ".ignore",
+          "readme",
+          "license",
+          "licence",
+          "changelog",
+          "contributors",
+          "authors"
+        ],
+        "exempt_extensions": [
+          "md",
+          "markdown",
+          "txt",
+          "rst",
+          "adoc"
+        ]
+      }
+    ]
+  },
+  "evidence_invalidation": {
+    "invalidated_by_source_mutation": true,
+    "generation_gated_freshness": true,
+    "tracked_artifact_classes": [
+      "documentation"
+    ]
+  },
+  "probes": [
+    {
+      "id": "go-test",
+      "command": "go test ./..."
+    }
+  ],
+  "budgets": {
+    "max_iterations": 10,
+    "max_tool_iterations": 50,
+    "context_window_tokens": null,
+    "max_thinking_only_tokens": 4096,
+    "repair_exit_thinking_tokens": 16384
+  },
+  "terminal": {
+    "done_token": "DONE",
+    "fail_token": "FAIL"
+  },
+  "adapter_kind": "legacy_coding",
+  "defaults_provenance": {
+    "declared_fields": [
+      "guidance",
+      "probes"
+    ],
+    "defaulted_fields": [
+      "read_scope",
+      "write_scope",
+      "mutable_artifact_classes",
+      "evidence_invalidation",
+      "terminal",
+      "budgets"
+    ]
+  }
+}

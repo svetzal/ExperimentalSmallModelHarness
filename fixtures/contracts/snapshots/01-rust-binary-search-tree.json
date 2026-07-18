@@ -1,0 +1,77 @@
+{
+  "schema_version": "run_contract.v1",
+  "guidance": "# Rust Binary Search Tree\n\nComplete the integer binary search tree implementation in `src/lib.rs`.\n\n## Contract\n\n- `BinarySearchTree::new` creates an empty tree.\n- `insert` adds a value and returns `true`; duplicate values are not added and\n  return `false`.\n- `contains` reports whether a value is present.\n- `len` and `is_empty` reflect the number of distinct values.\n- `in_order` returns all values in ascending order.\n- `height` returns `0` for an empty tree and otherwise counts nodes along the\n  longest root-to-leaf path.\n- Use an actual linked binary tree. Do not replace the representation with a\n  sorted vector, set, or map.\n\nOnly change `src/lib.rs`. Do not remove or weaken tests and do not add external\ndependencies.\n\n## Validation\n\nRun both commands from the project root:\n\n```sh\ncargo fmt --check\ncargo test\n```\n\nReply `DONE` only after both commands pass. Reply `FAIL` only if blocked.\n",
+  "read_scope": {
+    "kind": "unrestricted"
+  },
+  "write_scope": {
+    "kind": "unrestricted"
+  },
+  "mutable_artifact_classes": {
+    "classes": [
+      {
+        "name": "documentation",
+        "exempt_file_names": [
+          ".gitignore",
+          ".ignore",
+          "readme",
+          "license",
+          "licence",
+          "changelog",
+          "contributors",
+          "authors"
+        ],
+        "exempt_extensions": [
+          "md",
+          "markdown",
+          "txt",
+          "rst",
+          "adoc"
+        ]
+      }
+    ]
+  },
+  "evidence_invalidation": {
+    "invalidated_by_source_mutation": true,
+    "generation_gated_freshness": true,
+    "tracked_artifact_classes": [
+      "documentation"
+    ]
+  },
+  "probes": [
+    {
+      "id": "cargo-fmt-check",
+      "command": "cargo fmt --check"
+    },
+    {
+      "id": "cargo-test",
+      "command": "cargo test"
+    }
+  ],
+  "budgets": {
+    "max_iterations": 10,
+    "max_tool_iterations": 50,
+    "context_window_tokens": null,
+    "max_thinking_only_tokens": 4096,
+    "repair_exit_thinking_tokens": 16384
+  },
+  "terminal": {
+    "done_token": "DONE",
+    "fail_token": "FAIL"
+  },
+  "adapter_kind": "legacy_coding",
+  "defaults_provenance": {
+    "declared_fields": [
+      "guidance",
+      "probes"
+    ],
+    "defaulted_fields": [
+      "read_scope",
+      "write_scope",
+      "mutable_artifact_classes",
+      "evidence_invalidation",
+      "terminal",
+      "budgets"
+    ]
+  }
+}

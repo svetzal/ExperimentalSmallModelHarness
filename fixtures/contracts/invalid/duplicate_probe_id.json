@@ -1,0 +1,7 @@
+{
+  "guidance": "Two probes declare the same id.",
+  "probes": [
+    { "id": "test", "command": "cargo test" },
+    { "id": "test", "command": "cargo build" }
+  ]
+}

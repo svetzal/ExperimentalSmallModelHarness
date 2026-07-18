@@ -1,0 +1,11 @@
+{
+  "guidance": "Zero max_iterations is not a usable budget.",
+  "probes": [],
+  "budgets": {
+    "max_iterations": 0,
+    "max_tool_iterations": 50,
+    "context_window_tokens": null,
+    "max_thinking_only_tokens": 4096,
+    "repair_exit_thinking_tokens": 16384
+  }
+}

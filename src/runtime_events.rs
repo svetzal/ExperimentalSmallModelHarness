@@ -123,3 +123,19 @@ pub const AGENT_RUN_MANUAL_STOP: &str = "agent.run.manual_stop";
 /// [`crate::trace_analysis::IndependentValidation`] to a known value; a
 /// `run.finished`/`DONE` completion never does.
 pub const AGENT_INDEPENDENT_VALIDATION_OBSERVED: &str = "agent.independent_validation.observed";
+
+/// Emitted once per run, immediately after contract resolution and before
+/// `ToolScope`/tool construction or any LLM call. Describes what was
+/// *supplied* (path-free: which adapter, and non-content metadata like a
+/// goal path or explicit-contract source path) — not the resolved contract
+/// itself; see [`AGENT_CONTRACT_RESOLVED`]. Payload fields: `adapter_kind`,
+/// `supplied` (a [`crate::contract::SuppliedContract`]).
+pub const AGENT_CONTRACT_SUPPLIED: &str = "agent.contract.supplied";
+
+/// Emitted once per run, alongside [`AGENT_CONTRACT_SUPPLIED`], carrying the
+/// full resolved [`crate::contract::ResolvedRunContract`] — schema version,
+/// guidance, scope, artifact classes, evidence invalidation, probes,
+/// budgets, terminal tokens, adapter kind, and defaults provenance. Payload
+/// fields: `schema_version`, `adapter_kind`, `resolved` (a
+/// [`crate::contract::ResolvedRunContract`]).
+pub const AGENT_CONTRACT_RESOLVED: &str = "agent.contract.resolved";

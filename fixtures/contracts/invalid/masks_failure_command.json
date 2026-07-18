@@ -1,0 +1,6 @@
+{
+  "guidance": "A probe command masks failure with `|| true`.",
+  "probes": [
+    { "id": "cargo-build", "command": "cargo build || true" }
+  ]
+}

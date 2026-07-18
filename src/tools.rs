@@ -2485,7 +2485,11 @@ fn split_heredoc_start(line: &str) -> Option<(&str, String)> {
     Some((prefix, marker))
 }
 
-fn is_validation_probe(command: &str) -> bool {
+/// Whether the executor recognizes `command` as a validation probe. Exposed
+/// `pub(crate)` so `contract`'s explicit-contract validator can cross-check
+/// declared probe commands without duplicating this list (see
+/// `GENERALIZATION_PLAN.md` Slice 2).
+pub(crate) fn is_validation_probe(command: &str) -> bool {
     let lowered = command_detection_text(command).to_ascii_lowercase();
     let trimmed = lowered.trim();
     if trimmed.starts_with("echo ")

@@ -1,0 +1,6 @@
+{
+  "guidance": "Fix the Ruby INI parser so it round-trips comments and section ordering.\n\nRun from the project root:\n\n```sh\nmake test\n```\n\nReply DONE only after validation passes. Reply FAIL only if blocked.",
+  "probes": [
+    { "id": "make-test", "command": "make test" }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "guidance": "The done token is empty.",
+  "probes": [],
+  "terminal": {
+    "done_token": "",
+    "fail_token": "FAIL"
+  }
+}

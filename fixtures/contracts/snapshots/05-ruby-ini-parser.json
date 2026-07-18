@@ -1,0 +1,68 @@
+{
+  "schema_version": "run_contract.v1",
+  "guidance": "# Ruby INI Parser\n\nImplement `parse_ini(text)` in `ini_parser.rb`.\n\n## Contract\n\n- Return a nested hash mapping section names to key/value hashes.\n- Store keys before the first section under the section name `default`.\n- Ignore blank lines and full-line comments beginning with `#` or `;` after\n  optional leading whitespace.\n- Parse section headers such as `[database]`, trimming surrounding whitespace\n  inside the brackets.\n- Parse `key = value` pairs, trimming whitespace around the key and value.\n- Values remain strings; no numeric or boolean coercion is required.\n- A repeated key in the same section uses the last value.\n- Raise `IniParseError` for an empty section name, an empty key, malformed\n  section header, or any non-comment line without `=`.\n- Error messages must include the one-based source line number.\n- Use only the Ruby standard library.\n\nOnly change `ini_parser.rb`. Do not remove or weaken tests.\n\n## Validation\n\nRun from the project root:\n\n```sh\nmake test\n```\n\nReply `DONE` only after validation passes. Reply `FAIL` only if blocked.\n",
+  "read_scope": {
+    "kind": "unrestricted"
+  },
+  "write_scope": {
+    "kind": "unrestricted"
+  },
+  "mutable_artifact_classes": {
+    "classes": [
+      {
+        "name": "documentation",
+        "exempt_file_names": [
+          ".gitignore",
+          ".ignore",
+          "readme",
+          "license",
+          "licence",
+          "changelog",
+          "contributors",
+          "authors"
+        ],
+        "exempt_extensions": [
+          "md",
+          "markdown",
+          "txt",
+          "rst",
+          "adoc"
+        ]
+      }
+    ]
+  },
+  "evidence_invalidation": {
+    "invalidated_by_source_mutation": true,
+    "generation_gated_freshness": true,
+    "tracked_artifact_classes": [
+      "documentation"
+    ]
+  },
+  "probes": [],
+  "budgets": {
+    "max_iterations": 10,
+    "max_tool_iterations": 50,
+    "context_window_tokens": null,
+    "max_thinking_only_tokens": 4096,
+    "repair_exit_thinking_tokens": 16384
+  },
+  "terminal": {
+    "done_token": "DONE",
+    "fail_token": "FAIL"
+  },
+  "adapter_kind": "legacy_coding",
+  "defaults_provenance": {
+    "declared_fields": [
+      "guidance",
+      "probes"
+    ],
+    "defaulted_fields": [
+      "read_scope",
+      "write_scope",
+      "mutable_artifact_classes",
+      "evidence_invalidation",
+      "terminal",
+      "budgets"
+    ]
+  }
+}

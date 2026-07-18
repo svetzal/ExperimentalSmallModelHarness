@@ -1,0 +1,6 @@
+{
+  "guidance": "A probe command the executor will never recognize as a validation probe.",
+  "probes": [
+    { "id": "echo-hello", "command": "echo hello" }
+  ]
+}

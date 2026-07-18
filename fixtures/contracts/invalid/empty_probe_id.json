@@ -1,0 +1,6 @@
+{
+  "guidance": "A probe declares an empty id.",
+  "probes": [
+    { "id": "", "command": "cargo test" }
+  ]
+}

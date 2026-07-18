@@ -3,8 +3,9 @@ use crate::agent::{
     default_max_thinking_only_tokens, default_repair_exit_thinking_tokens, run_coding_agent,
 };
 use crate::baseline::{load_matrix_baseline, summarize_matrix};
+use crate::contract::{Budgets, ContractSource, resolve_contract};
 use crate::trace_analysis::analyze_trace;
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -85,6 +86,21 @@ enum Command {
     /// counts (harness completion, independent validation, hard-stops,
     /// environment corrections), replacing matrix-specific classification.
     SummarizeMatrix,
+
+    /// Resolve a run contract without starting a provider or gateway:
+    /// either a legacy Markdown `task.md` (via shell-fence scraping) or an
+    /// explicit contract JSON file. Prints the resolved contract. This is
+    /// both the no-provider resolution command and the snapshot
+    /// generator/checker for `fixtures/contracts/snapshots/`.
+    ResolveContract {
+        /// Legacy Markdown goal file. Mutually exclusive with `--contract`.
+        #[arg(long)]
+        goal: Option<PathBuf>,
+
+        /// Explicit contract JSON file. Mutually exclusive with `--goal`.
+        #[arg(long)]
+        contract: Option<PathBuf>,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -149,6 +165,34 @@ pub async fn run() -> Result<()> {
             let baseline = load_matrix_baseline();
             let summary = summarize_matrix(&baseline.cells);
             println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::ResolveContract { goal, contract } => {
+            let source = match (goal, contract) {
+                (Some(_), Some(_)) => {
+                    bail!("--goal and --contract are mutually exclusive; supply exactly one")
+                }
+                (None, None) => {
+                    bail!("one of --goal or --contract is required")
+                }
+                (Some(goal), None) => {
+                    let goal_text = std::fs::read_to_string(&goal)
+                        .with_context(|| format!("reading goal file {}", goal.display()))?;
+                    ContractSource::Legacy {
+                        goal_path: goal.display().to_string(),
+                        goal_text,
+                    }
+                }
+                (None, Some(contract)) => {
+                    let json_text = std::fs::read_to_string(&contract)
+                        .with_context(|| format!("reading contract file {}", contract.display()))?;
+                    ContractSource::Explicit {
+                        source_path: Some(contract.display().to_string()),
+                        json_text,
+                    }
+                }
+            };
+            let resolved = resolve_contract(source, Budgets::default())?;
+            println!("{}", serde_json::to_string_pretty(&resolved)?);
         }
     }
     Ok(())

@@ -1,0 +1,12 @@
+{
+  "guidance": "Evidence invalidation references an artifact class that does not exist.",
+  "probes": [],
+  "mutable_artifact_classes": {
+    "classes": []
+  },
+  "evidence_invalidation": {
+    "invalidated_by_source_mutation": true,
+    "generation_gated_freshness": true,
+    "tracked_artifact_classes": ["documentation"]
+  }
+}

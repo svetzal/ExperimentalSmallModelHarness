@@ -1,0 +1,68 @@
+{
+  "schema_version": "run_contract.v1",
+  "guidance": "# Python Arithmetic Expression Parser\n\nImplement `evaluate(expression)` in `expression_parser.py` as a small recursive\ndescent parser.\n\n## Grammar and behaviour\n\n- Accept integers, whitespace, parentheses, and `+`, `-`, `*`, `/`.\n- Multiplication and division bind more tightly than addition and subtraction.\n- Operators of equal precedence are left-associative.\n- Unary `+` and unary `-` are supported, including before parentheses.\n- Division uses normal Python floating-point division.\n- Return an `int` when the result is mathematically integral; otherwise return a\n  `float`.\n- Raise `ValueError` for empty input, invalid characters, missing operands,\n  mismatched parentheses, or trailing tokens.\n- Let `ZeroDivisionError` propagate for division by zero.\n- Do not use `eval`, `exec`, `ast`, or third-party parsing libraries.\n\nOnly change `expression_parser.py`. Do not remove or weaken tests.\n\n## Validation\n\nRun from the project root:\n\n```sh\nmake test\n```\n\nReply `DONE` only after validation passes. Reply `FAIL` only if blocked.\n",
+  "read_scope": {
+    "kind": "unrestricted"
+  },
+  "write_scope": {
+    "kind": "unrestricted"
+  },
+  "mutable_artifact_classes": {
+    "classes": [
+      {
+        "name": "documentation",
+        "exempt_file_names": [
+          ".gitignore",
+          ".ignore",
+          "readme",
+          "license",
+          "licence",
+          "changelog",
+          "contributors",
+          "authors"
+        ],
+        "exempt_extensions": [
+          "md",
+          "markdown",
+          "txt",
+          "rst",
+          "adoc"
+        ]
+      }
+    ]
+  },
+  "evidence_invalidation": {
+    "invalidated_by_source_mutation": true,
+    "generation_gated_freshness": true,
+    "tracked_artifact_classes": [
+      "documentation"
+    ]
+  },
+  "probes": [],
+  "budgets": {
+    "max_iterations": 10,
+    "max_tool_iterations": 50,
+    "context_window_tokens": null,
+    "max_thinking_only_tokens": 4096,
+    "repair_exit_thinking_tokens": 16384
+  },
+  "terminal": {
+    "done_token": "DONE",
+    "fail_token": "FAIL"
+  },
+  "adapter_kind": "legacy_coding",
+  "defaults_provenance": {
+    "declared_fields": [
+      "guidance",
+      "probes"
+    ],
+    "defaulted_fields": [
+      "read_scope",
+      "write_scope",
+      "mutable_artifact_classes",
+      "evidence_invalidation",
+      "terminal",
+      "budgets"
+    ]
+  }
+}

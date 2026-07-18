@@ -1,0 +1,5 @@
+{
+  "guidance": "A scope rule attempts to escape the workspace root.",
+  "read_scope": ["../outside"],
+  "probes": []
+}

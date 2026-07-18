@@ -1,0 +1,9 @@
+{
+  "guidance": "Implement the missing binary search tree operations.\n\nRun both commands from the project root:\n\n```sh\ncargo fmt --check\ncargo test\n```\n\nReply DONE only after validation passes. Reply FAIL only if blocked.",
+  "read_scope": ["."],
+  "write_scope": ["."],
+  "probes": [
+    { "id": "cargo-fmt-check", "command": "cargo fmt --check" },
+    { "id": "cargo-test", "command": "cargo test" }
+  ]
+}

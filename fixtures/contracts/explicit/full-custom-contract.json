@@ -1,0 +1,33 @@
+{
+  "guidance": "Implement topological sort for the JavaScript project.\n\nRun from the project root:\n\n```sh\nnpm test\n```\n\nReply DONE only after validation passes. Reply FAIL only if blocked.",
+  "read_scope": ["."],
+  "write_scope": ["src", "test"],
+  "mutable_artifact_classes": {
+    "classes": [
+      {
+        "name": "documentation",
+        "exempt_file_names": [".gitignore", "readme"],
+        "exempt_extensions": ["md", "txt"]
+      }
+    ]
+  },
+  "evidence_invalidation": {
+    "invalidated_by_source_mutation": true,
+    "generation_gated_freshness": true,
+    "tracked_artifact_classes": ["documentation"]
+  },
+  "probes": [
+    { "id": "npm-test", "command": "npm test" }
+  ],
+  "budgets": {
+    "max_iterations": 10,
+    "max_tool_iterations": 50,
+    "context_window_tokens": 131072,
+    "max_thinking_only_tokens": 4096,
+    "repair_exit_thinking_tokens": 16384
+  },
+  "terminal": {
+    "done_token": "DONE",
+    "fail_token": "FAIL"
+  }
+}

@@ -75,6 +75,19 @@ pub struct TraceAnalysis {
     /// Whether the validation environment itself (as opposed to the
     /// harness or the generated artifact) was valid.
     pub environment_validity: EnvironmentValidity,
+
+    // Slice 2 typed run contract (GENERALIZATION_PLAN.md). `None` for
+    // traces recorded before contract resolution was introduced; the
+    // runtime always emits both events together, so all three fields are
+    // populated or all three are `None`.
+    /// `resolved_contract.adapter_kind`, duplicated here as a plain string
+    /// for convenient filtering without deserializing the full contract.
+    pub contract_adapter_kind: Option<String>,
+    /// The full resolved contract from [`crate::runtime_events::AGENT_CONTRACT_RESOLVED`].
+    pub resolved_contract: Option<crate::contract::ResolvedRunContract>,
+    /// What was supplied to resolution, from
+    /// [`crate::runtime_events::AGENT_CONTRACT_SUPPLIED`].
+    pub supplied_contract: Option<crate::contract::SuppliedContract>,
 }
 
 /// The first observed occurrence of a canonical measurement: which event
@@ -317,6 +330,15 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
                 } else {
                     IndependentValidation::Failed
                 };
+            }
+            events::AGENT_CONTRACT_SUPPLIED => {
+                analysis.supplied_contract =
+                    serde_json::from_value(payload["supplied"].clone()).ok();
+            }
+            events::AGENT_CONTRACT_RESOLVED => {
+                analysis.contract_adapter_kind = value_string(payload, "adapter_kind");
+                analysis.resolved_contract =
+                    serde_json::from_value(payload["resolved"].clone()).ok();
             }
             events::AGENT_STAGE_FIRST_SOURCE_MUTATION => {
                 note_productive_milestone(

@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod baseline;
 pub mod cli;
+pub mod contract;
 pub mod provenance;
 pub mod runtime_events;
 pub mod tools;

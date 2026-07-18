@@ -206,7 +206,31 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     let goal = tokio::fs::read_to_string(&goal_file)
         .await
         .with_context(|| format!("reading goal file {}", goal_file.display()))?;
-    let requested_validation_commands = requested_validation_commands(&goal);
+
+    // Resolve the typed run contract before any tool scope, prompt, or LLM
+    // effect (GENERALIZATION_PLAN.md Slice 2). The legacy coding adapter
+    // wraps today's shell-fence scraping, so `requested_validation_commands`
+    // below carries exactly the same ordered, deduped command strings as
+    // before this slice.
+    let contract_source = crate::contract::ContractSource::Legacy {
+        goal_path: goal_file.display().to_string(),
+        goal_text: goal.clone(),
+    };
+    let contract_budgets = crate::contract::Budgets {
+        max_iterations: config.max_iterations,
+        max_tool_iterations: config.max_tool_iterations,
+        context_window_tokens: config.context_window_tokens,
+        max_thinking_only_tokens: config.max_thinking_only_tokens,
+        repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
+    };
+    let supplied_contract = crate::contract::supplied_contract_for(&contract_source);
+    let resolved_contract = crate::contract::resolve_contract(contract_source, contract_budgets)?;
+    let requested_validation_commands: Vec<String> = resolved_contract
+        .probes
+        .iter()
+        .map(|probe| probe.command.clone())
+        .collect();
+
     let tool_root = tool_root
         .canonicalize()
         .with_context(|| format!("canonicalizing tool root {}", tool_root.display()))?;
@@ -248,6 +272,23 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             "note": "Tools are rooted at the generated project workspace."
         }),
     )?;
+
+    trace.event(
+        crate::runtime_events::AGENT_CONTRACT_SUPPLIED,
+        serde_json::json!({
+            "adapter_kind": resolved_contract.adapter_kind,
+            "supplied": &supplied_contract,
+        }),
+    )?;
+    trace.event(
+        crate::runtime_events::AGENT_CONTRACT_RESOLVED,
+        serde_json::json!({
+            "schema_version": &resolved_contract.schema_version,
+            "adapter_kind": resolved_contract.adapter_kind,
+            "resolved": &resolved_contract,
+        }),
+    )?;
+
     let scope = ToolScope::new(tool_root.clone(), Arc::clone(&trace))?;
     let system_prompt = system_prompt();
     let tools = coding_tools(&scope);
@@ -1011,75 +1052,7 @@ fn should_terminalize_after_successful_validation(
     Some(validation.clone())
 }
 
-fn requested_validation_commands(goal: &str) -> Vec<String> {
-    let mut commands = Vec::new();
-    let mut in_fence = false;
-    let mut shell_fence = false;
-
-    for line in goal.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            if in_fence {
-                in_fence = false;
-                shell_fence = false;
-            } else {
-                in_fence = true;
-                let info = trimmed.trim_start_matches('`').trim().to_ascii_lowercase();
-                shell_fence = matches!(
-                    info.as_str(),
-                    "" | "sh" | "shell" | "bash" | "zsh" | "console" | "text"
-                );
-            }
-            continue;
-        }
-
-        if !in_fence || !shell_fence {
-            continue;
-        }
-        let command = trimmed.trim_start_matches('$').trim();
-        if is_requested_validation_command_line(command) {
-            let normalized = normalize_validation_command(command);
-            if !normalized.is_empty() && !commands.contains(&normalized) {
-                commands.push(normalized);
-            }
-        }
-    }
-
-    commands
-}
-
-fn is_requested_validation_command_line(command: &str) -> bool {
-    if validation_command_masks_failure(command) {
-        return false;
-    }
-    let normalized = normalize_validation_command(command);
-    [
-        "cargo test",
-        "cargo build",
-        "cargo check",
-        "cargo clippy",
-        "cargo fmt",
-        "cargo run",
-        "./cargo test",
-        "./cargo build",
-        "./cargo check",
-        "./cargo clippy",
-        "./cargo fmt",
-        "./cargo run",
-        "npm test",
-        "npm run test",
-        "pnpm test",
-        "yarn test",
-        "pytest",
-        "python -m pytest",
-        "go test",
-        "mix test",
-    ]
-    .iter()
-    .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
-}
-
-fn validation_matches_requested_command(command: &str, requested: &[String]) -> bool {
+pub(crate) fn validation_matches_requested_command(command: &str, requested: &[String]) -> bool {
     if validation_command_masks_failure(command) {
         return false;
     }
@@ -1092,7 +1065,7 @@ fn validation_matches_requested_command(command: &str, requested: &[String]) -> 
         .any(|expected| actual == *expected || actual.starts_with(&format!("{expected} ")))
 }
 
-fn validation_command_masks_failure(command: &str) -> bool {
+pub(crate) fn validation_command_masks_failure(command: &str) -> bool {
     let spaced = command
         .replace("||", " || ")
         .replace("&&", " && ")
@@ -1118,7 +1091,7 @@ fn validation_command_masks_failure(command: &str) -> bool {
     })
 }
 
-fn normalize_validation_command(command: &str) -> String {
+pub(crate) fn normalize_validation_command(command: &str) -> String {
     let command = command
         .split_once('|')
         .map(|(head, _)| head)
@@ -1136,7 +1109,7 @@ fn normalize_validation_command(command: &str) -> String {
     parts.join(" ")
 }
 
-fn validation_command_family(command: &str) -> String {
+pub(crate) fn validation_command_family(command: &str) -> String {
     let normalized = normalize_validation_command(command);
     let parts = normalized.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
@@ -5070,49 +5043,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn requested_validation_parser_extracts_shell_validation_commands() {
-        let task = r#"
-Edit the existing Rust project.
-
-```rust
-fn cargo_test_is_not_a_command() {}
-```
-
-Run:
-
-```sh
-cargo test test_deterministic_simulation_terminates_and_reports_summary
-cargo run -- --simulate 600
-```
-"#;
-
-        assert_eq!(
-            requested_validation_commands(task),
-            vec![
-                "cargo test test_deterministic_simulation_terminates_and_reports_summary",
-                "cargo run -- --simulate 600",
-            ]
-        );
-    }
-
-    #[test]
-    fn requested_validation_parser_ignores_masked_success_commands() {
-        let task = r#"
-Run:
-
-```sh
-cargo build || true
-cargo test
-cargo run -- --version-check ; true
-```
-"#;
-
-        assert_eq!(
-            requested_validation_commands(task),
-            vec!["cargo test".to_string()]
-        );
-    }
+    // `requested_validation_parser_extracts_shell_validation_commands` and
+    // `requested_validation_parser_ignores_masked_success_commands` moved to
+    // `contract.rs` alongside `requested_validation_commands` itself (see
+    // GENERALIZATION_PLAN.md Slice 2).
 
     #[test]
     fn validation_matching_rejects_masked_success_commands() {
@@ -5488,7 +5422,16 @@ cargo run -- --version-check ; true
         assert!(trace.contains("\"kind\":\"agent.turn.empty_response_escalated\""));
         assert!(trace.contains("\"kind\":\"agent.turn.empty_response_hard_failed\""));
         assert!(trace.contains("\"consecutive_empty_responses\":3"));
-        assert!(!trace.contains("DONE"));
+        // The hard-stop escalates at turn 3 of 4, so the scripted fourth
+        // turn's `Content("DONE")` must never be reached: the harness
+        // finishes on the escalation summary, not a clean "DONE". (The
+        // trace does legitimately contain the literal string "DONE"
+        // elsewhere now, as descriptive `terminal.done_token` metadata on
+        // the resolved run contract traced before the turn loop starts —
+        // see `agent.contract.resolved`. `run.finished` is emitted
+        // unconditionally on every loop exit, including this hard-stop, so
+        // it is not a useful discriminator here.)
+        assert!(!trace.contains("\"final_summary\":\"DONE\""));
     }
 
     #[tokio::test]
@@ -6440,5 +6383,98 @@ cargo run -- --version-check ; true
         fn clone_box(&self) -> Box<dyn LlmTool> {
             Box::new(self.clone())
         }
+    }
+
+    /// A gateway that panics if any of its methods are invoked. Used to
+    /// prove contract resolution happens before any LLM/tool effect
+    /// (GENERALIZATION_PLAN.md Slice 2): `resolve_contract`'s signature has
+    /// no gateway parameter at all, so an invalid contract cannot reach one
+    /// — this test exercises that ordering concretely by threading a
+    /// `PanicGateway` through the same async call site resolution runs in
+    /// front of, and asserting the panics never fire.
+    struct PanicGateway;
+
+    #[async_trait]
+    impl LlmGateway for PanicGateway {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _tools: Option<&[Box<dyn LlmTool>]>,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<LlmGatewayResponse> {
+            panic!("PanicGateway::complete must never be called before contract resolution");
+        }
+
+        async fn complete_json(
+            &self,
+            _model: &str,
+            _messages: &[LlmMessage],
+            _schema: Value,
+            _config: &CompletionConfig,
+        ) -> mojentic::Result<Value> {
+            panic!("PanicGateway::complete_json must never be called before contract resolution");
+        }
+
+        async fn get_available_models(&self) -> mojentic::Result<Vec<String>> {
+            panic!(
+                "PanicGateway::get_available_models must never be called before contract resolution"
+            );
+        }
+
+        async fn calculate_embeddings(
+            &self,
+            _text: &str,
+            _model: Option<&str>,
+        ) -> mojentic::Result<Vec<f32>> {
+            panic!(
+                "PanicGateway::calculate_embeddings must never be called before contract resolution"
+            );
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _model: &'a str,
+            _messages: &'a [LlmMessage],
+            _tools: Option<&'a [Box<dyn LlmTool>]>,
+            _config: &'a CompletionConfig,
+        ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
+        {
+            panic!("PanicGateway::complete_stream must never be called before contract resolution");
+        }
+    }
+
+    /// Mirrors the resolution-before-effect ordering in
+    /// `run_coding_agent_with_gateway`: contract resolution is the first
+    /// fallible step, performed before `gateway` is touched at all.
+    async fn resolve_contract_before_gateway_probe<G: LlmGateway + ?Sized>(
+        source: crate::contract::ContractSource,
+        budgets: crate::contract::Budgets,
+        _gateway: &G,
+    ) -> Result<crate::contract::ResolvedRunContract> {
+        crate::contract::resolve_contract(source, budgets)
+    }
+
+    #[tokio::test]
+    async fn invalid_explicit_contract_errors_before_any_gateway_effect() {
+        let invalid_json =
+            std::fs::read_to_string("fixtures/contracts/invalid/duplicate_probe_id.json")
+                .expect("reading invalid contract fixture");
+        let source = crate::contract::ContractSource::Explicit {
+            source_path: Some("fixtures/contracts/invalid/duplicate_probe_id.json".to_string()),
+            json_text: invalid_json,
+        };
+
+        let result = resolve_contract_before_gateway_probe(
+            source,
+            crate::contract::Budgets::default(),
+            &PanicGateway,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "invalid explicit contract must fail resolution"
+        );
     }
 }
