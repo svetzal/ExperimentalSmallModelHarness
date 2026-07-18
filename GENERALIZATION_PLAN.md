@@ -491,6 +491,43 @@ pre-registered one-variable sequential cap assessment at the next protective
 tier, not a jump to full-window reasoning and not a prompt/model/policy bundle.
 Full evidence is under Experiments/Generation28/.
 
+### Slice 8: Assess The Next Protective Reasoning Tier
+
+- Hold the exact failing text packet, bounded diagnostic, model, prompt,
+  transcript, tools, repair policy, and all other budgets fixed.
+- Increase only the thinking-only cap from 4,096 to 8,192 tokens.
+- Measure post-failure action exit and fresh reprobe separately from assertion
+  success.
+- Include runtime, output-token cost, denied edits, and terminal stop class in
+  the decision.
+
+Exit condition: one valid smoke and a fixed n=3 cell reach natural harness
+terminal states; at least 2/3 post-failure actions plus one fresh reprobe are
+required to support the tier; no permanent policy change is made at n=3.
+
+**Slice 8 status: complete with an action-exit signal (2026-07-18).**
+Generation29 reused Generation28's contract, task, seed, expected bytes, model,
+diagnostic, and runtime configuration byte-for-byte except for the registered
+4,096-to-8,192 thinking-only cap change. The fixed cell observed correct
+bounded diagnostics in 3/3 runs, concrete post-failure action in 2/3, and fresh
+second probes in 2/3, meeting the preregistered action gate exactly. In the two
+acting runs, the first mismatch progressed from byte 15 to byte 49.
+
+The tier did not improve completed-task efficacy: assertion pass, terminal
+DONE, and independent exact-file validation remained 0/3. All three runs
+naturally hard-stopped in validation repair rather than at the thinking-only
+stream boundary. Runtime rose to 415-1,548 seconds from Generation28's 134-172
+seconds, with 25,800-86,467 observed output tokens and up to two denied write
+attempts. Context pressure stayed green, and there were no manual,
+environment, or shell-tool stops.
+
+This is an Initial Replicated Cell Signal that 8,192 is a useful experimental
+action-exit tier for this packet, not evidence that it should become the
+default or be widened again. Before any cap policy decision, extend both the
+4,096 and 8,192 arms from n=3 to n=5 with two fresh replicates per arm and
+compare action exit, reprobe, exact success, stop class, and runtime
+distributions. Full evidence is under Experiments/Generation29/.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`
