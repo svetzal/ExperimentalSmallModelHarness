@@ -1,6 +1,8 @@
+#[cfg(test)]
+use crate::tools::coding_tools;
 use crate::tools::{
     SuccessfulValidationSnapshot, ToolPolicySnapshot, ToolScope, ValidationRepairSnapshot,
-    coding_tools,
+    tools_for_profile,
 };
 use crate::trace::TraceRecorder;
 use anyhow::{Context, Result};
@@ -48,6 +50,7 @@ const ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS: usize = 512;
 pub struct AgentRunConfig {
     pub experiment_dir: PathBuf,
     pub goal_file: PathBuf,
+    pub contract_file: Option<PathBuf>,
     pub model: String,
     pub max_iterations: usize,
     pub max_tool_iterations: usize,
@@ -199,7 +202,10 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         .experiment_dir
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", config.experiment_dir.display()))?;
-    let goal_file = canonicalize_goal(&experiment_dir, &config.goal_file)?;
+    let goal_file = canonicalize_goal(
+        &experiment_dir,
+        config.contract_file.as_ref().unwrap_or(&config.goal_file),
+    )?;
     let goal = tokio::fs::read_to_string(&goal_file)
         .await
         .with_context(|| format!("reading goal file {}", goal_file.display()))?;
@@ -209,9 +215,16 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     // wraps today's shell-fence scraping, so `requested_validation_commands`
     // below carries exactly the same ordered, deduped command strings as
     // before this slice.
-    let contract_source = crate::contract::ContractSource::Legacy {
-        goal_path: goal_file.display().to_string(),
-        goal_text: goal.clone(),
+    let contract_source = if config.contract_file.is_some() {
+        crate::contract::ContractSource::Explicit {
+            source_path: Some(goal_file.display().to_string()),
+            json_text: goal.clone(),
+        }
+    } else {
+        crate::contract::ContractSource::Legacy {
+            goal_path: goal_file.display().to_string(),
+            goal_text: goal.clone(),
+        }
     };
     let contract_budgets = crate::contract::Budgets {
         max_iterations: config.max_iterations,
@@ -225,6 +238,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     let requested_validation_commands: Vec<String> = resolved_contract
         .probes
         .iter()
+        .filter(|probe| !probe.command.is_empty())
         .map(|probe| probe.command.clone())
         .collect();
 
@@ -286,25 +300,30 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         }),
     )?;
 
-    let scope = ToolScope::new(tool_root.clone(), Arc::clone(&trace))?;
+    let scope_rules = |scope: &crate::contract::Scope| match scope {
+        crate::contract::Scope::Unrestricted => Vec::new(),
+        crate::contract::Scope::Rules(rules) => rules.clone(),
+    };
+    let scope = ToolScope::new_profiled(
+        tool_root.clone(),
+        Arc::clone(&trace),
+        resolved_contract.profile.clone(),
+        scope_rules(&resolved_contract.read_scope),
+        scope_rules(&resolved_contract.write_scope),
+    )?;
     let requested_probe_ids_by_command = resolved_contract
         .probes
         .iter()
+        .filter(|probe| !probe.command.is_empty())
         .map(|probe| (probe.command.clone(), probe.id.clone()))
         .collect::<BTreeMap<_, _>>();
-    scope.configure_requested_probes(
-        resolved_contract
-            .probes
-            .iter()
-            .map(|probe| probe.id.clone())
-            .collect(),
-    );
-    let profile = crate::profile::select_profile();
+    scope.configure_probes(resolved_contract.probes.clone())?;
+    let profile = crate::profile::profile_by_ref(&resolved_contract.profile)?;
     let system_prompt = profile.system_guidance();
-    let tools = coding_tools(&scope);
+    let tools = tools_for_profile(&scope, profile);
     let mut messages = vec![
         LlmMessage::system(system_prompt),
-        LlmMessage::user(profile.run_guidance(&goal)),
+        LlmMessage::user(profile.run_guidance(&resolved_contract.guidance)),
     ];
     let num_predict = config
         .num_predict
@@ -589,9 +608,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                     }),
                 )?;
                 final_summary = format!("turn {turn} modified files without follow-up validation");
-                messages.push(LlmMessage::user(
-                    crate::profile::select_profile().post_write_validation_nudge(false),
-                ));
+                messages.push(LlmMessage::user(profile.post_write_validation_nudge(false)));
                 continue;
             }
             if let Some(decision) = &repair_no_action {
@@ -768,9 +785,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                     "policy": policy,
                 }),
             )?;
-            messages.push(LlmMessage::user(
-                crate::profile::select_profile().post_write_validation_nudge(true),
-            ));
+            messages.push(LlmMessage::user(profile.post_write_validation_nudge(true)));
             continue;
         }
         if is_done_response(&final_summary)
@@ -5168,6 +5183,7 @@ mod tests {
         let config = AgentRunConfig {
             experiment_dir: temp.path().join("experiment"),
             goal_file: PathBuf::from("task.md"),
+            contract_file: None,
             model: "qwen3.6:27b-coding-mxfp8".to_string(),
             max_iterations: 10,
             max_tool_iterations: 50,
@@ -5213,7 +5229,7 @@ mod tests {
         let summary = fixture.run(&gateway, 3).await;
 
         assert_eq!(summary.final_summary, "DONE");
-        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        let trace = std::fs::read_to_string(&summary.trace_file).unwrap();
         assert!(trace.contains("\"kind\":\"agent.turn.tool_only_response\""));
         let turn_two_ledgers = trace_payloads(&trace, "llm.context_assembly.ledger")
             .into_iter()
@@ -5722,6 +5738,68 @@ mod tests {
         assert!(trace.contains("\"kind\":\"run.finished\""));
     }
 
+    #[tokio::test]
+    async fn fixture_runs_explicit_file_assertion_without_a_shell_probe() {
+        let expected = "# Project Aurora\n\n- Owner: Mia Chen\n- Status: Blocked\n- Blocker: Vendor API credentials\n- Next step: Contact vendor by Friday\n";
+        let fixture = AgentFixture::new("unused legacy task");
+        std::fs::write(
+            fixture.workspace.join("input.txt"),
+            "Project Aurora status\nowner: Mia Chen\nstatus: blocked\nblocker: vendor API credentials\nnext: contact vendor by Friday\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.experiment.join("contract.json"),
+            serde_json::to_string_pretty(&json!({
+                "profile": {
+                    "id": "text_transform",
+                    "version": "text_transform_profile.v1"
+                },
+                "guidance": "Create the exact brief from input.txt.",
+                "read_scope": ["input.txt", "brief.md"],
+                "write_scope": ["brief.md"],
+                "probes": [{
+                    "id": "brief-exact",
+                    "assertion": {
+                        "kind": "file_text_equals",
+                        "path": "brief.md",
+                        "expected": expected
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "write_file",
+                HashMap::from([
+                    ("path".to_string(), json!("brief.md")),
+                    ("content".to_string(), json!(expected)),
+                ]),
+            )],
+            vec![tool_call_chunk(
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("brief-exact"))]),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run_contract(&gateway, 3).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("brief.md")).unwrap(),
+            expected
+        );
+        let trace = std::fs::read_to_string(&summary.trace_file).unwrap();
+        assert!(trace.contains("\"assertion_kind\":\"file_text_equals\""));
+        assert!(trace.contains("\"probe_id\":\"brief-exact\""));
+        assert!(!trace.contains("\"kind\":\"tool.shell_command\""));
+        let analysis = crate::trace_analysis::analyze_trace(&summary.trace_file).unwrap();
+        assert!(analysis.validation_probe_reached.is_some());
+        assert!(analysis.validation_probe_passed.is_some());
+    }
+
     struct AgentFixture {
         _temp: tempfile::TempDir,
         experiment: PathBuf,
@@ -5761,6 +5839,36 @@ mod tests {
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
                     goal_file: PathBuf::from("task.md"),
+                    contract_file: None,
+                    model: "fake-model".to_string(),
+                    max_iterations,
+                    max_tool_iterations: 10,
+                    context_window_tokens: Some(131_072),
+                    packet_type: "narrow-patch".to_string(),
+                    expected_output_tokens: 2_048,
+                    num_predict: None,
+                    max_thinking_only_tokens: 2_048,
+                    repair_exit_thinking_tokens: 16_384,
+                    action_boundary_interrupt_tokens: 0,
+                    transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                },
+                gateway,
+                self.workspace.clone(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn run_contract(
+            &self,
+            gateway: &ScriptedGateway,
+            max_iterations: usize,
+        ) -> AgentRunSummary {
+            run_coding_agent_with_gateway(
+                AgentRunConfig {
+                    experiment_dir: self.experiment.clone(),
+                    goal_file: PathBuf::from("task.md"),
+                    contract_file: Some(PathBuf::from("contract.json")),
                     model: "fake-model".to_string(),
                     max_iterations,
                     max_tool_iterations: 10,
@@ -5789,6 +5897,7 @@ mod tests {
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
                     goal_file: PathBuf::from("task.md"),
+                    contract_file: None,
                     model: "fake-model".to_string(),
                     max_iterations,
                     max_tool_iterations: 10,

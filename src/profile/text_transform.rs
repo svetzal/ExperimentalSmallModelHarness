@@ -1,4 +1,4 @@
-use super::{DomainProfile, ProfileRef};
+use super::{DomainProfile, ProfileRef, ToolCapability};
 use crate::contract::{
     ArtifactClass, Budgets, EvidenceInvalidation, MutableArtifactClasses, ResolvedRunContract,
 };
@@ -15,6 +15,16 @@ impl DomainProfile for TextTransformProfile {
             id: TEXT_TRANSFORM_PROFILE_ID.into(),
             version: TEXT_TRANSFORM_PROFILE_VERSION.into(),
         }
+    }
+
+    fn tool_capabilities(&self) -> &'static [ToolCapability] {
+        &[
+            ToolCapability::ListTree,
+            ToolCapability::ReadFile,
+            ToolCapability::WriteFile,
+            ToolCapability::EditFile,
+            ToolCapability::ExecuteProbe,
+        ]
     }
 
     fn system_guidance(&self) -> String {

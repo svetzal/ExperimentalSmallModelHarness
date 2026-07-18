@@ -8,7 +8,7 @@
 //! allowed to reference `cargo`, `rust`, `pytest`, etc; the runtime core
 //! (`agent.rs`, `tools.rs`, `contract.rs`, ...) must not.
 
-use super::{DomainProfile, ProfileRef};
+use super::{DomainProfile, ProfileRef, ToolCapability};
 use crate::agent::{normalize_validation_command, validation_command_masks_failure};
 use crate::contract::{
     AdapterKind, ArtifactClass, Budgets, DefaultsProvenance, EvidenceInvalidation,
@@ -28,6 +28,16 @@ pub struct CodingProfile;
 impl DomainProfile for CodingProfile {
     fn profile_ref(&self) -> ProfileRef {
         profile_ref()
+    }
+
+    fn tool_capabilities(&self) -> &'static [ToolCapability] {
+        &[
+            ToolCapability::ListTree,
+            ToolCapability::ReadFile,
+            ToolCapability::WriteFile,
+            ToolCapability::EditFile,
+            ToolCapability::ShellCommand,
+        ]
     }
 
     fn system_guidance(&self) -> String {

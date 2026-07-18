@@ -215,6 +215,33 @@ fn core_runtime_files_contain_no_domain_specific_literals() {
 }
 
 #[test]
+fn core_runtime_has_no_second_domain_identity_or_benchmark_literals() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let guarded = [
+        "src/runtime.rs",
+        "src/agent.rs",
+        "src/tools.rs",
+        "src/contract.rs",
+        "src/trace_analysis.rs",
+    ];
+    let forbidden = ["text_transform", "Project Aurora", "brief.md", "Mia Chen"];
+    let mut failures = Vec::new();
+    for relative in guarded {
+        let production = strip_test_modules(&fs::read_to_string(repo_root.join(relative)).unwrap());
+        for literal in forbidden {
+            if production.contains(literal) {
+                failures.push(format!("{relative}: {literal:?}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "generic runtime contains second-domain coupling: {}",
+        failures.join(", ")
+    );
+}
+
+#[test]
 fn strip_test_modules_removes_nested_braces_and_keeps_surrounding_code() {
     let source = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn helper() { if true { 1 } else { 2 } }\n    const X: &str = \"cargo test\";\n}\nfn b() {}\n";
     let stripped = strip_test_modules(source);

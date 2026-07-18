@@ -745,7 +745,23 @@ impl<E: RuntimeEffects> RuntimeOrchestrator<E> {
     }
 
     pub fn request_validation(&mut self, probe_id: Option<&str>) -> Result<bool, E::Error> {
-        self.effects.validate(probe_id)
+        let success = self.effects.validate(probe_id)?;
+        self.state.reduce(&RuntimeEvent::ValidationProbe {
+            probe_id: probe_id.map(str::to_string),
+            command: "declared_probe".to_string(),
+            command_family: "declared_probe".to_string(),
+            status: Some(if success { 0 } else { 1 }),
+            success,
+            clears_pending_mutations: success,
+            caused_mutation: false,
+            failure_text: if success {
+                String::new()
+            } else {
+                "declared probe failed".to_string()
+            },
+            failure_details: Vec::new(),
+        });
+        Ok(success)
     }
 
     pub fn observe_terminal(&mut self, token: TerminalToken) -> RuntimeDecision {
@@ -1109,6 +1125,7 @@ mod tests {
     struct FakeEffects {
         mutations: usize,
         validations: usize,
+        validation_result: bool,
     }
 
     impl RuntimeEffects for FakeEffects {
@@ -1119,7 +1136,7 @@ mod tests {
         }
         fn validate(&mut self, _probe_id: Option<&str>) -> Result<bool, Self::Error> {
             self.validations += 1;
-            Ok(true)
+            Ok(self.validation_result)
         }
     }
 
@@ -1155,5 +1172,29 @@ mod tests {
             Ok(RuntimeDecision::RejectMutation { .. })
         ));
         assert_eq!(orchestrator.effects.mutations, 1);
+    }
+
+    #[test]
+    fn fake_probe_effect_drives_the_same_freshness_transitions() {
+        let mut orchestrator = RuntimeOrchestrator {
+            state: RuntimeState::new(vec!["exact".into()]),
+            policy: RuntimePolicy,
+            effects: FakeEffects::default(),
+        };
+        orchestrator
+            .request_mutation(vec!["artifact".into()], vec!["artifact".into()])
+            .unwrap();
+        assert!(!orchestrator.request_validation(Some("exact")).unwrap());
+        assert!(!orchestrator.state.terminal_readiness);
+        orchestrator.effects.validation_result = true;
+        assert!(orchestrator.request_validation(Some("exact")).unwrap());
+        assert!(orchestrator.state.terminal_readiness);
+        orchestrator
+            .request_mutation(vec!["artifact".into()], vec!["artifact".into()])
+            .unwrap();
+        assert!(!orchestrator.state.terminal_readiness);
+        assert!(orchestrator.request_validation(Some("exact")).unwrap());
+        assert!(orchestrator.state.terminal_readiness);
+        assert_eq!(orchestrator.effects.validations, 3);
     }
 }

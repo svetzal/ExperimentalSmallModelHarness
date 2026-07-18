@@ -1,3 +1,5 @@
+use crate::contract::{FileAssertion, Probe};
+use crate::profile::{DomainProfile, ProfileRef, ToolCapability};
 use crate::runtime::{
     MutationSource, RuntimeDecision, RuntimeEvent, RuntimePolicy, RuntimeState,
     SuccessfulValidation, ValidationRepair,
@@ -39,6 +41,8 @@ pub struct ToolScope {
     runtime: Arc<Mutex<RuntimeState>>,
     measurements: Arc<Mutex<ToolMeasurements>>,
     access: Arc<AccessPolicy>,
+    profile: ProfileRef,
+    probes: Arc<Mutex<BTreeMap<String, Probe>>>,
 }
 
 #[derive(Debug, Default)]
@@ -167,7 +171,12 @@ struct PathRule {
 
 impl ToolScope {
     pub fn new(root: PathBuf, trace: Arc<TraceRecorder>) -> Result<Self> {
-        Self::new_with_policy(root, trace, AccessPolicy::default())
+        Self::new_with_policy(
+            root,
+            trace,
+            AccessPolicy::default(),
+            crate::profile::select_profile().profile_ref(),
+        )
     }
 
     pub fn new_restricted(
@@ -183,6 +192,26 @@ impl ToolScope {
                 read_allow: parse_path_rules(read_allow)?,
                 write_allow: parse_path_rules(write_allow)?,
             },
+            crate::profile::select_profile().profile_ref(),
+        )
+    }
+
+    pub fn new_profiled(
+        root: PathBuf,
+        trace: Arc<TraceRecorder>,
+        profile: ProfileRef,
+        read_allow: Vec<String>,
+        write_allow: Vec<String>,
+    ) -> Result<Self> {
+        crate::profile::profile_by_ref(&profile)?;
+        Self::new_with_policy(
+            root,
+            trace,
+            AccessPolicy {
+                read_allow: parse_path_rules(read_allow)?,
+                write_allow: parse_path_rules(write_allow)?,
+            },
+            profile,
         )
     }
 
@@ -190,6 +219,7 @@ impl ToolScope {
         root: PathBuf,
         trace: Arc<TraceRecorder>,
         access: AccessPolicy,
+        profile: ProfileRef,
     ) -> Result<Self> {
         let root = root
             .canonicalize()
@@ -200,7 +230,13 @@ impl ToolScope {
             runtime: Arc::new(Mutex::new(RuntimeState::default())),
             measurements: Arc::new(Mutex::new(ToolMeasurements::default())),
             access: Arc::new(access),
+            profile,
+            probes: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+
+    fn profile(&self) -> &'static dyn DomainProfile {
+        crate::profile::profile_by_ref(&self.profile).expect("validated domain profile")
     }
 
     fn resolve_existing_or_new(&self, relative: &str) -> Result<PathBuf> {
@@ -340,7 +376,7 @@ impl ToolScope {
             .collect::<Vec<_>>();
         let source_paths = relative_paths
             .iter()
-            .filter(|path| crate::profile::coding::path_requires_validation_after_write(path))
+            .filter(|path| self.profile().path_requires_validation_after_write(path))
             .cloned()
             .collect::<Vec<_>>();
         let event = RuntimeEvent::ToolMutation {
@@ -425,7 +461,7 @@ impl ToolScope {
         }
         let source_paths = paths
             .iter()
-            .filter(|path| crate::profile::coding::path_requires_validation_after_write(path))
+            .filter(|path| self.profile().path_requires_validation_after_write(path))
             .cloned()
             .collect::<Vec<_>>();
         let event = RuntimeEvent::ToolMutation {
@@ -509,17 +545,18 @@ impl ToolScope {
         stdout: &CapturedOutput,
         stderr: &CapturedOutput,
     ) -> Result<Option<ValidationRepairSnapshot>> {
-        let command_family = crate::profile::coding::command_family(command);
+        let command_family = self.profile().command_family(command);
         let failure_text = failure_summary(&stderr.content, &stdout.content);
-        let failure_details =
-            crate::profile::coding::failure_details(&stderr.content, &stdout.content);
+        let failure_details = self
+            .profile()
+            .failure_details(&stderr.content, &stdout.content);
         let success = output.status.success();
         let mut runtime = self.runtime.lock().expect("runtime state mutex poisoned");
         let pending_paths_before_probe = runtime.writes_since_probe_paths.clone();
         let had_pending_source_writes = runtime
             .writes_since_probe_paths
             .keys()
-            .any(|path| crate::profile::coding::path_requires_validation_after_write(path));
+            .any(|path| self.profile().path_requires_validation_after_write(path));
         let cleared_pending_source_writes = had_pending_source_writes && success;
         let first_validation_probe = !runtime.emitted_first_validation_probe;
         let first_post_validation_repair_action =
@@ -741,6 +778,147 @@ impl ToolScope {
         *runtime = RuntimeState::new(probe_ids);
     }
 
+    pub fn configure_probes(&self, probes: Vec<Probe>) -> Result<()> {
+        let mut by_id = BTreeMap::new();
+        let mut ids = Vec::with_capacity(probes.len());
+        for probe in probes {
+            if let Some(FileAssertion::FileTextEquals { path, .. }) = &probe.assertion {
+                let target = self.resolve_existing_or_new(path)?;
+                self.check_read(&target)?;
+                self.check_write(&target)?;
+                self.reject_symlink_escape_before_effect(&target)?;
+            }
+            ids.push(probe.id.clone());
+            if by_id.insert(probe.id.clone(), probe).is_some() {
+                bail!("duplicate probe id during tool configuration");
+            }
+        }
+        self.configure_requested_probes(ids);
+        *self.probes.lock().expect("probe map mutex poisoned") = by_id;
+        Ok(())
+    }
+
+    fn reject_symlink_escape_before_effect(&self, target: &Path) -> Result<()> {
+        let existing = if target.exists() {
+            target
+        } else {
+            target.parent().context("assertion path has no parent")?
+        };
+        let canonical = existing
+            .canonicalize()
+            .with_context(|| format!("canonicalizing assertion path {}", existing.display()))?;
+        if !canonical.starts_with(&*self.root) {
+            bail!("assertion path escapes the tool scope through a symlink");
+        }
+        Ok(())
+    }
+
+    async fn execute_probe(&self, probe_id: &str) -> Result<Value> {
+        let probe = self
+            .probes
+            .lock()
+            .expect("probe map mutex poisoned")
+            .get(probe_id)
+            .cloned()
+            .with_context(|| format!("unknown declared probe id {probe_id:?}"))?;
+        let Some(FileAssertion::FileTextEquals { path, expected }) = probe.assertion else {
+            bail!("probe {probe_id:?} is not executable through the assertion effect");
+        };
+        let unresolved = self.resolve_existing_or_new(&path)?;
+        let result = async {
+            let canonical = unresolved
+                .canonicalize()
+                .with_context(|| format!("resolving asserted file {path:?}"))?;
+            if !canonical.starts_with(&*self.root) {
+                bail!("asserted file escapes the tool scope through a symlink");
+            }
+            self.check_read(&canonical)?;
+            let bytes = tokio::fs::read(&canonical)
+                .await
+                .with_context(|| format!("reading asserted file {path:?}"))?;
+            let actual = String::from_utf8(bytes)
+                .with_context(|| format!("asserted file {path:?} is not valid UTF-8"))?;
+            Ok::<bool, anyhow::Error>(actual == expected)
+        }
+        .await;
+        let (success, failure_details) = match result {
+            Ok(true) => (true, Vec::new()),
+            Ok(false) => (
+                false,
+                vec![format!(
+                    "exact UTF-8 content mismatch for {path:?}: expected {} bytes",
+                    expected.len()
+                )],
+            ),
+            Err(error) => (false, vec![error.to_string()]),
+        };
+        self.note_assertion_result(probe_id, &path, success, &failure_details)?;
+        Ok(json!({
+            "validation_probe": true,
+            "probe_id": probe_id,
+            "command": format!("probe:{probe_id}"),
+            "command_family": "file_text_equals",
+            "assertion_kind": "file_text_equals",
+            "path": path,
+            "status": if success { 0 } else { 1 },
+            "success": success,
+            "validation_probe_clears_pending_source_writes": success,
+            "shell_mutation_requires_validation": false,
+            "failure_details": failure_details,
+        }))
+    }
+
+    fn note_assertion_result(
+        &self,
+        probe_id: &str,
+        path: &str,
+        success: bool,
+        failure_details: &[String],
+    ) -> Result<()> {
+        let command = format!("probe:{probe_id}");
+        let mut runtime = self.runtime.lock().expect("runtime state mutex poisoned");
+        let first = !runtime.emitted_first_validation_probe;
+        let pending_paths = runtime.writes_since_probe_paths.clone();
+        let had_pending = !runtime.pending_evidence_paths.is_empty();
+        let event = RuntimeEvent::ValidationProbe {
+            probe_id: Some(probe_id.to_string()),
+            command: command.clone(),
+            command_family: "file_text_equals".to_string(),
+            status: Some(if success { 0 } else { 1 }),
+            success,
+            clears_pending_mutations: success,
+            caused_mutation: false,
+            failure_text: failure_details.join("\n"),
+            failure_details: failure_details.to_vec(),
+        };
+        runtime.reduce(&event);
+        let total_probes = runtime.total_validation_probes;
+        let total_writes = runtime.total_write_operations;
+        drop(runtime);
+        let payload = json!({
+            "probe_id": probe_id,
+            "command": command,
+            "command_family": "file_text_equals",
+            "assertion_kind": "file_text_equals",
+            "path": path,
+            "status": if success { 0 } else { 1 },
+            "success": success,
+            "failure_details": failure_details,
+            "had_pending_source_writes": had_pending,
+            "cleared_pending_source_writes": success && had_pending,
+            "pending_paths_before_probe": pending_paths,
+            "total_shell_probes": total_probes,
+            "total_write_operations": total_writes,
+        });
+        if first {
+            self.trace
+                .event("agent.stage.first_validation_probe", &payload)?;
+        }
+        self.trace
+            .event("agent.validation_probe.observed", &payload)?;
+        Ok(())
+    }
+
     fn note_patch_fallback_choice(
         &self,
         paths: &[PathBuf],
@@ -834,23 +1012,81 @@ impl ToolScope {
 }
 
 pub fn coding_tools(scope: &ToolScope) -> Vec<Box<dyn LlmTool>> {
-    vec![
-        Box::new(ListTreeTool {
-            scope: scope.clone(),
-        }),
-        Box::new(ReadFileTool {
-            scope: scope.clone(),
-        }),
-        Box::new(WriteFileTool {
-            scope: scope.clone(),
-        }),
-        Box::new(EditFileTool {
-            scope: scope.clone(),
-        }),
-        Box::new(ShellCommandTool {
-            scope: scope.clone(),
-        }),
-    ]
+    tools_for_profile(scope, crate::profile::select_profile())
+}
+
+pub fn tools_for_profile(scope: &ToolScope, profile: &dyn DomainProfile) -> Vec<Box<dyn LlmTool>> {
+    profile
+        .tool_capabilities()
+        .iter()
+        .map(|capability| match capability {
+            ToolCapability::ListTree => Box::new(ListTreeTool {
+                scope: scope.clone(),
+            }) as Box<dyn LlmTool>,
+            ToolCapability::ReadFile => Box::new(ReadFileTool {
+                scope: scope.clone(),
+            }),
+            ToolCapability::WriteFile => Box::new(WriteFileTool {
+                scope: scope.clone(),
+            }),
+            ToolCapability::EditFile => Box::new(EditFileTool {
+                scope: scope.clone(),
+            }),
+            ToolCapability::ShellCommand => Box::new(ShellCommandTool {
+                scope: scope.clone(),
+            }),
+            ToolCapability::ExecuteProbe => Box::new(ExecuteProbeTool {
+                scope: scope.clone(),
+            }),
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecuteProbeTool {
+    scope: ToolScope,
+}
+
+#[async_trait]
+impl LlmTool for ExecuteProbeTool {
+    async fn run(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &ToolRunCtx,
+    ) -> mojentic::Result<Value> {
+        self.scope.note_tool_call();
+        let probe_id = required_str(args, "probe_id").map_err(to_mojentic_error)?;
+        let result = self
+            .scope
+            .execute_probe(probe_id)
+            .await
+            .map_err(to_mojentic_error);
+        let payload = match &result {
+            Ok(value) => value.clone(),
+            Err(error) => json!({ "error": error.to_string() }),
+        };
+        self.scope.trace_tool_event("tool.execute_probe", payload);
+        result
+    }
+
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            r#type: "function".to_string(),
+            function: FunctionDescriptor {
+                name: "execute_probe".to_string(),
+                description: "Execute one declared non-shell probe by stable probe ID.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "probe_id": { "type": "string" } },
+                    "required": ["probe_id"]
+                }),
+            },
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn LlmTool> {
+        Box::new(self.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1119,7 +1355,7 @@ fn collect_shell_mutation_snapshot(
             .metadata()
             .with_context(|| format!("reading metadata {}", path.display()))?;
         let relative = scope.relative_path(&path)?;
-        if is_shell_mutation_snapshot_excluded(&relative) {
+        if is_shell_mutation_snapshot_excluded(scope, &relative) {
             continue;
         }
         if gitignore.matched(&path, metadata.is_dir()).is_ignore() {
@@ -1132,7 +1368,10 @@ fn collect_shell_mutation_snapshot(
             collect_shell_mutation_snapshot(scope, &path, gitignore, snapshot)?;
         } else if metadata.is_file() {
             let relative = scope.relative_display(&path);
-            if crate::profile::coding::path_requires_validation_after_write(&relative) {
+            if scope
+                .profile()
+                .path_requires_validation_after_write(&relative)
+            {
                 snapshot.insert(relative, file_fingerprint(&path, &metadata)?);
             }
         }
@@ -1140,12 +1379,12 @@ fn collect_shell_mutation_snapshot(
     Ok(())
 }
 
-fn is_shell_mutation_snapshot_excluded(relative: &Path) -> bool {
+fn is_shell_mutation_snapshot_excluded(scope: &ToolScope, relative: &Path) -> bool {
     relative.components().any(|component| {
         let Component::Normal(name) = component else {
             return false;
         };
-        crate::profile::coding::is_ignored_dir(&name.to_string_lossy())
+        scope.profile().is_ignored_dir(&name.to_string_lossy())
     })
 }
 
@@ -1797,17 +2036,20 @@ impl ShellCommandTool {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
-        let validation_probe = crate::profile::coding::is_validation_probe(command);
+        let validation_probe = self.scope.profile().recognizes_probe(command);
         let policy_before_command = self.scope.policy_snapshot();
         if policy_before_command.validation_required_after_write
             && !validation_probe
-            && crate::profile::coding::is_known_shell_mutation_command(command)
+            && self
+                .scope
+                .profile()
+                .is_known_shell_mutation_command(command)
         {
             bail!(
                 "shell command appears to mutate files while validation is required after source edits; run a validation probe before further cleanup, then use edit_file for any remaining source edits"
             );
         }
-        let command_family = crate::profile::coding::command_family(command);
+        let command_family = self.scope.profile().command_family(command);
         let before_mutation_snapshot = match self.scope.shell_mutation_snapshot() {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
@@ -2437,6 +2679,22 @@ mod tests {
         .unwrap()
     }
 
+    fn text_scope(temp: &tempfile::TempDir) -> ToolScope {
+        let trace = Arc::new(TraceRecorder::create(&temp.path().join("traces")).unwrap());
+        ToolScope::new_profiled(
+            temp.path().to_path_buf(),
+            trace,
+            crate::profile::text_transform::TextTransformProfile.profile_ref(),
+            vec!["input.txt".into(), "brief.md".into()],
+            vec!["brief.md".into()],
+        )
+        .unwrap()
+    }
+
+    fn exact_probe(expected: &str) -> Probe {
+        Probe::file_text_equals("brief-exact", "brief.md", expected)
+    }
+
     #[test]
     fn rejects_parent_paths() {
         let temp = tempfile::tempdir().unwrap();
@@ -2449,6 +2707,106 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
         assert!(scope.resolve_existing_or_new("/tmp/outside").is_err());
+    }
+
+    #[test]
+    fn profile_capabilities_select_text_tools_without_shell() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = text_scope(&temp);
+        let profile = crate::profile::profile_by_ref(&scope.profile).unwrap();
+        let names = tools_for_profile(&scope, profile)
+            .iter()
+            .map(|tool| tool.descriptor().function.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "list_tree",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "execute_probe"
+            ]
+        );
+        assert!(!names.iter().any(|name| name == "shell_command"));
+    }
+
+    #[tokio::test]
+    async fn exact_file_assertion_fails_passes_and_tracks_freshness() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("input.txt"), "seed\n").unwrap();
+        let scope = text_scope(&temp);
+        scope
+            .configure_probes(vec![exact_probe("expected\n")])
+            .unwrap();
+
+        std::fs::write(temp.path().join("brief.md"), "wrong\n").unwrap();
+        scope
+            .note_write_intent(&[temp.path().join("brief.md")])
+            .unwrap();
+        let failed = scope.execute_probe("brief-exact").await.unwrap();
+        assert_eq!(failed["success"], false);
+        assert!(!scope.runtime_state_snapshot().terminal_readiness);
+
+        std::fs::write(temp.path().join("brief.md"), "expected\n").unwrap();
+        scope
+            .note_write_intent(&[temp.path().join("brief.md")])
+            .unwrap();
+        let passed = scope.execute_probe("brief-exact").await.unwrap();
+        assert_eq!(passed["success"], true);
+        assert!(scope.runtime_state_snapshot().terminal_readiness);
+
+        scope
+            .note_write_intent(&[temp.path().join("brief.md")])
+            .unwrap();
+        assert!(!scope.runtime_state_snapshot().terminal_readiness);
+        assert_eq!(
+            scope.runtime_state_snapshot().requested_probes[0].status,
+            crate::runtime::ProbeStatus::Stale
+        );
+        scope.execute_probe("brief-exact").await.unwrap();
+        assert!(scope.runtime_state_snapshot().terminal_readiness);
+
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+        assert!(trace.contains(r#""probe_id":"brief-exact""#));
+        assert!(trace.contains(r#""assertion_kind":"file_text_equals""#));
+        assert!(trace.contains(r#""path":"brief.md""#));
+    }
+
+    #[test]
+    fn denied_assertion_is_rejected_before_probe_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("input.txt"), "seed\n").unwrap();
+        let scope = text_scope(&temp);
+        let result =
+            scope.configure_probes(vec![Probe::file_text_equals("outside", "outside.md", "x")]);
+        assert!(result.is_err());
+        assert_eq!(scope.runtime_state_snapshot().total_validation_probes, 0);
+        assert!(
+            scope
+                .probes
+                .lock()
+                .expect("probe map mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assertion_symlink_escape_is_rejected_before_probe_effects() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("input.txt"), "seed\n").unwrap();
+        std::fs::write(outside.path().join("brief.md"), "x").unwrap();
+        symlink(
+            outside.path().join("brief.md"),
+            temp.path().join("brief.md"),
+        )
+        .unwrap();
+        let scope = text_scope(&temp);
+        assert!(scope.configure_probes(vec![exact_probe("x")]).is_err());
+        assert_eq!(scope.runtime_state_snapshot().total_validation_probes, 0);
     }
 
     #[test]

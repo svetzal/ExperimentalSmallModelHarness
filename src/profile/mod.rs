@@ -18,6 +18,16 @@ use serde::{Deserialize, Serialize};
 
 pub use coding::CodingProfile;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCapability {
+    ListTree,
+    ReadFile,
+    WriteFile,
+    EditFile,
+    ShellCommand,
+    ExecuteProbe,
+}
+
 /// Stable identity of a domain profile, carried on
 /// [`crate::contract::ResolvedRunContract`] so traced/serialized contracts
 /// record which profile resolved them. `#[serde(default)]` on that field
@@ -42,6 +52,8 @@ impl Default for ProfileRef {
 pub trait DomainProfile: Send + Sync {
     /// This profile's stable identity.
     fn profile_ref(&self) -> ProfileRef;
+
+    fn tool_capabilities(&self) -> &'static [ToolCapability];
 
     /// The worker/system prompt text.
     fn system_guidance(&self) -> String;

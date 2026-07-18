@@ -30,6 +30,10 @@ enum Command {
         #[arg(long, default_value = "task.md")]
         goal: PathBuf,
 
+        /// Explicit run-contract JSON file, relative to the experiment root unless absolute.
+        #[arg(long)]
+        contract: Option<PathBuf>,
+
         /// Ollama model name.
         #[arg(long, default_value = DEFAULT_MODEL)]
         model: String,
@@ -109,6 +113,7 @@ pub async fn run() -> Result<()> {
         Command::Run {
             experiment,
             goal,
+            contract,
             model,
             max_iterations,
             max_tool_iterations,
@@ -139,6 +144,7 @@ pub async fn run() -> Result<()> {
             let summary = run_coding_agent(AgentRunConfig {
                 experiment_dir: experiment,
                 goal_file: goal,
+                contract_file: contract,
                 model,
                 max_iterations,
                 max_tool_iterations,
