@@ -371,6 +371,39 @@ Exit condition: the second profile reuses the same state machine, tracing,
 scope, freshness, and stop policy without coding-specific branches in the
 runtime core.
 
+**Slice 5 status: complete (2026-07-18).** A registered text_transform /
+text_transform_profile.v1 profile now supplies stable identity, worker/run/
+repair guidance, artifact policy, and minimal tool capabilities. Explicit
+contracts retain the byte-compatible command-probe shape used by coding tasks
+and add a typed file_text_equals assertion with a stable ID, scoped relative
+path, and exact UTF-8 expectation. Validation rejects empty or duplicate IDs,
+mixed command/assertion definitions, absolute and parent paths, paths outside
+declared read/write scope, and symlink escapes before model or mutation
+effects.
+
+The profile-selected tool set exposes bounded tree/read/write/edit effects plus
+execute_probe; it does not expose a shell tool. Assertion execution emits the
+established validation trace events with additive probe ID, assertion kind,
+path, status, and failure details, then reduces through the same validation
+event, mutation epoch, stale-evidence, repair, and terminal-readiness
+transitions used by coding probes. Fake-effect, real-filesystem, fake-gateway
+orchestration, analyzer-compatibility, and structural tests cover pass/fail,
+denial, stale-after-mutation, fresh reassertion, and absence of second-domain
+identities or benchmark literals from the generic runtime core.
+
+Deterministic parity remained green at Harness commit 85c48c3: 198 unit tests
+and six structural tests passed; the five coding contract snapshots and coding
+prompt fixtures stayed byte-identical; matrix summarization remained 30
+completed / 24 independent passes / 6 failures; preserved trace analysis was
+byte-identical; and Cargo.toml/Cargo.lock did not change. Generation26 then
+recorded a valid instrumentation smoke and a fixed n=3
+qwen3.6:35b-a3b-coding-nvfp4 cell. Distributions were 3/3 valid, 3/3 first tool
+call, 3/3 artifact mutation, 3/3 assertion reached, 3/3 assertion passed, 3/3
+terminal DONE accepted, 0 hard/manual/environment stops, and 3/3 independent
+exact-file passes. This is a Replicated Cell Signal for the narrow benchmark,
+not proof of broad cross-domain capability. Full evidence is under
+Experiments/Generation26/.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`
