@@ -328,6 +328,39 @@ Exit condition: repair, validation freshness, action-boundary, and terminal
 decisions have table-driven transition tests independent of tool
 implementations.
 
+**Slice 4 status: complete (2026-07-18).** `src/runtime.rs` now defines the
+serializable `runtime_event.v1` observation vocabulary, a pure deterministic
+`RuntimeState` reducer, and a typed `RuntimePolicy` decision layer. The state
+owns mutation/fresh-validation epochs, declared-probe freshness and ordering,
+write budget and the one-edit repair allowance, repair reads/no-action state,
+action-boundary counts, repeated inspections, true-empty versus tool-only and
+hidden-only turns, terminal readiness/tokens, manual and environment stops,
+and effect-failure facts. `src/runtime_events.rs` is the explicit adapter from
+typed events to the stable pre-Slice-4 trace names and payload shapes; reducer
+and policy code do not consume trace strings.
+
+`agent.rs` and `tools.rs` now classify provider/tool outcomes into typed events,
+ask policy before mutation effects, reduce accepted observations, and retain
+the existing prompt and trace adapters. The former `ToolPolicyState`, repair
+and action-boundary tracker structs, and inspection counter storage were
+removed. Stable filesystem/shell implementations remain in their existing tool
+adapters; the provider remains behind `LlmGateway`. A deterministic
+`RuntimeEffects` boundary and fake prove denied mutations and accepted terminal
+states cannot execute later effects.
+
+The exit condition was verified without a local-model run: `cargo fmt --check`,
+warning-free `cargo clippy --all-targets --all-features -- -D warnings`, and all
+189 unit/integration tests plus five structural tests pass. The 12-test pure
+runtime table suite passed twice, and the focused fake-effect test passed. All
+five resolved-contract snapshots matched committed bytes across two passes;
+coding-profile prompt parity passed twice; `summarize-matrix` was byte-identical
+twice at 30 completed / 24 independently validated passes / 6 failures; and
+`analyze-trace fixtures/traces/*.jsonl` was byte-identical twice. Structural
+guards prove `runtime.rs` imports no provider, filesystem, subprocess, clock,
+tracing, or coding-profile implementation and that orchestration adapters do
+not recreate the removed transition-state structs. `Cargo.toml` and
+`Cargo.lock` are unchanged. Slice 5 and a second domain were not started.
+
 ### Slice 5: Prove A Second Domain
 
 Add one small non-code artifact task only after the coding profile reaches

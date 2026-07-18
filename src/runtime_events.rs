@@ -1,4 +1,4 @@
-//! Stable `RuntimeEvent` name registry for canonical trace measurement.
+//! Backward-compatible trace adapter for the typed runtime vocabulary.
 //!
 //! `GENERALIZATION_PLAN.md` (Slice 1, "Canonicalize Measurement") requires
 //! one documented, stable vocabulary of event names and payload fields that
@@ -13,6 +13,134 @@
 //! when or why the runtime prompts, permits actions, validates, repairs,
 //! interrupts, or stops — it only gives the analyzer a stable string to
 //! match instead of an inline literal.
+
+use crate::runtime::{RuntimeEvent, TerminalToken};
+use serde::Serialize;
+use serde_json::{Value, json};
+
+/// Version of the typed reducer input vocabulary. This does not replace the
+/// stable legacy trace schema; [`legacy_trace_events`] is the explicit adapter
+/// that preserves those names and payload shapes.
+pub const RUNTIME_EVENT_SCHEMA_VERSION: &str = "runtime_event.v1";
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LegacyTraceEvent {
+    pub kind: &'static str,
+    pub payload: Value,
+}
+
+/// Translate typed reducer input into the pre-Slice-4 public trace vocabulary.
+/// Orchestration adapters may add effect-specific payload fields before writing
+/// the event, but policy code never consumes these strings.
+pub fn legacy_trace_events(event: &RuntimeEvent) -> Vec<LegacyTraceEvent> {
+    let one = |kind, payload| vec![LegacyTraceEvent { kind, payload }];
+    match event {
+        RuntimeEvent::RunStarted => one(RUN_STARTED, json!({})),
+        RuntimeEvent::RunFinished => one(RUN_FINISHED, json!({})),
+        RuntimeEvent::TurnStarted { turn } => one("agent.turn.started", json!({ "turn": turn })),
+        RuntimeEvent::ModelCallStarted { turn, depth } => one(
+            "llm.call.started",
+            json!({ "turn": turn, "llm_call_depth": depth }),
+        ),
+        RuntimeEvent::ModelContent { chars } => {
+            one("llm.content.observed", json!({ "chars": chars }))
+        }
+        RuntimeEvent::ModelThinking { chars } => {
+            one("llm.thinking.observed", json!({ "chars": chars }))
+        }
+        RuntimeEvent::ModelToolCall { name } => {
+            one("llm.tool_call.observed", json!({ "name": name }))
+        }
+        RuntimeEvent::ModelNoContent => one("llm.no_content_stream.observed", json!({})),
+        RuntimeEvent::ToolRead { path } => one("tool.read_file", json!({ "path": path })),
+        RuntimeEvent::ToolMutation {
+            paths,
+            evidence_invalidating_paths,
+            source,
+        } => one(
+            AGENT_STAGE_FIRST_SOURCE_MUTATION,
+            json!({
+                "paths": evidence_invalidating_paths,
+                "all_paths": paths,
+                "action": source,
+            }),
+        ),
+        RuntimeEvent::ValidationProbe {
+            command,
+            command_family,
+            status,
+            success,
+            ..
+        } => one(
+            AGENT_VALIDATION_PROBE_OBSERVED,
+            json!({
+                "command": command,
+                "command_family": command_family,
+                "status": status,
+                "success": success,
+            }),
+        ),
+        RuntimeEvent::RequestedProbeObserved {
+            probe_id,
+            command,
+            status,
+            success,
+        } => one(
+            "agent.requested_validation.observed",
+            json!({
+                "probe_id": probe_id,
+                "command": command,
+                "status": status,
+                "success": success,
+            }),
+        ),
+        RuntimeEvent::ActionBoundaryInterrupted { turn } => {
+            one("agent.action_boundary.interrupted", json!({ "turn": turn }))
+        }
+        RuntimeEvent::RepairNoContentInterrupted { turn } => one(
+            "agent.validation.repair_no_content_interrupted",
+            json!({ "turn": turn }),
+        ),
+        RuntimeEvent::RepairDepthExceeded { turn, reason } => one(
+            AGENT_VALIDATION_REPAIR_DEPTH_HARD_FAILED,
+            json!({ "turn": turn, "reason": reason }),
+        ),
+        RuntimeEvent::Inspection { signature } => one(
+            "agent.inspection_loop.observed",
+            json!({ "signature": signature }),
+        ),
+        RuntimeEvent::TurnFinished {
+            turn,
+            content,
+            tool_calls,
+            mutated,
+            probed,
+            ..
+        } => one(
+            "agent.turn.finished",
+            json!({
+                "turn": turn,
+                "content": content,
+                "tool_calls": tool_calls,
+                "mutated": mutated,
+                "probed": probed,
+            }),
+        ),
+        RuntimeEvent::TerminalToken { token } => match token {
+            TerminalToken::Done => one("agent.terminal.done_observed", json!({})),
+            TerminalToken::Fail => one("agent.terminal.fail_observed", json!({})),
+        },
+        RuntimeEvent::ManualStop { reason } => {
+            one(AGENT_RUN_MANUAL_STOP, json!({ "reason": reason }))
+        }
+        RuntimeEvent::EnvironmentStop { reason } => {
+            one("agent.run.environment_stop", json!({ "reason": reason }))
+        }
+        RuntimeEvent::EffectFailed { effect, error } => {
+            one(RUN_FAILED, json!({ "stage": effect, "error": error }))
+        }
+    }
+}
 
 /// Emitted once per run with the resolved run configuration and captured
 /// [`crate::provenance::HarnessSourceState`]. Payload fields consumed by the
@@ -139,3 +267,32 @@ pub const AGENT_CONTRACT_SUPPLIED: &str = "agent.contract.supplied";
 /// fields: `schema_version`, `adapter_kind`, `resolved` (a
 /// [`crate::contract::ResolvedRunContract`]).
 pub const AGENT_CONTRACT_RESOLVED: &str = "agent.contract.resolved";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{RepairDepthReason, RuntimeEvent};
+
+    #[test]
+    fn typed_events_adapt_to_stable_legacy_trace_names() {
+        let cases = [
+            (RuntimeEvent::RunStarted, RUN_STARTED),
+            (
+                RuntimeEvent::RepairDepthExceeded {
+                    turn: 4,
+                    reason: RepairDepthReason::MaxLlmCallDepth,
+                },
+                AGENT_VALIDATION_REPAIR_DEPTH_HARD_FAILED,
+            ),
+            (
+                RuntimeEvent::ManualStop {
+                    reason: "operator".to_string(),
+                },
+                AGENT_RUN_MANUAL_STOP,
+            ),
+        ];
+        for (event, expected_kind) in cases {
+            assert_eq!(legacy_trace_events(&event)[0].kind, expected_kind);
+        }
+    }
+}

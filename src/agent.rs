@@ -34,11 +34,8 @@ const RETAIN_RAW_TOOL_RESULT_MAX_CHARS: usize = 6_000;
 const REPAIR_HANDOFF_RAW_TOOL_RESULT_RECENT_COUNT: usize = 2;
 const REPAIR_HANDOFF_RAW_TOOL_RESULT_MAX_CHARS: usize = 3_000;
 const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
-const MAX_REPAIR_NO_ACTION_TURNS: usize = 2;
-const MAX_ACTION_BOUNDARY_NO_ACTION_TURNS: usize = 2;
 const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
 const HIDDEN_ONLY_NO_ACTION_ESCALATION_TURNS: usize = 2;
-const MAX_PRE_VALIDATION_REPEATED_INSPECTIONS: usize = 4;
 const NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER: usize = 20;
 const REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT: usize = 1_024;
 const MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH: usize = 12;
@@ -290,6 +287,18 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     )?;
 
     let scope = ToolScope::new(tool_root.clone(), Arc::clone(&trace))?;
+    let requested_probe_ids_by_command = resolved_contract
+        .probes
+        .iter()
+        .map(|probe| (probe.command.clone(), probe.id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    scope.configure_requested_probes(
+        resolved_contract
+            .probes
+            .iter()
+            .map(|probe| probe.id.clone())
+            .collect(),
+    );
     let profile = crate::profile::select_profile();
     let system_prompt = profile.system_guidance();
     let tools = coding_tools(&scope);
@@ -310,17 +319,16 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
     };
 
     let mut final_summary = String::new();
-    let mut consecutive_empty_responses = 0usize;
-    let mut consecutive_hidden_only_no_action_turns = 0usize;
-    let mut action_boundary_no_action_tracker = ActionBoundaryNoActionTracker::default();
-    let mut repair_no_action_tracker = RepairNoActionTracker::default();
     let mut final_response_only_next_turn = false;
     let mut requested_validation_ledger =
         RequestedValidationLedger::new(requested_validation_commands.clone());
+    scope.observe_runtime(crate::runtime::RuntimeEvent::RunStarted);
     let requested_validation_completed_write_operations = 0usize;
     let mut exhausted_iterations = true;
     let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     for turn in 1..=config.max_iterations {
+        scope.observe_runtime(crate::runtime::RuntimeEvent::TurnStarted { turn });
+        let runtime_before_turn = scope.runtime_state_snapshot();
         let policy_before_turn = scope.policy_snapshot();
         let requested_validation_ledger_before_turn = requested_validation_ledger.clone();
         let active_tools = if final_response_only_next_turn {
@@ -395,6 +403,26 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         let thinking_chars_this_turn = turn_result.thinking_chars;
         let response = turn_result.response;
         requested_validation_ledger = turn_result.requested_validation_ledger;
+        for entry in &requested_validation_ledger.entries {
+            if matches!(
+                entry.status,
+                RequestedValidationStatus::Passed | RequestedValidationStatus::Failed
+            ) && entry.generation == Some(requested_validation_ledger.generation)
+            {
+                scope.observe_runtime(crate::runtime::RuntimeEvent::RequestedProbeObserved {
+                    probe_id: requested_probe_ids_by_command
+                        .get(&entry.command)
+                        .cloned()
+                        .unwrap_or_else(|| entry.command.clone()),
+                    command: entry
+                        .observed_command
+                        .clone()
+                        .unwrap_or_else(|| entry.command.clone()),
+                    status: entry.status_code,
+                    success: entry.status == RequestedValidationStatus::Passed,
+                });
+            }
+        }
         messages = turn_result.messages;
         trace.event(
             "agent.turn.finished",
@@ -409,19 +437,19 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         let wrote_this_turn =
             policy.total_write_operations > policy_before_turn.total_write_operations;
         let probed_this_turn = policy.total_shell_probes > policy_before_turn.total_shell_probes;
-        let terminalize_after_validation = should_terminalize_after_successful_validation(
-            &policy_before_turn,
-            &policy,
-            &requested_validation_commands,
-        )
-        .filter(|_| requested_validation_commands.is_empty())
-        .or_else(|| {
-            (!requested_validation_commands.is_empty()
-                && !requested_validation_ledger_before_turn.is_satisfied()
-                && requested_validation_ledger.is_satisfied())
-            .then(|| requested_validation_ledger.latest_successful_validation())
+        let runtime_after_effects = scope.runtime_state_snapshot();
+        let terminalize_after_validation = (!runtime_before_turn.terminal_readiness
+            && runtime_after_effects.terminal_readiness
+            && policy.total_shell_probes > policy_before_turn.total_shell_probes)
+            .then(|| policy.latest_successful_validation_after_write.clone())
             .flatten()
-        });
+            .or_else(|| {
+                (!requested_validation_commands.is_empty()
+                    && !requested_validation_ledger_before_turn.is_satisfied()
+                    && requested_validation_ledger.is_satisfied())
+                .then(|| requested_validation_ledger.latest_successful_validation())
+                .flatten()
+            });
         trace.event(
             "agent.context.turn_pressure",
             serde_json::json!({
@@ -438,13 +466,58 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 "thinking_chars_this_turn": thinking_chars_this_turn,
             }),
         )?;
-        let repair_no_action = repair_no_action_tracker.observe(
+        if let Some(interrupt) = &action_boundary_interrupted {
+            scope.observe_runtime(crate::runtime::RuntimeEvent::ActionBoundaryInterrupted {
+                turn: interrupt.turn,
+            });
+        }
+        if repair_no_content_interrupted {
+            scope
+                .observe_runtime(crate::runtime::RuntimeEvent::RepairNoContentInterrupted { turn });
+        }
+        let turn_decision = scope.observe_runtime(crate::runtime::RuntimeEvent::TurnFinished {
+            turn,
+            content: !response.trim().is_empty(),
+            thinking: thinking_chars_this_turn > 0,
+            tool_calls: tool_calls_this_turn,
+            mutated: wrote_this_turn,
+            probed: probed_this_turn,
+            repair_was_active_before: policy_before_turn.validation_repair.is_some(),
+            repair_interrupted: repair_no_content_interrupted,
+            action_boundary_interrupted: action_boundary_interrupted.is_some(),
+        });
+        let runtime_after_turn = scope.runtime_state_snapshot();
+        let consecutive_empty_responses = runtime_after_turn.consecutive_empty_responses;
+        let consecutive_hidden_only_no_action_turns =
+            runtime_after_turn.consecutive_hidden_only_no_action_turns;
+        let repair_no_action = matches!(
+            turn_decision,
+            crate::runtime::RuntimeDecision::EscalateRepair
+                | crate::runtime::RuntimeDecision::HardStopRepairNoAction
+        )
+        .then(|| RepairNoActionDecision {
             turn,
             tool_calls_this_turn,
-            &policy_before_turn,
-            &policy,
-            repair_no_content_interrupted,
-        );
+            reason: if repair_no_content_interrupted {
+                RepairNoActionReason::NoContentInterrupted
+            } else {
+                RepairNoActionReason::NoRepairAction
+            },
+            consecutive_no_action_turns: runtime_after_turn.consecutive_repair_no_action_turns,
+            escalation_required: matches!(
+                turn_decision,
+                crate::runtime::RuntimeDecision::HardStopRepairNoAction
+            ),
+            active_repair: policy
+                .validation_repair
+                .clone()
+                .expect("repair decision requires active repair"),
+            validation_repair_read_paths: policy.validation_repair_read_paths.clone(),
+            total_write_operations_before_turn: policy_before_turn.total_write_operations,
+            total_write_operations_after_turn: policy.total_write_operations,
+            total_shell_probes_before_turn: policy_before_turn.total_shell_probes,
+            total_shell_probes_after_turn: policy.total_shell_probes,
+        });
         if let Some(decision) = &repair_no_action {
             trace.event("agent.validation.repair_no_action", decision)?;
             if decision.escalation_required {
@@ -465,13 +538,28 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             exhausted_iterations = false;
             break;
         }
-        let action_boundary_no_action = action_boundary_no_action_tracker.observe(
-            turn,
-            tool_calls_this_turn,
-            &policy_before_turn,
-            &policy,
-            action_boundary_interrupted.clone(),
-        );
+        let action_boundary_no_action = action_boundary_interrupted.clone().and_then(|interrupt| {
+            matches!(
+                turn_decision,
+                crate::runtime::RuntimeDecision::PromptActionBoundary
+                    | crate::runtime::RuntimeDecision::HardStopActionBoundary
+            )
+            .then(|| ActionBoundaryNoActionDecision {
+                turn,
+                tool_calls_this_turn,
+                consecutive_no_action_turns: runtime_after_turn
+                    .consecutive_action_boundary_no_action_turns,
+                escalation_required: matches!(
+                    turn_decision,
+                    crate::runtime::RuntimeDecision::HardStopActionBoundary
+                ),
+                interrupt,
+                total_write_operations_before_turn: policy_before_turn.total_write_operations,
+                total_write_operations_after_turn: policy.total_write_operations,
+                total_shell_probes_before_turn: policy_before_turn.total_shell_probes,
+                total_shell_probes_after_turn: policy.total_shell_probes,
+            })
+        });
         if let Some(decision) = &action_boundary_no_action {
             trace.event("agent.action_boundary.no_action", decision)?;
             if decision.escalation_required {
@@ -492,7 +580,6 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
         }
         if response.trim().is_empty() {
             if policy.validation_required_after_write {
-                consecutive_hidden_only_no_action_turns = 0;
                 trace.event(
                     "agent.validation.required_after_edit",
                     serde_json::json!({
@@ -508,7 +595,6 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 continue;
             }
             if let Some(decision) = &repair_no_action {
-                consecutive_hidden_only_no_action_turns = 0;
                 final_summary = format!(
                     "turn {turn} made no validation-repair edit or probe after validation failure"
                 );
@@ -518,7 +604,6 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 continue;
             }
             if let Some(interrupt) = &action_boundary_interrupted {
-                consecutive_hidden_only_no_action_turns = 0;
                 final_summary = format!(
                     "turn {turn} action-boundary interrupt after hidden reasoning with no visible action"
                 );
@@ -529,7 +614,6 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 continue;
             }
             if thinking_chars_this_turn > 0 && !wrote_this_turn && !probed_this_turn {
-                consecutive_hidden_only_no_action_turns += 1;
                 let escalation_required = consecutive_hidden_only_no_action_turns
                     >= HIDDEN_ONLY_NO_ACTION_ESCALATION_TURNS;
                 trace.event(
@@ -590,7 +674,6 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 )));
                 continue;
             }
-            consecutive_hidden_only_no_action_turns = 0;
             if tool_calls_this_turn > 0 {
                 trace.event(
                     "agent.turn.tool_only_response",
@@ -623,8 +706,13 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
                 ));
                 continue;
             }
-            consecutive_empty_responses += 1;
-            let empty_response_decision = empty_response_decision(consecutive_empty_responses);
+            let empty_response_decision = EmptyResponseDecision {
+                escalation_required: matches!(
+                    turn_decision,
+                    crate::runtime::RuntimeDecision::HardStopEmptyResponse
+                ),
+                prompt: empty_response_prompt(consecutive_empty_responses),
+            };
             if thinking_chars_this_turn > 0 {
                 trace.event(
                     "agent.turn.thinking_only_response",
@@ -669,8 +757,6 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             messages.push(LlmMessage::user(empty_response_decision.prompt));
             continue;
         }
-        consecutive_empty_responses = 0;
-        consecutive_hidden_only_no_action_turns = 0;
         final_summary = response.clone();
         messages.push(LlmMessage::assistant(response));
         if policy.validation_required_after_write {
@@ -687,7 +773,9 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             ));
             continue;
         }
-        if is_done_response(&final_summary) && !requested_validation_ledger.can_accept_done() {
+        if is_done_response(&final_summary)
+            && !scope.runtime_state_snapshot().requested_probes_satisfied()
+        {
             trace.event(
                 "agent.validation.done_rejected",
                 serde_json::json!({
@@ -702,6 +790,9 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             continue;
         }
         if is_terminal_response(&final_summary) {
+            if let Some(token) = crate::runtime::terminal_token(&final_summary) {
+                scope.observe_runtime(crate::runtime::RuntimeEvent::TerminalToken { token });
+            }
             exhausted_iterations = false;
             break;
         }
@@ -760,6 +851,7 @@ async fn run_coding_agent_with_gateway<G: LlmGateway + ?Sized>(
             )?;
         }
     }
+    scope.observe_runtime(crate::runtime::RuntimeEvent::RunFinished);
 
     let summary = AgentRunSummary {
         experiment_dir,
@@ -816,22 +908,11 @@ fn is_terminal_response(response: &str) -> bool {
 }
 
 fn is_done_response(response: &str) -> bool {
-    response
-        .lines()
-        .map(str::trim)
-        .any(|line| line.eq_ignore_ascii_case("DONE"))
+    crate::runtime::terminal_token(response) == Some(crate::runtime::TerminalToken::Done)
 }
 
 fn is_fail_response(response: &str) -> bool {
-    response
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .is_some_and(|line| {
-            line.split_once(char::is_whitespace)
-                .map(|(head, _)| head.eq_ignore_ascii_case("FAIL"))
-                .unwrap_or_else(|| line.eq_ignore_ascii_case("FAIL"))
-        })
+    crate::runtime::terminal_token(response) == Some(crate::runtime::TerminalToken::Fail)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -990,10 +1071,6 @@ impl RequestedValidationLedger {
             })
     }
 
-    fn can_accept_done(&self) -> bool {
-        self.entries.is_empty() || self.is_satisfied()
-    }
-
     fn latest_successful_validation(&self) -> Option<SuccessfulValidationSnapshot> {
         self.entries
             .iter()
@@ -1029,6 +1106,7 @@ fn should_prompt_validation_repair(policy: &ToolPolicySnapshot, response: &str) 
     policy.validation_repair.is_some() && !is_terminal_response(response)
 }
 
+#[cfg(test)]
 fn should_terminalize_after_successful_validation(
     before: &ToolPolicySnapshot,
     after: &ToolPolicySnapshot,
@@ -1252,11 +1330,6 @@ struct ActionBoundaryInterrupt {
     latest_preview: String,
 }
 
-#[derive(Debug, Default)]
-struct ActionBoundaryNoActionTracker {
-    consecutive_no_action_turns: usize,
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct ActionBoundaryNoActionDecision {
     turn: usize,
@@ -1268,12 +1341,6 @@ struct ActionBoundaryNoActionDecision {
     total_write_operations_after_turn: usize,
     total_shell_probes_before_turn: usize,
     total_shell_probes_after_turn: usize,
-}
-
-#[derive(Debug, Default)]
-struct RepairNoActionTracker {
-    active_failure_key: Option<String>,
-    consecutive_no_action_turns: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1317,113 +1384,6 @@ struct RepairDepthDecision {
 enum RepairDepthReason {
     MaxLlmCallDepth,
     RedContextAfterRepairAction,
-}
-
-impl ActionBoundaryNoActionTracker {
-    fn observe(
-        &mut self,
-        turn: usize,
-        tool_calls_this_turn: usize,
-        before: &ToolPolicySnapshot,
-        after: &ToolPolicySnapshot,
-        interrupt: Option<ActionBoundaryInterrupt>,
-    ) -> Option<ActionBoundaryNoActionDecision> {
-        let wrote_this_turn = after.total_write_operations > before.total_write_operations;
-        let probed_this_turn = after.total_shell_probes > before.total_shell_probes;
-        let Some(interrupt) = interrupt else {
-            if wrote_this_turn || probed_this_turn {
-                self.consecutive_no_action_turns = 0;
-            }
-            return None;
-        };
-        if wrote_this_turn || probed_this_turn {
-            self.consecutive_no_action_turns = 0;
-            return None;
-        }
-
-        self.consecutive_no_action_turns += 1;
-        Some(ActionBoundaryNoActionDecision {
-            turn,
-            tool_calls_this_turn,
-            consecutive_no_action_turns: self.consecutive_no_action_turns,
-            escalation_required: self.consecutive_no_action_turns
-                >= MAX_ACTION_BOUNDARY_NO_ACTION_TURNS,
-            interrupt,
-            total_write_operations_before_turn: before.total_write_operations,
-            total_write_operations_after_turn: after.total_write_operations,
-            total_shell_probes_before_turn: before.total_shell_probes,
-            total_shell_probes_after_turn: after.total_shell_probes,
-        })
-    }
-}
-
-impl RepairNoActionTracker {
-    fn observe(
-        &mut self,
-        turn: usize,
-        tool_calls_this_turn: usize,
-        before: &ToolPolicySnapshot,
-        after: &ToolPolicySnapshot,
-        repair_no_content_interrupted: bool,
-    ) -> Option<RepairNoActionDecision> {
-        let Some(active_repair) = after.validation_repair.clone() else {
-            self.reset();
-            return None;
-        };
-        let active_key = repair_failure_key(&active_repair);
-        if self.active_failure_key.as_deref() != Some(active_key.as_str()) {
-            self.active_failure_key = Some(active_key.clone());
-            self.consecutive_no_action_turns = 0;
-        }
-
-        let repair_was_active_before = before
-            .validation_repair
-            .as_ref()
-            .map(repair_failure_key)
-            .is_some_and(|before_key| before_key == active_key);
-        let wrote_this_turn = after.total_write_operations > before.total_write_operations;
-        let probed_this_turn = after.total_shell_probes > before.total_shell_probes;
-        let reason = if repair_no_content_interrupted && repair_was_active_before {
-            RepairNoActionReason::NoContentInterrupted
-        } else {
-            RepairNoActionReason::NoRepairAction
-        };
-
-        if !repair_was_active_before
-            || (!repair_no_content_interrupted && (wrote_this_turn || probed_this_turn))
-        {
-            self.consecutive_no_action_turns = 0;
-            return None;
-        }
-
-        self.consecutive_no_action_turns += 1;
-        Some(RepairNoActionDecision {
-            turn,
-            tool_calls_this_turn,
-            reason,
-            consecutive_no_action_turns: self.consecutive_no_action_turns,
-            escalation_required: self.consecutive_no_action_turns >= MAX_REPAIR_NO_ACTION_TURNS,
-            active_repair,
-            validation_repair_read_paths: after.validation_repair_read_paths.clone(),
-            total_write_operations_before_turn: before.total_write_operations,
-            total_write_operations_after_turn: after.total_write_operations,
-            total_shell_probes_before_turn: before.total_shell_probes,
-            total_shell_probes_after_turn: after.total_shell_probes,
-        })
-    }
-
-    fn reset(&mut self) {
-        self.active_failure_key = None;
-        self.consecutive_no_action_turns = 0;
-    }
-}
-
-fn repair_failure_key(repair: &ValidationRepairSnapshot) -> String {
-    format!(
-        "{}\n{}",
-        repair.command_family.trim(),
-        repair.failure_text.trim()
-    )
 }
 
 async fn stream_response<G: LlmGateway + ?Sized>(
@@ -2168,6 +2128,22 @@ fn repair_depth_decision(
     } else {
         None
     }?;
+    let runtime_reason = match reason {
+        RepairDepthReason::MaxLlmCallDepth => crate::runtime::RepairDepthReason::MaxLlmCallDepth,
+        RepairDepthReason::RedContextAfterRepairAction => {
+            crate::runtime::RepairDepthReason::RedContextAfterRepairAction
+        }
+    };
+    let event = crate::runtime::RuntimeEvent::RepairDepthExceeded {
+        turn: ledger.turn,
+        reason: runtime_reason,
+    };
+    if !matches!(
+        crate::runtime::RuntimePolicy.decide(&crate::runtime::RuntimeState::default(), &event),
+        crate::runtime::RuntimeDecision::HardStopRepairDepth { .. }
+    ) {
+        return None;
+    }
 
     Some(RepairDepthDecision {
         turn: ledger.turn,
@@ -2337,8 +2313,7 @@ struct InspectionLoopDecision {
 
 #[derive(Debug, Default)]
 struct InspectionLoopTracker {
-    meaningful_action_seen: bool,
-    signatures: BTreeMap<String, usize>,
+    runtime: crate::runtime::RuntimeState,
 }
 
 impl InspectionLoopTracker {
@@ -2349,25 +2324,33 @@ impl InspectionLoopTracker {
         call: &LlmToolCall,
         result: &ToolCallRunResult,
     ) -> Option<InspectionLoopDecision> {
-        if self.meaningful_action_seen {
+        if self.runtime.meaningful_action_seen {
             return None;
         }
         if is_meaningful_source_edit(call, result) || is_validation_probe_result(result) {
-            self.meaningful_action_seen = true;
-            self.signatures.clear();
+            self.runtime.meaningful_action_seen = true;
+            self.runtime.repeated_inspections.clear();
             return None;
         }
 
         let signature = inspection_signature(call)?;
-        let count = self.signatures.entry(signature.clone()).or_insert(0);
-        *count += 1;
-        (*count >= MAX_PRE_VALIDATION_REPEATED_INSPECTIONS).then_some(InspectionLoopDecision {
-            signature,
-            repeated_count: *count,
-            limit: MAX_PRE_VALIDATION_REPEATED_INSPECTIONS,
-            turn,
-            llm_call_depth,
-        })
+        let event = crate::runtime::RuntimeEvent::Inspection {
+            signature: signature.clone(),
+        };
+        let decision = crate::runtime::RuntimePolicy.decide(&self.runtime, &event);
+        self.runtime.reduce(&event);
+        match decision {
+            crate::runtime::RuntimeDecision::StopRepeatedInspection { count, .. } => {
+                Some(InspectionLoopDecision {
+                    signature,
+                    repeated_count: count,
+                    limit: crate::runtime::MAX_PRE_VALIDATION_REPEATED_INSPECTIONS,
+                    turn,
+                    llm_call_depth,
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -3500,6 +3483,7 @@ struct EmptyResponseDecision {
     prompt: String,
 }
 
+#[cfg(test)]
 fn empty_response_decision(consecutive_empty_responses: usize) -> EmptyResponseDecision {
     EmptyResponseDecision {
         escalation_required: consecutive_empty_responses >= EMPTY_RESPONSE_ESCALATION_TURNS,
@@ -5094,7 +5078,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_no_action_tracker_escalates_after_repeated_no_write_turns() {
+    fn repair_no_action_escalation_prompt_preserves_failure_evidence() {
         let repair = ValidationRepairSnapshot {
             active: true,
             command: "cargo clippy --all-targets".to_string(),
@@ -5105,30 +5089,19 @@ mod tests {
             repeated_command_family_count: 1,
             repeated_failure_summary_count: 1,
         };
-        let mut tracker = RepairNoActionTracker::default();
-        let before = repair_policy_snapshot(3, 2, Some(repair.clone()), BTreeMap::new());
-        let after_first = repair_policy_snapshot(
-            3,
-            2,
-            Some(repair.clone()),
-            BTreeMap::from([("src/main.rs".to_string(), 1)]),
-        );
-
-        let first = tracker.observe(6, 1, &before, &after_first, false).unwrap();
-
-        assert_eq!(first.consecutive_no_action_turns, 1);
-        assert!(!first.escalation_required);
-        assert!(matches!(first.reason, RepairNoActionReason::NoRepairAction));
-
-        let after_second = repair_policy_snapshot(
-            3,
-            2,
-            Some(repair.clone()),
-            BTreeMap::from([("src/main.rs".to_string(), 3)]),
-        );
-        let second = tracker
-            .observe(7, 1, &after_first, &after_second, false)
-            .unwrap();
+        let second = RepairNoActionDecision {
+            turn: 7,
+            tool_calls_this_turn: 1,
+            reason: RepairNoActionReason::NoRepairAction,
+            consecutive_no_action_turns: 2,
+            escalation_required: true,
+            active_repair: repair,
+            validation_repair_read_paths: BTreeMap::from([("src/main.rs".to_string(), 3)]),
+            total_write_operations_before_turn: 3,
+            total_write_operations_after_turn: 3,
+            total_shell_probes_before_turn: 2,
+            total_shell_probes_after_turn: 2,
+        };
 
         assert_eq!(second.consecutive_no_action_turns, 2);
         assert!(second.escalation_required);
@@ -5149,60 +5122,6 @@ mod tests {
         assert!(!prompt.contains("bounded write"));
         assert!(!prompt.contains("patch/write_file"));
         assert!(prompt.contains("Do not emit a text-only repair plan"));
-
-        let after_write = repair_policy_snapshot(4, 2, Some(repair), BTreeMap::new());
-        assert!(
-            tracker
-                .observe(8, 1, &after_second, &after_write, false)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn repair_no_action_tracker_counts_repair_no_content_interrupts() {
-        let repair = ValidationRepairSnapshot {
-            active: true,
-            command: "cargo clippy --all-targets".to_string(),
-            command_family: "cargo clippy".to_string(),
-            status: Some(101),
-            failure_text: "error[E0422]: cannot find struct `TextStyle`".to_string(),
-            failure_details: Vec::new(),
-            repeated_command_family_count: 1,
-            repeated_failure_summary_count: 1,
-        };
-        let mut tracker = RepairNoActionTracker::default();
-        let before = repair_policy_snapshot(3, 2, Some(repair.clone()), BTreeMap::new());
-        let after_action_with_interrupt =
-            repair_policy_snapshot(4, 3, Some(repair.clone()), BTreeMap::new());
-
-        let first = tracker
-            .observe(6, 4, &before, &after_action_with_interrupt, true)
-            .unwrap();
-
-        assert_eq!(first.consecutive_no_action_turns, 1);
-        assert!(!first.escalation_required);
-        assert!(matches!(
-            first.reason,
-            RepairNoActionReason::NoContentInterrupted
-        ));
-
-        let after_second_interrupt = repair_policy_snapshot(4, 3, Some(repair), BTreeMap::new());
-        let second = tracker
-            .observe(
-                7,
-                0,
-                &after_action_with_interrupt,
-                &after_second_interrupt,
-                true,
-            )
-            .unwrap();
-
-        assert_eq!(second.consecutive_no_action_turns, 2);
-        assert!(second.escalation_required);
-        assert!(matches!(
-            second.reason,
-            RepairNoActionReason::NoContentInterrupted
-        ));
     }
 
     #[test]

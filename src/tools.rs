@@ -1,3 +1,7 @@
+use crate::runtime::{
+    MutationSource, RuntimeDecision, RuntimeEvent, RuntimePolicy, RuntimeState,
+    SuccessfulValidation, ValidationRepair,
+};
 use crate::trace::TraceRecorder;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -15,7 +19,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
-const MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL: usize = 3;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 20_000;
 const DEFAULT_READ_MAX_BYTES: usize = 20_000;
 const DEFAULT_TREE_MAX_DEPTH: usize = 4;
@@ -25,38 +28,26 @@ const MAX_SHELL_TIMEOUT_SECS: u64 = 1800;
 const PATCH_TIMEOUT_SECS: u64 = 300;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const MAX_SHELL_MUTATION_HASH_BYTES: u64 = 2_000_000;
-const FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE: usize = 1;
+#[cfg(test)]
+const MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL: usize =
+    crate::runtime::MAX_CONSECUTIVE_WRITES_WITHOUT_PROBE;
 
 #[derive(Debug, Clone)]
 pub struct ToolScope {
     root: Arc<PathBuf>,
     trace: Arc<TraceRecorder>,
-    policy: Arc<Mutex<ToolPolicyState>>,
+    runtime: Arc<Mutex<RuntimeState>>,
+    measurements: Arc<Mutex<ToolMeasurements>>,
     access: Arc<AccessPolicy>,
 }
 
 #[derive(Debug, Default)]
-struct ToolPolicyState {
-    total_tool_calls: usize,
-    consecutive_writes_without_shell: usize,
-    writes_since_shell_probe: usize,
-    writes_since_shell_probe_paths: BTreeMap<String, usize>,
-    total_write_operations: usize,
-    total_shell_probes: usize,
-    validation_repair: Option<ValidationRepairState>,
-    validation_repair_write_allowance: usize,
-    validation_repair_read_paths: BTreeMap<String, usize>,
-    repeated_command_failures: HashMap<String, usize>,
-    repeated_failure_summaries: HashMap<String, usize>,
-    latest_successful_validation_after_write: Option<SuccessfulValidationState>,
+struct ToolMeasurements {
     patch_fallbacks_by_file: BTreeMap<String, PatchFallbackState>,
     total_tool_result_chars: usize,
     max_tool_result_chars: usize,
     max_tool_result_kind: Option<String>,
     tool_result_chars_by_kind: BTreeMap<String, usize>,
-    emitted_first_source_mutation: bool,
-    emitted_first_validation_probe: bool,
-    emitted_first_post_validation_repair_action: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -92,17 +83,6 @@ pub struct ValidationRepairSnapshot {
     pub repeated_failure_summary_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ValidationRepairState {
-    command: String,
-    command_family: String,
-    status: Option<i32>,
-    failure_text: String,
-    failure_details: Vec<String>,
-    repeated_command_family_count: usize,
-    repeated_failure_summary_count: usize,
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SuccessfulValidationSnapshot {
     pub command: String,
@@ -112,29 +92,20 @@ pub struct SuccessfulValidationSnapshot {
     pub total_write_operations: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SuccessfulValidationState {
-    command: String,
-    command_family: String,
-    status: Option<i32>,
-    total_shell_probes: usize,
-    total_write_operations: usize,
-}
-
-impl From<&SuccessfulValidationState> for SuccessfulValidationSnapshot {
-    fn from(state: &SuccessfulValidationState) -> Self {
+impl From<&SuccessfulValidation> for SuccessfulValidationSnapshot {
+    fn from(state: &SuccessfulValidation) -> Self {
         Self {
             command: state.command.clone(),
             command_family: state.command_family.clone(),
             status: state.status,
-            total_shell_probes: state.total_shell_probes,
+            total_shell_probes: state.probe_epoch,
             total_write_operations: state.total_write_operations,
         }
     }
 }
 
-impl From<&ValidationRepairState> for ValidationRepairSnapshot {
-    fn from(state: &ValidationRepairState) -> Self {
+impl From<&ValidationRepair> for ValidationRepairSnapshot {
+    fn from(state: &ValidationRepair) -> Self {
         Self {
             active: true,
             command: state.command.clone(),
@@ -226,7 +197,8 @@ impl ToolScope {
         Ok(Self {
             root: Arc::new(root),
             trace,
-            policy: Arc::new(Mutex::new(ToolPolicyState::default())),
+            runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            measurements: Arc::new(Mutex::new(ToolMeasurements::default())),
             access: Arc::new(access),
         })
     }
@@ -371,72 +343,48 @@ impl ToolScope {
             .filter(|path| crate::profile::coding::path_requires_validation_after_write(path))
             .cloned()
             .collect::<Vec<_>>();
-        let mut first_source_mutation = false;
-        let mut first_post_validation_repair_action = false;
-        let mut active_repair = None;
-        let mut repair_allowance_used = None;
-        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
-        if policy.consecutive_writes_without_shell >= MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
-            let use_repair_allowance = !source_paths.is_empty()
-                && policy.validation_repair.is_some()
-                && policy.validation_repair_write_allowance > 0;
-            if use_repair_allowance {
-                policy.validation_repair_write_allowance -= 1;
-                repair_allowance_used = Some((
-                    policy.validation_repair_write_allowance,
-                    policy
-                        .validation_repair
-                        .as_ref()
-                        .map(ValidationRepairSnapshot::from),
-                ));
-            } else {
-                let consecutive_writes_without_shell = policy.consecutive_writes_without_shell;
-                let writes_since_shell_probe = policy.writes_since_shell_probe;
-                let writes_since_shell_probe_paths = policy.writes_since_shell_probe_paths.clone();
-                let total_write_operations = policy.total_write_operations;
-                drop(policy);
-                self.trace.event(
-                    "agent.write_budget.exhausted",
-                    json!({
-                        "attempted_paths": relative_paths,
-                        "attempted_source_paths": source_paths,
-                        "consecutive_writes_without_shell": consecutive_writes_without_shell,
-                        "writes_since_shell_probe": writes_since_shell_probe,
-                        "writes_since_shell_probe_paths": writes_since_shell_probe_paths,
-                        "total_write_operations": total_write_operations,
-                        "required_action": "shell_validation_probe",
-                    }),
-                )?;
-                bail!("write budget exhausted: run a shell validation probe before editing again");
+        let event = RuntimeEvent::ToolMutation {
+            paths: relative_paths.clone(),
+            evidence_invalidating_paths: source_paths.clone(),
+            source: MutationSource::Write,
+        };
+        let mut runtime = self.runtime.lock().expect("runtime state mutex poisoned");
+        let first_source_mutation =
+            !source_paths.is_empty() && !runtime.emitted_first_source_mutation;
+        let first_post_validation_repair_action = !source_paths.is_empty()
+            && runtime.validation_repair.is_some()
+            && !runtime.emitted_first_post_repair_action;
+        let active_repair = runtime
+            .validation_repair
+            .as_ref()
+            .map(ValidationRepairSnapshot::from);
+        let decision = RuntimePolicy.decide(&runtime, &event);
+        let consume_repair_allowance = matches!(
+            decision,
+            RuntimeDecision::AllowMutation {
+                consume_repair_allowance: true
             }
+        );
+        if let RuntimeDecision::RejectMutation { reason } = decision {
+            self.trace.event(
+                "agent.write_budget.exhausted",
+                json!({
+                    "attempted_paths": relative_paths,
+                    "attempted_source_paths": source_paths,
+                    "consecutive_writes_without_shell": runtime.consecutive_writes_without_probe,
+                    "writes_since_shell_probe": runtime.writes_since_probe,
+                    "writes_since_shell_probe_paths": runtime.writes_since_probe_paths,
+                    "total_write_operations": runtime.total_write_operations,
+                    "required_action": "shell_validation_probe",
+                }),
+            )?;
+            bail!(reason);
         }
-        if !source_paths.is_empty() && !policy.emitted_first_source_mutation {
-            policy.emitted_first_source_mutation = true;
-            first_source_mutation = true;
-        }
-        if !source_paths.is_empty()
-            && policy.validation_repair.is_some()
-            && !policy.emitted_first_post_validation_repair_action
-        {
-            policy.emitted_first_post_validation_repair_action = true;
-            first_post_validation_repair_action = true;
-            active_repair = policy
-                .validation_repair
-                .as_ref()
-                .map(ValidationRepairSnapshot::from);
-        }
-        policy.consecutive_writes_without_shell += 1;
-        policy.writes_since_shell_probe += 1;
-        for relative in relative_paths {
-            *policy
-                .writes_since_shell_probe_paths
-                .entry(relative)
-                .or_insert(0) += 1;
-        }
-        policy.total_write_operations += 1;
-        let total_write_operations = policy.total_write_operations;
-        drop(policy);
-        if let Some((remaining, active_repair)) = repair_allowance_used {
+        runtime.reduce(&event);
+        let total_write_operations = runtime.total_write_operations;
+        let remaining = runtime.validation_repair_write_allowance;
+        drop(runtime);
+        if consume_repair_allowance {
             self.trace.event(
                 "agent.validation.repair_write_allowance.used",
                 json!({
@@ -480,36 +428,24 @@ impl ToolScope {
             .filter(|path| crate::profile::coding::path_requires_validation_after_write(path))
             .cloned()
             .collect::<Vec<_>>();
-        let mut first_source_mutation = false;
-        let mut first_post_validation_repair_action = false;
-        let mut active_repair = None;
-        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
-        if !source_paths.is_empty() && !policy.emitted_first_source_mutation {
-            policy.emitted_first_source_mutation = true;
-            first_source_mutation = true;
-        }
-        if !source_paths.is_empty()
-            && policy.validation_repair.is_some()
-            && !policy.emitted_first_post_validation_repair_action
-        {
-            policy.emitted_first_post_validation_repair_action = true;
-            first_post_validation_repair_action = true;
-            active_repair = policy
-                .validation_repair
-                .as_ref()
-                .map(ValidationRepairSnapshot::from);
-        }
-        policy.consecutive_writes_without_shell += 1;
-        policy.writes_since_shell_probe += 1;
-        for relative in paths {
-            *policy
-                .writes_since_shell_probe_paths
-                .entry(relative.clone())
-                .or_insert(0) += 1;
-        }
-        policy.total_write_operations += 1;
-        let total_write_operations = policy.total_write_operations;
-        drop(policy);
+        let event = RuntimeEvent::ToolMutation {
+            paths: paths.to_vec(),
+            evidence_invalidating_paths: source_paths.clone(),
+            source: MutationSource::Shell,
+        };
+        let mut runtime = self.runtime.lock().expect("runtime state mutex poisoned");
+        let first_source_mutation =
+            !source_paths.is_empty() && !runtime.emitted_first_source_mutation;
+        let first_post_validation_repair_action = !source_paths.is_empty()
+            && runtime.validation_repair.is_some()
+            && !runtime.emitted_first_post_repair_action;
+        let active_repair = runtime
+            .validation_repair
+            .as_ref()
+            .map(ValidationRepairSnapshot::from);
+        runtime.reduce(&event);
+        let total_write_operations = runtime.total_write_operations;
+        drop(runtime);
         if first_source_mutation {
             let _ = self.trace.event(
                 "agent.stage.first_source_mutation",
@@ -542,22 +478,28 @@ impl ToolScope {
 
     fn note_read_target(&self, path: &Path) {
         let relative = self.relative_display(path);
-        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
-        if policy.validation_repair.is_some() {
-            *policy
-                .validation_repair_read_paths
-                .entry(relative)
-                .or_insert(0) += 1;
-        }
+        self.runtime
+            .lock()
+            .expect("runtime state mutex poisoned")
+            .reduce(&RuntimeEvent::ToolRead { path: relative });
     }
 
     #[cfg(test)]
     fn note_validation_probe(&self) {
-        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
-        policy.consecutive_writes_without_shell = 0;
-        policy.writes_since_shell_probe = 0;
-        policy.writes_since_shell_probe_paths.clear();
-        policy.total_shell_probes += 1;
+        self.runtime
+            .lock()
+            .expect("runtime state mutex poisoned")
+            .reduce(&RuntimeEvent::ValidationProbe {
+                probe_id: None,
+                command: "validation probe".to_string(),
+                command_family: "validation".to_string(),
+                status: Some(0),
+                success: true,
+                clears_pending_mutations: true,
+                caused_mutation: false,
+                failure_text: String::new(),
+                failure_details: Vec::new(),
+            });
     }
 
     fn note_validation_probe_result(
@@ -572,47 +514,45 @@ impl ToolScope {
         let failure_details =
             crate::profile::coding::failure_details(&stderr.content, &stdout.content);
         let success = output.status.success();
-        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
-        let pending_paths_before_probe = policy.writes_since_shell_probe_paths.clone();
-        let had_pending_source_writes = policy
-            .writes_since_shell_probe_paths
+        let mut runtime = self.runtime.lock().expect("runtime state mutex poisoned");
+        let pending_paths_before_probe = runtime.writes_since_probe_paths.clone();
+        let had_pending_source_writes = runtime
+            .writes_since_probe_paths
             .keys()
             .any(|path| crate::profile::coding::path_requires_validation_after_write(path));
         let cleared_pending_source_writes = had_pending_source_writes && success;
-        let first_validation_probe = !policy.emitted_first_validation_probe;
-        if first_validation_probe {
-            policy.emitted_first_validation_probe = true;
-        }
-        let first_post_validation_repair_action = policy.validation_repair.is_some()
-            && !policy.emitted_first_post_validation_repair_action;
+        let first_validation_probe = !runtime.emitted_first_validation_probe;
+        let first_post_validation_repair_action =
+            runtime.validation_repair.is_some() && !runtime.emitted_first_post_repair_action;
         let active_repair = if first_post_validation_repair_action {
-            policy.emitted_first_post_validation_repair_action = true;
-            policy
+            runtime
                 .validation_repair
                 .as_ref()
                 .map(ValidationRepairSnapshot::from)
         } else {
             None
         };
-        if success {
-            policy.consecutive_writes_without_shell = 0;
-            policy.writes_since_shell_probe = 0;
-            policy.writes_since_shell_probe_paths.clear();
-            policy.validation_repair_write_allowance = 0;
-        }
-        policy.total_shell_probes += 1;
-        let total_shell_probes = policy.total_shell_probes;
-        let total_write_operations = policy.total_write_operations;
-        if success && had_pending_source_writes {
-            policy.latest_successful_validation_after_write = Some(SuccessfulValidationState {
-                command: command.to_string(),
-                command_family: command_family.clone(),
-                status: output.status.code(),
-                total_shell_probes,
-                total_write_operations,
-            });
-        }
-        drop(policy);
+        let previous_repair = runtime.validation_repair.is_some();
+        let event = RuntimeEvent::ValidationProbe {
+            probe_id: None,
+            command: command.to_string(),
+            command_family: command_family.clone(),
+            status: output.status.code(),
+            success,
+            clears_pending_mutations: cleared_pending_source_writes,
+            caused_mutation: false,
+            failure_text,
+            failure_details,
+        };
+        runtime.reduce(&event);
+        let total_shell_probes = runtime.total_validation_probes;
+        let total_write_operations = runtime.total_write_operations;
+        let repair = runtime
+            .validation_repair
+            .as_ref()
+            .map(ValidationRepairSnapshot::from);
+        let granted_repair_write_allowance = !success && had_pending_source_writes;
+        drop(runtime);
 
         if first_validation_probe {
             self.trace.event(
@@ -655,14 +595,8 @@ impl ToolScope {
             )?;
         }
 
-        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
-
         if success {
-            let previous = policy.validation_repair.take();
-            policy.validation_repair_write_allowance = 0;
-            policy.validation_repair_read_paths.clear();
-            drop(policy);
-            if previous.is_some() {
+            if previous_repair {
                 self.trace.event(
                     "agent.validation.repair_resolved",
                     json!({
@@ -673,40 +607,7 @@ impl ToolScope {
             }
             return Ok(None);
         }
-
-        let command_count = {
-            let count = policy
-                .repeated_command_failures
-                .entry(command_family.clone())
-                .or_insert(0);
-            *count += 1;
-            *count
-        };
-        let summary_count = {
-            let count = policy
-                .repeated_failure_summaries
-                .entry(failure_text.clone())
-                .or_insert(0);
-            *count += 1;
-            *count
-        };
-        let repair = ValidationRepairState {
-            command: command.to_string(),
-            command_family,
-            status: output.status.code(),
-            failure_text,
-            failure_details,
-            repeated_command_family_count: command_count,
-            repeated_failure_summary_count: summary_count,
-        };
-        let snapshot = ValidationRepairSnapshot::from(&repair);
-        policy.validation_repair = Some(repair);
-        let granted_repair_write_allowance = had_pending_source_writes;
-        if granted_repair_write_allowance {
-            policy.validation_repair_write_allowance = FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE;
-        }
-        policy.validation_repair_read_paths.clear();
-        drop(policy);
+        let snapshot = repair.expect("failed validation activates repair state");
         self.trace
             .event("agent.validation.repair_required", &snapshot)?;
         if granted_repair_write_allowance {
@@ -716,7 +617,7 @@ impl ToolScope {
                     "command": command,
                     "command_family": snapshot.command_family,
                     "status": snapshot.status,
-                    "allowance": FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE,
+                    "allowance": crate::runtime::FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE,
                     "pending_paths_before_probe": pending_paths_before_probe,
                 }),
             )?;
@@ -725,8 +626,12 @@ impl ToolScope {
     }
 
     fn note_tool_call(&self) {
-        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
-        policy.total_tool_calls += 1;
+        self.runtime
+            .lock()
+            .expect("runtime state mutex poisoned")
+            .reduce(&RuntimeEvent::ModelToolCall {
+                name: "tool".to_string(),
+            });
     }
 
     fn trace_tool_event(&self, kind: &str, payload: Value) {
@@ -734,13 +639,16 @@ impl ToolScope {
             .map(|content| content.len())
             .unwrap_or_default();
         let snapshot = {
-            let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
-            policy.total_tool_result_chars += result_chars;
-            if result_chars > policy.max_tool_result_chars {
-                policy.max_tool_result_chars = result_chars;
-                policy.max_tool_result_kind = Some(kind.to_string());
+            let mut measurements = self
+                .measurements
+                .lock()
+                .expect("tool measurements mutex poisoned");
+            measurements.total_tool_result_chars += result_chars;
+            if result_chars > measurements.max_tool_result_chars {
+                measurements.max_tool_result_chars = result_chars;
+                measurements.max_tool_result_kind = Some(kind.to_string());
             }
-            *policy
+            *measurements
                 .tool_result_chars_by_kind
                 .entry(kind.to_string())
                 .or_insert(0) += result_chars;
@@ -748,11 +656,15 @@ impl ToolScope {
                 kind: kind.to_string(),
                 result_chars,
                 result_estimated_tokens: estimate_tokens(result_chars),
-                total_tool_result_chars: policy.total_tool_result_chars,
-                total_tool_result_estimated_tokens: estimate_tokens(policy.total_tool_result_chars),
-                max_tool_result_chars: policy.max_tool_result_chars,
-                max_tool_result_estimated_tokens: estimate_tokens(policy.max_tool_result_chars),
-                max_tool_result_kind: policy.max_tool_result_kind.clone(),
+                total_tool_result_chars: measurements.total_tool_result_chars,
+                total_tool_result_estimated_tokens: estimate_tokens(
+                    measurements.total_tool_result_chars,
+                ),
+                max_tool_result_chars: measurements.max_tool_result_chars,
+                max_tool_result_estimated_tokens: estimate_tokens(
+                    measurements.max_tool_result_chars,
+                ),
+                max_tool_result_kind: measurements.max_tool_result_kind.clone(),
             }
         };
         let _ = self.trace.event("tool.payload.measured", &snapshot);
@@ -760,28 +672,29 @@ impl ToolScope {
     }
 
     pub fn policy_snapshot(&self) -> ToolPolicySnapshot {
-        let policy = self.policy.lock().expect("tool policy mutex poisoned");
+        let runtime = self.runtime.lock().expect("runtime state mutex poisoned");
+        let measurements = self
+            .measurements
+            .lock()
+            .expect("tool measurements mutex poisoned");
         ToolPolicySnapshot {
-            total_tool_calls: policy.total_tool_calls,
-            consecutive_writes_without_shell: policy.consecutive_writes_without_shell,
-            writes_since_shell_probe: policy.writes_since_shell_probe,
-            writes_since_shell_probe_paths: policy.writes_since_shell_probe_paths.clone(),
-            validation_required_after_write: policy
-                .writes_since_shell_probe_paths
-                .keys()
-                .any(|path| crate::profile::coding::path_requires_validation_after_write(path)),
-            total_write_operations: policy.total_write_operations,
-            total_shell_probes: policy.total_shell_probes,
-            validation_repair: policy
+            total_tool_calls: runtime.total_tool_calls,
+            consecutive_writes_without_shell: runtime.consecutive_writes_without_probe,
+            writes_since_shell_probe: runtime.writes_since_probe,
+            writes_since_shell_probe_paths: runtime.writes_since_probe_paths.clone(),
+            validation_required_after_write: runtime.validation_required(),
+            total_write_operations: runtime.total_write_operations,
+            total_shell_probes: runtime.total_validation_probes,
+            validation_repair: runtime
                 .validation_repair
                 .as_ref()
                 .map(ValidationRepairSnapshot::from),
-            validation_repair_read_paths: policy.validation_repair_read_paths.clone(),
-            latest_successful_validation_after_write: policy
-                .latest_successful_validation_after_write
+            validation_repair_read_paths: runtime.validation_repair_read_paths.clone(),
+            latest_successful_validation_after_write: runtime
+                .latest_successful_validation
                 .as_ref()
                 .map(SuccessfulValidationSnapshot::from),
-            patch_fallbacks: policy
+            patch_fallbacks: measurements
                 .patch_fallbacks_by_file
                 .iter()
                 .map(|(path, state)| PatchFallbackSnapshot {
@@ -791,13 +704,41 @@ impl ToolScope {
                     guidance: state.guidance.clone(),
                 })
                 .collect(),
-            total_tool_result_chars: policy.total_tool_result_chars,
-            total_tool_result_estimated_tokens: estimate_tokens(policy.total_tool_result_chars),
-            max_tool_result_chars: policy.max_tool_result_chars,
-            max_tool_result_estimated_tokens: estimate_tokens(policy.max_tool_result_chars),
-            max_tool_result_kind: policy.max_tool_result_kind.clone(),
-            tool_result_chars_by_kind: policy.tool_result_chars_by_kind.clone(),
+            total_tool_result_chars: measurements.total_tool_result_chars,
+            total_tool_result_estimated_tokens: estimate_tokens(
+                measurements.total_tool_result_chars,
+            ),
+            max_tool_result_chars: measurements.max_tool_result_chars,
+            max_tool_result_estimated_tokens: estimate_tokens(measurements.max_tool_result_chars),
+            max_tool_result_kind: measurements.max_tool_result_kind.clone(),
+            tool_result_chars_by_kind: measurements.tool_result_chars_by_kind.clone(),
         }
+    }
+
+    /// Feed an orchestration observation through the same pure state/policy
+    /// core used by tool effects. The decision is computed before the event is
+    /// reduced, preserving policy precedence at the adapter boundary.
+    pub fn observe_runtime(&self, event: RuntimeEvent) -> RuntimeDecision {
+        let mut runtime = self.runtime.lock().expect("runtime state mutex poisoned");
+        let decision = RuntimePolicy.decide(&runtime, &event);
+        runtime.reduce(&event);
+        decision
+    }
+
+    pub fn runtime_state_snapshot(&self) -> RuntimeState {
+        self.runtime
+            .lock()
+            .expect("runtime state mutex poisoned")
+            .clone()
+    }
+
+    pub fn configure_requested_probes(&self, probe_ids: Vec<String>) {
+        let mut runtime = self.runtime.lock().expect("runtime state mutex poisoned");
+        assert_eq!(
+            runtime.total_tool_calls, 0,
+            "requested probes must be configured before effects begin"
+        );
+        *runtime = RuntimeState::new(probe_ids);
     }
 
     fn note_patch_fallback_choice(
@@ -829,7 +770,10 @@ impl ToolScope {
             .iter()
             .map(|path| self.relative_display(path))
             .collect::<Vec<_>>();
-        let mut policy = self.policy.lock().expect("tool policy mutex poisoned");
+        let mut policy = self
+            .measurements
+            .lock()
+            .expect("tool measurements mutex poisoned");
         for path in &relative_paths {
             let fallback =
                 policy
@@ -871,7 +815,10 @@ impl ToolScope {
             .iter()
             .map(|path| self.relative_display(path))
             .collect::<Vec<_>>();
-        let policy = self.policy.lock().expect("tool policy mutex poisoned");
+        let policy = self
+            .measurements
+            .lock()
+            .expect("tool measurements mutex poisoned");
         Ok(policy
             .patch_fallbacks_by_file
             .iter()

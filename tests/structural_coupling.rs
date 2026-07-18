@@ -40,6 +40,7 @@ const CORE_SOURCE_FILES: &[&str] = &[
     "src/trace.rs",
     "src/trace_analysis.rs",
     "src/runtime_events.rs",
+    "src/runtime.rs",
     "src/provenance.rs",
     "src/lib.rs",
     "src/main.rs",
@@ -110,6 +111,53 @@ fn strip_test_modules(source: &str) -> String {
         rest = &rest[close_brace..];
     }
     result
+}
+
+#[test]
+fn runtime_reducer_and_policy_are_effect_free() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = repo_root.join("src/runtime.rs");
+    let source = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    let production = strip_test_modules(&source);
+    let forbidden = [
+        "use mojentic",
+        "use tokio",
+        "use std::fs",
+        "use std::process",
+        "use std::time",
+        "use chrono",
+        "use tracing",
+        "crate::trace::",
+        "crate::profile::",
+        "crate::profile",
+    ];
+    let found = forbidden
+        .iter()
+        .filter(|token| production.contains(**token))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        found.is_empty(),
+        "runtime reducer/policy must not import provider, filesystem, subprocess, clock, tracing, or profile effects: {found:?}"
+    );
+}
+
+#[test]
+fn orchestration_adapters_do_not_reintroduce_transition_state() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let forbidden = [
+        ("src/tools.rs", "struct ToolPolicyState"),
+        ("src/agent.rs", "struct ActionBoundaryNoActionTracker"),
+        ("src/agent.rs", "struct RepairNoActionTracker"),
+    ];
+    for (relative, token) in forbidden {
+        let source = fs::read_to_string(repo_root.join(relative)).unwrap();
+        assert!(
+            !strip_test_modules(&source).contains(token),
+            "{relative} must delegate transition ownership to RuntimeState: found {token}"
+        );
+    }
 }
 
 /// Case-insensitive, word-boundary-aware substring search: `needle` must be
