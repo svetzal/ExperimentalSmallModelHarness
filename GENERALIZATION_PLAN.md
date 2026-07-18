@@ -567,6 +567,42 @@ still produces structurally incorrect full-file rewrites, then test one repair
 representation or measurement intervention rather than another cap increase.
 Full evidence is under Experiments/Generation30/.
 
+### Slice 10: Test Sequential Local Retry Patience
+
+- Hold the Generation30 packet, model, quantization, prompt, transcript,
+  diagnostics, tools, runtime policy, and 16,384-token per-call envelope fixed.
+- Replace one natural harness attempt with sequential natural attempts on the
+  same retained artifact.
+- Stop on exact success, explicit `FAIL`, two consecutive unchanged attempts,
+  eight completed failed edit-to-probe cycles, or eight natural attempts.
+- Never interrupt an active attempt; report attempts, failed cycles, artifact
+  hashes, wall-clock, output, and exact successes per unattended hour.
+
+Exit condition: one excluded smoke and a fixed n=3 cell reach natural terminal
+states; at least 2/3 fixed replicates must pass a fresh assertion, receive
+terminal acceptance, and match independent exact-file validation. No default
+policy change is made at n=3.
+
+**Slice 10 status: complete with a confirming efficacy signal (2026-07-18).**
+Generation31 held the full Generation30 model packet and 16,384-token envelope
+fixed, changing only experiment-level execution patience. The fixed cell
+reached exact success in 3/3 replicates after 5, 3, and 4 natural attempts and
+8, 5, and 6 completed failed repair cycles. Each terminal success had a fresh
+passing exact assertion and an independent byte match. The excluded smoke also
+completed exactly after two attempts and four failed cycles.
+
+The fixed cell cost 20,500.647 seconds (5.695 hours) and 1,250,019 observed
+output tokens, yielding 0.527 exact successes per unattended hour. Nine failed
+attempts stopped naturally before the three successes. Context stayed green,
+and no manual or environment stop occurred. This supports retained-artifact
+retry as an experimental local-only patience tier and rejects another token-cap
+widening for this packet. It does not justify a default at n=3: local inference
+has no hosted token charge, but wall-clock, energy, thermals, accelerator
+occupancy, and delayed feedback remain real costs. The next measurement is an
+n=5 single-attempt versus retained-retry comparison on a fresh exact-text
+packet with an instrumented coordinator. Full evidence is under
+Experiments/Generation31/.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`
