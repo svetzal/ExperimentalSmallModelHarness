@@ -1,0 +1,73 @@
+{
+  "schema_version": "run_contract.v1",
+  "guidance": "Read input.txt and create brief.md with the exact requested Markdown summary. Execute probe brief-exact after the latest edit. Do not run or infer a shell validation command.",
+  "read_scope": {
+    "kind": "rules",
+    "rules": [
+      "input.txt",
+      "brief.md"
+    ]
+  },
+  "write_scope": {
+    "kind": "rules",
+    "rules": [
+      "brief.md"
+    ]
+  },
+  "mutable_artifact_classes": {
+    "classes": [
+      {
+        "name": "text_artifact",
+        "exempt_file_names": [],
+        "exempt_extensions": []
+      }
+    ]
+  },
+  "evidence_invalidation": {
+    "invalidated_by_source_mutation": true,
+    "generation_gated_freshness": true,
+    "tracked_artifact_classes": [
+      "text_artifact"
+    ]
+  },
+  "probes": [
+    {
+      "id": "brief-exact",
+      "assertion": {
+        "kind": "file_text_equals",
+        "path": "brief.md",
+        "expected": "# Project Aurora\n\n- Owner: Mia Chen\n- Status: Blocked\n- Blocker: Vendor API credentials\n- Next step: Contact vendor by Friday\n"
+      }
+    }
+  ],
+  "budgets": {
+    "max_iterations": 10,
+    "max_tool_iterations": 50,
+    "context_window_tokens": null,
+    "max_thinking_only_tokens": 4096,
+    "repair_exit_thinking_tokens": 16384
+  },
+  "terminal": {
+    "done_token": "DONE",
+    "fail_token": "FAIL"
+  },
+  "adapter_kind": "explicit",
+  "profile": {
+    "id": "text_transform",
+    "version": "text_transform_profile.v1"
+  },
+  "defaults_provenance": {
+    "declared_fields": [
+      "guidance",
+      "probes",
+      "read_scope",
+      "write_scope"
+    ],
+    "defaulted_fields": [
+      "mutable_artifact_classes",
+      "evidence_invalidation",
+      "budgets",
+      "terminal"
+    ]
+  }
+}

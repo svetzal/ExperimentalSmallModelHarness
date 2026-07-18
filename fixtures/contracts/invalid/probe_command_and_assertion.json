@@ -1,0 +1,4 @@
+{
+  "guidance": "g",
+  "probes": [{"id":"a","command":"cargo test","assertion":{"kind":"file_text_equals","path":"out.txt","expected":"x"}}]
+}

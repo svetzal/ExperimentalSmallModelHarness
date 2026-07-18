@@ -1,0 +1,5 @@
+{
+  "profile": {"id":"text_transform","version":"text_transform_profile.v1"},
+  "guidance": "g",
+  "probes": [{"id":"a","assertion":{"kind":"file_text_equals","path":"../out.txt","expected":"x"}}]
+}

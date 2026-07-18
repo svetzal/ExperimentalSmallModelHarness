@@ -11,6 +11,7 @@
 //! [`coding::CodingProfile`].
 
 pub mod coding;
+pub mod text_transform;
 
 use crate::contract::{Budgets, EvidenceInvalidation, MutableArtifactClasses, ResolvedRunContract};
 use serde::{Deserialize, Serialize};
@@ -111,4 +112,25 @@ pub trait DomainProfile: Send + Sync {
 pub fn select_profile() -> &'static dyn DomainProfile {
     const PROFILE: CodingProfile = CodingProfile;
     &PROFILE
+}
+
+pub fn profile_by_ref(profile: &ProfileRef) -> anyhow::Result<&'static dyn DomainProfile> {
+    static CODING: CodingProfile = CodingProfile;
+    static TEXT_TRANSFORM: text_transform::TextTransformProfile =
+        text_transform::TextTransformProfile;
+    let selected: &'static dyn DomainProfile = match profile.id.as_str() {
+        coding::CODING_PROFILE_ID => &CODING,
+        text_transform::TEXT_TRANSFORM_PROFILE_ID => &TEXT_TRANSFORM,
+        other => anyhow::bail!("unknown domain profile {other:?}"),
+    };
+    let expected = selected.profile_ref();
+    if profile.version != expected.version {
+        anyhow::bail!(
+            "unsupported profile version {:?} for {:?}; expected {:?}",
+            profile.version,
+            profile.id,
+            expected.version
+        );
+    }
+    Ok(selected)
 }

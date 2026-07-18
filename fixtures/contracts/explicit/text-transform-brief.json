@@ -1,0 +1,24 @@
+{
+  "profile": {
+    "id": "text_transform",
+    "version": "text_transform_profile.v1"
+  },
+  "guidance": "Read input.txt and create brief.md with the exact requested Markdown summary. Execute probe brief-exact after the latest edit. Do not run or infer a shell validation command.",
+  "read_scope": [
+    "input.txt",
+    "brief.md"
+  ],
+  "write_scope": [
+    "brief.md"
+  ],
+  "probes": [
+    {
+      "id": "brief-exact",
+      "assertion": {
+        "kind": "file_text_equals",
+        "path": "brief.md",
+        "expected": "# Project Aurora\n\n- Owner: Mia Chen\n- Status: Blocked\n- Blocker: Vendor API credentials\n- Next step: Contact vendor by Friday\n"
+      }
+    }
+  ]
+}

@@ -668,10 +668,7 @@ pub(crate) fn synthesize_probe_ids(commands: &[String]) -> Vec<Probe> {
             } else {
                 format!("{base}-{count}")
             };
-            Probe {
-                id,
-                command: command.clone(),
-            }
+            Probe::command(id, command.clone())
         })
         .collect()
 }
@@ -857,14 +854,8 @@ cargo run -- --version-check ; true
         assert_eq!(
             resolved.probes,
             vec![
-                Probe {
-                    id: "cargo-fmt-check".to_string(),
-                    command: "cargo fmt --check".to_string(),
-                },
-                Probe {
-                    id: "cargo-test".to_string(),
-                    command: "cargo test".to_string(),
-                },
+                Probe::command("cargo-fmt-check", "cargo fmt --check"),
+                Probe::command("cargo-test", "cargo test"),
             ]
         );
         assert_eq!(resolved.profile, profile_ref());

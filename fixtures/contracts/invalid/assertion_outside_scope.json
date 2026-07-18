@@ -1,0 +1,7 @@
+{
+  "profile": {"id":"text_transform","version":"text_transform_profile.v1"},
+  "guidance": "g",
+  "read_scope": ["input.txt"],
+  "write_scope": ["brief.md"],
+  "probes": [{"id":"a","assertion":{"kind":"file_text_equals","path":"other.md","expected":"x"}}]
+}

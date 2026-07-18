@@ -1,0 +1,5 @@
+Complete this scoped text transformation inside the current workspace.
+
+Read input.txt and create brief.md.
+
+Inspect the input, create or edit the requested text artifact, then execute each declared assertion by probe ID.

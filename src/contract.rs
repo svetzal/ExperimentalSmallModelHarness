@@ -29,7 +29,6 @@
 
 use crate::agent::validation_command_masks_failure;
 use crate::profile::ProfileRef;
-use crate::profile::coding::is_validation_probe;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -78,7 +77,49 @@ pub enum Scope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Probe {
     pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assertion: Option<FileAssertion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileAssertion {
+    FileTextEquals { path: String, expected: String },
+}
+
+impl Probe {
+    pub fn command(id: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            command: command.into(),
+            assertion: None,
+        }
+    }
+
+    pub fn file_text_equals(
+        id: impl Into<String>,
+        path: impl Into<String>,
+        expected: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            command: String::new(),
+            assertion: Some(FileAssertion::FileTextEquals {
+                path: path.into(),
+                expected: expected.into(),
+            }),
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        if self.command.is_empty() {
+            &self.id
+        } else {
+            &self.command
+        }
+    }
 }
 
 /// One named class of writable artifact, with the exemption lists that
@@ -222,6 +263,8 @@ pub enum ContractSource {
 /// (not-yet-enforced) data; `guidance` and `probes` are always required.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SuppliedExplicitContract {
+    #[serde(default)]
+    pub profile: ProfileRef,
     pub guidance: String,
     #[serde(default)]
     pub read_scope: Option<Vec<String>>,
@@ -274,7 +317,8 @@ fn resolve_explicit_contract(
 ) -> Result<ResolvedRunContract> {
     let supplied: SuppliedExplicitContract =
         serde_json::from_str(json_text).context("parsing explicit run contract JSON")?;
-    validate_explicit_contract(&supplied)?;
+    let profile = crate::profile::profile_by_ref(&supplied.profile)?;
+    validate_explicit_contract(&supplied, profile)?;
 
     let mut declared = vec!["guidance".to_string(), "probes".to_string()];
     let mut defaulted = Vec::new();
@@ -299,7 +343,7 @@ fn resolve_explicit_contract(
         }
         None => {
             defaulted.push("mutable_artifact_classes".to_string());
-            crate::profile::select_profile().default_artifact_classes()
+            profile.default_artifact_classes()
         }
     };
 
@@ -310,7 +354,7 @@ fn resolve_explicit_contract(
         }
         None => {
             defaulted.push("evidence_invalidation".to_string());
-            crate::profile::select_profile().default_evidence_invalidation()
+            profile.default_evidence_invalidation()
         }
     };
     validate_artifact_invalidation_consistency(&mutable_artifact_classes, &evidence_invalidation)?;
@@ -348,7 +392,7 @@ fn resolve_explicit_contract(
         budgets,
         terminal,
         adapter_kind: AdapterKind::Explicit,
-        profile: crate::profile::select_profile().profile_ref(),
+        profile: profile.profile_ref(),
         defaults_provenance: DefaultsProvenance {
             declared_fields: declared,
             defaulted_fields: defaulted,
@@ -376,7 +420,10 @@ fn describe_scope(
 
 /// All explicit-contract validation, performed before any LLM/tool effect.
 /// Each failure mode returns an actionable, specific error.
-fn validate_explicit_contract(contract: &SuppliedExplicitContract) -> Result<()> {
+fn validate_explicit_contract(
+    contract: &SuppliedExplicitContract,
+    profile: &dyn crate::profile::DomainProfile,
+) -> Result<()> {
     let mut seen_ids = HashSet::new();
     for probe in &contract.probes {
         if probe.id.trim().is_empty() {
@@ -388,19 +435,32 @@ fn validate_explicit_contract(contract: &SuppliedExplicitContract) -> Result<()>
         if !seen_ids.insert(probe.id.clone()) {
             bail!("explicit contract: duplicate probe id {:?}", probe.id);
         }
-        if validation_command_masks_failure(&probe.command) {
+        let has_command = !probe.command.trim().is_empty();
+        let has_assertion = probe.assertion.is_some();
+        if has_command == has_assertion {
+            bail!(
+                "explicit contract: probe {:?} must declare exactly one of command or assertion",
+                probe.id
+            );
+        }
+        if has_command && validation_command_masks_failure(&probe.command) {
             bail!(
                 "explicit contract: probe {:?} command {:?} masks failure (e.g. `|| true`, `; true`, `|| exit 0`)",
                 probe.id,
                 probe.command
             );
         }
-        if !is_validation_probe(&probe.command) {
+        if has_command && !profile.recognizes_probe(&probe.command) {
             bail!(
                 "explicit contract: probe {:?} command {:?} will never be recognized as a validation probe by the executor",
                 probe.id,
                 probe.command
             );
+        }
+        if let Some(FileAssertion::FileTextEquals { path, .. }) = &probe.assertion {
+            validate_relative_path(path, &format!("probe {:?} assertion path", probe.id))?;
+            validate_assertion_in_scope(path, &contract.read_scope, "read_scope", &probe.id)?;
+            validate_assertion_in_scope(path, &contract.write_scope, "write_scope", &probe.id)?;
         }
     }
 
@@ -410,12 +470,7 @@ fn validate_explicit_contract(contract: &SuppliedExplicitContract) -> Result<()>
     ] {
         if let Some(rules) = scope {
             for rule in rules {
-                if rule.contains("..") || Path::new(rule).is_absolute() {
-                    bail!(
-                        "explicit contract: {field_name} rule {:?} escapes the workspace root",
-                        rule
-                    );
-                }
+                validate_relative_path(rule, &format!("{field_name} rule"))?;
             }
         }
     }
@@ -441,6 +496,50 @@ fn validate_explicit_contract(contract: &SuppliedExplicitContract) -> Result<()>
         }
     }
 
+    Ok(())
+}
+
+fn validate_relative_path(path: &str, label: &str) -> Result<()> {
+    let parsed = Path::new(path);
+    if path.trim().is_empty() || parsed.is_absolute() {
+        bail!(
+            "explicit contract: {label} {:?} escapes the workspace root",
+            path
+        );
+    }
+    if parsed.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        bail!(
+            "explicit contract: {label} {:?} escapes the workspace root",
+            path
+        );
+    }
+    Ok(())
+}
+
+fn validate_assertion_in_scope(
+    path: &str,
+    scope: &Option<Vec<String>>,
+    field: &str,
+    probe_id: &str,
+) -> Result<()> {
+    let Some(rules) = scope else { return Ok(()) };
+    let candidate = Path::new(path);
+    let allowed = rules.iter().any(|rule| {
+        let rule = Path::new(rule);
+        candidate == rule || candidate.starts_with(rule)
+    });
+    if !allowed {
+        bail!(
+            "explicit contract: probe {:?} assertion path {:?} is outside declared {field}",
+            probe_id,
+            path
+        );
+    }
     Ok(())
 }
 
@@ -558,14 +657,8 @@ mod tests {
         assert_eq!(
             resolved.probes,
             vec![
-                Probe {
-                    id: "cargo-fmt-check".to_string(),
-                    command: "cargo fmt --check".to_string(),
-                },
-                Probe {
-                    id: "cargo-test".to_string(),
-                    command: "cargo test".to_string(),
-                },
+                Probe::command("cargo-fmt-check", "cargo fmt --check"),
+                Probe::command("cargo-test", "cargo test"),
             ]
         );
     }
@@ -602,10 +695,7 @@ mod tests {
         let resolved = explicit(json).expect("make test is a recognized probe");
         assert_eq!(
             resolved.probes,
-            vec![Probe {
-                id: "make-test".to_string(),
-                command: "make test".to_string(),
-            }]
+            vec![Probe::command("make-test", "make test")]
         );
         assert!(!resolved.probes.is_empty());
     }
@@ -824,5 +914,46 @@ mod tests {
         let parsed: ResolvedRunContract = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.profile.id, "coding");
         assert_eq!(parsed.profile.version, "coding_profile.v1");
+    }
+
+    #[test]
+    fn text_transform_contract_matches_snapshot_and_has_no_command_probe() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let supplied = std::fs::read_to_string(
+            root.join("fixtures/contracts/explicit/text-transform-brief.json"),
+        )
+        .unwrap();
+        let resolved = explicit(&supplied).unwrap();
+        let snapshot: ResolvedRunContract = serde_json::from_str(
+            &std::fs::read_to_string(
+                root.join("fixtures/contracts/snapshots/text-transform-brief.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved, snapshot);
+        assert_eq!(resolved.profile.id, "text_transform");
+        assert!(resolved.probes[0].command.is_empty());
+        assert!(matches!(
+            resolved.probes[0].assertion,
+            Some(FileAssertion::FileTextEquals { .. })
+        ));
+    }
+
+    #[test]
+    fn assertion_path_must_be_scoped_and_root_relative() {
+        for fixture in [
+            "assertion_absolute_path.json",
+            "assertion_parent_escape.json",
+            "assertion_outside_scope.json",
+        ] {
+            let json = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("fixtures/contracts/invalid")
+                    .join(fixture),
+            )
+            .unwrap();
+            assert!(explicit(&json).is_err(), "{fixture} unexpectedly resolved");
+        }
     }
 }

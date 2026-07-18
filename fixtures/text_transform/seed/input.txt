@@ -1,0 +1,5 @@
+Project Aurora status
+owner: Mia Chen
+status: blocked
+blocker: vendor API credentials
+next: contact vendor by Friday
