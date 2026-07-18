@@ -452,6 +452,45 @@ prompt remain unchanged. The next measurement is a deterministic bounded
 mismatch diagnostic followed by the same fixed cell under the adaptation
 embargo. Full evidence is under Experiments/Generation27/.
 
+### Slice 7: Measure Exact-Repair Diagnostics
+
+- Report actual length and the first differing byte for failed exact-content
+  assertions.
+- Include deterministic escaped expected/actual excerpts bounded independently
+  of artifact size.
+- Preserve the full expected artifact outside normal worker context.
+- Repeat the refuting Generation27 packet with no prompt, model, cap, policy,
+  contract, seed, or expected-byte change.
+
+Exit condition: offset, length, escaping, and maximum excerpt size have
+deterministic tests; preserved coding evidence remains unchanged; and the exact
+repeat cell distinguishes diagnostic delivery from successful repair.
+
+**Slice 7 status: complete with a refuting replication (2026-07-18).** Commit
+7c8fe2e changed only `file_text_equals` failure evidence. A mismatch now reports
+expected and actual lengths, the first differing byte, and up to 16 preceding
+plus 32 following escaped bytes from each side. Tests cover exact payload
+content, bounded disclosure for long secrets, deterministic non-ASCII byte
+escaping, pass/fail freshness, and terminal state. All 202 unit/integration
+tests and seven structural tests passed; preserved matrix and trace outputs
+remained byte-stable; Cargo manifests were unchanged.
+
+Generation28 reused Generation27's contract, task, seed, and expected artifact
+byte-for-byte. Its valid fixed n=3 cell reached mutation, assertion, and the
+correct bounded byte-15 diagnostic in 3/3 runs. Only 1/3 converted that evidence
+into a post-failure repair write, 0/3 executed a second probe, and 0/3 passed the
+assertion, received terminal DONE, or matched independent exact validation.
+All three naturally reached the thinking-only-stream cap with green context
+pressure and no manual, environment, or shell-tool stop.
+
+This refutes the predicted 2/3 diagnostic-assisted success threshold. Bounded
+mismatch evidence is a valid and useful measurement—the one repair write fixed
+the title and capitalization exposed by the excerpt—but it is insufficient at
+the current 4,096-token thinking-only boundary. The next measurement is a
+pre-registered one-variable sequential cap assessment at the next protective
+tier, not a jump to full-window reasoning and not a prompt/model/policy bundle.
+Full evidence is under Experiments/Generation28/.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`
