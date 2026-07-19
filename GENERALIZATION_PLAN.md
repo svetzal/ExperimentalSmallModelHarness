@@ -643,6 +643,19 @@ continues applying the unchanged between-attempt limits. Missing or ambiguous
 trace matches fail closed. The registered comparison must restart under one
 immutable post-fix harness revision.
 
+**Generation33 measurement finding (2026-07-19).** The complete replacement
+cell produced 0/5 exact control artifacts and 4/5 retry artifacts with both
+independent exact bytes and a fresh passing assertion. All four exact retry
+runs also ended with terminal `DONE` text and `run.finished`, but the ordinary
+agent adapter reduced `RuntimeEvent::TerminalToken` without emitting its
+canonical `agent.terminal.done_observed` trace event. The strict coordinator
+therefore classified them as exact-without-terminal evidence. Treat the cell as
+inconclusive for retry efficacy: its reachability and cost distributions remain
+descriptive evidence, while the distinguishing acceptance metric is missing.
+Emit the typed terminal-token adapter event at the orchestration boundary,
+preserve the strict success rule, and replicate without changing the packet,
+model, budgets, or retry limits.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`

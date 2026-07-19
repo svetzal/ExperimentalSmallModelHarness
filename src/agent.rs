@@ -806,7 +806,11 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         }
         if is_terminal_response(&final_summary) {
             if let Some(token) = crate::runtime::terminal_token(&final_summary) {
-                scope.observe_runtime(crate::runtime::RuntimeEvent::TerminalToken { token });
+                let event = crate::runtime::RuntimeEvent::TerminalToken { token };
+                scope.observe_runtime(event.clone());
+                for legacy in crate::runtime_events::legacy_trace_events(&event) {
+                    trace.event(legacy.kind, legacy.payload)?;
+                }
             }
             exhausted_iterations = false;
             break;
@@ -5863,6 +5867,7 @@ mod tests {
         let trace = std::fs::read_to_string(&summary.trace_file).unwrap();
         assert!(trace.contains("\"assertion_kind\":\"file_text_equals\""));
         assert!(trace.contains("\"probe_id\":\"brief-exact\""));
+        assert!(trace.contains("\"kind\":\"agent.terminal.done_observed\""));
         assert!(!trace.contains("\"kind\":\"tool.shell_command\""));
         let analysis = crate::trace_analysis::analyze_trace(&summary.trace_file).unwrap();
         assert!(analysis.validation_probe_reached.is_some());
