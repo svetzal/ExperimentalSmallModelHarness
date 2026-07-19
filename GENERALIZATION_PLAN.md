@@ -656,6 +656,25 @@ Emit the typed terminal-token adapter event at the orchestration boundary,
 preserve the strict success rule, and replicate without changing the packet,
 model, budgets, or retry limits.
 
+**Generation34 decision (2026-07-19).** The unchanged replacement cell reached
+0/5 exact artifacts and 0/5 confirmed successes in the single-attempt control,
+versus 5/5 independent exact artifacts and 3/5 strict confirmed successes under
+bounded retained-artifact retry. Retry used 11 natural attempts and 24 failed
+repair cycles over 11,098.381 seconds and 734,310 observed output tokens. The
+control used 8,689.368 seconds and 522,825 tokens. Confirmed successes per
+unattended hour were 0.000 and 0.973 respectively; independent exact artifacts
+per hour were 0.000 and 1.622.
+
+The two strict retry misses were exact-without-terminal stops: both final files
+matched the expected SHA-256, but their attempts exhausted repair depth before
+a fresh passing assertion and accepted `DONE`. The coordinator correctly did
+not accept either result. There were no manual, environment, scope, stale
+acceptance, or context-pressure invalidations. The registered confirming rule
+is met, so bounded retained-artifact retry is now a narrow local-only Policy
+Candidate. It is not yet a default: repeat the unchanged coordinator on a
+second fresh exact-artifact packet to test cross-packet generality before
+adoption. Full evidence is under Experiments/Generation34/.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`
