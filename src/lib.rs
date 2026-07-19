@@ -4,6 +4,7 @@ pub mod cli;
 pub mod contract;
 pub mod profile;
 pub mod provenance;
+pub mod retry;
 pub mod runtime;
 pub mod runtime_events;
 pub mod tools;

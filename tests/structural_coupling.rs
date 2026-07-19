@@ -42,6 +42,7 @@ const CORE_SOURCE_FILES: &[&str] = &[
     "src/runtime_events.rs",
     "src/runtime.rs",
     "src/provenance.rs",
+    "src/retry.rs",
     "src/lib.rs",
     "src/main.rs",
 ];

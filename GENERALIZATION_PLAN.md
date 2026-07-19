@@ -603,6 +603,36 @@ n=5 single-attempt versus retained-retry comparison on a fresh exact-text
 packet with an instrumented coordinator. Full evidence is under
 Experiments/Generation31/.
 
+### Slice 11: Compare Single Attempts With Bounded Retained Retries
+
+- Add a separate `run-sequential` entry point; preserve `run` as the unchanged
+  single-attempt control.
+- Await every attempt to its natural terminal state and make retry decisions
+  only between attempts.
+- Persist per-attempt trace paths, pre/post artifact hashes, failed
+  edit-to-probe cycles, passing probes, accepted terminal status, independent
+  exact validation, runtime, output, and the outer stop reason.
+- Compare five fresh single-attempt workspaces with five fresh sequential-retry
+  workspaces on a new exact-text packet, holding the model and all within-run
+  settings fixed.
+
+Exit condition: the coordinator has deterministic scope, hash, trace-counting,
+success-evidence, and stop-order tests; the preserved matrix and trace analyzer
+remain stable; and both n=5 arms reach natural terminal states. A retry policy
+candidate requires a treatment exact-success advantage without stale evidence,
+manual interruption, or a worse exact-success-per-unattended-hour result. If
+both arms are 5/5, the packet is too easy to distinguish the policy. If neither
+arm succeeds, classify the fresh packet before changing retry limits.
+
+**Slice 11 measurement readiness (2026-07-18).** The new command calls the
+ordinary single-run path for every attempt and owns only the between-attempt
+decision. It requires an experiment-owned expected artifact for independent
+byte validation and stops on confirmed exact success, explicit `FAIL`, exact
+bytes without fresh terminal evidence, consecutive unchanged attempts, failed
+repair-cycle limit, or attempt limit. It never interrupts an active attempt.
+Generation32 will preregister the fresh packet and fixed n=5 comparison against
+the commit containing this measurement-first capability before any model run.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`
