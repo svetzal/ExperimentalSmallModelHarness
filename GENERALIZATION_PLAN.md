@@ -633,6 +633,16 @@ repair-cycle limit, or attempt limit. It never interrupts an active attempt.
 Generation32 will preregister the fresh packet and fixed n=5 comparison against
 the commit containing this measurement-first capability before any model run.
 
+**Generation32 pilot finding (2026-07-18).** A controlled inner
+thinking-only hard failure wrote a complete `run.failed` trace, but the initial
+coordinator propagated the returned error before recording the attempt or
+persisting its sequence summary. The pilot is therefore inconclusive for retry
+efficacy. The measurement path now adopts exactly one newly created failed
+trace matching the canonical worker root, records its terminal error, and
+continues applying the unchanged between-attempt limits. Missing or ambiguous
+trace matches fail closed. The registered comparison must restart under one
+immutable post-fix harness revision.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`

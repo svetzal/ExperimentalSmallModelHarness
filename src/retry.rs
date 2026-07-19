@@ -14,6 +14,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -64,6 +65,7 @@ pub struct SequentialAttemptRecord {
     pub runtime_seconds: Option<f64>,
     pub observed_output_tokens: usize,
     pub final_summary: String,
+    pub terminal_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,7 +140,22 @@ pub async fn run_sequential(config: SequentialRunConfig) -> Result<SequentialRun
     loop {
         let attempt = attempts.len() + 1;
         let pre_artifact = snapshot(&artifact)?;
-        let run_summary = run_agent(config.agent.clone()).await?;
+        let trace_dir = experiment_dir.join("traces");
+        let traces_before = trace_paths(&trace_dir)?;
+        let run_result = run_agent(config.agent.clone()).await;
+        let (trace_file, final_summary, terminal_error) = match run_result {
+            Ok(summary) => (summary.trace_file, summary.final_summary, None),
+            Err(error) => {
+                let trace_file = newly_failed_trace(&trace_dir, &traces_before, &tool_root)
+                    .with_context(|| format!("adopting trace after inner run error: {error:#}"))?;
+                let error = format!("{error:#}");
+                (
+                    trace_file,
+                    format!("inner run failed: {error}"),
+                    Some(error),
+                )
+            }
+        };
         let post_artifact = snapshot(&artifact)?;
         let artifact_unchanged = pre_artifact == post_artifact;
         consecutive_unchanged_attempts = if artifact_unchanged {
@@ -146,16 +163,16 @@ pub async fn run_sequential(config: SequentialRunConfig) -> Result<SequentialRun
         } else {
             0
         };
-        let evidence = inspect_trace(&run_summary.trace_file)?;
+        let evidence = inspect_trace(&trace_file)?;
         cumulative_failed_repair_cycles += evidence.failed_repair_cycles;
-        let analysis = analyze_trace(&run_summary.trace_file)?;
+        let analysis = analyze_trace(&trace_file)?;
         cumulative_runtime_seconds += analysis.runtime_seconds.unwrap_or_default();
         cumulative_observed_output_tokens += analysis.observed_output_tokens;
         let independent_exact = artifact_bytes_equal(&artifact, &expected_bytes)?;
 
         let record = SequentialAttemptRecord {
             attempt,
-            trace_file: run_summary.trace_file.clone(),
+            trace_file,
             pre_artifact,
             post_artifact,
             artifact_unchanged,
@@ -168,7 +185,8 @@ pub async fn run_sequential(config: SequentialRunConfig) -> Result<SequentialRun
             independent_exact,
             runtime_seconds: analysis.runtime_seconds,
             observed_output_tokens: analysis.observed_output_tokens,
-            final_summary: run_summary.final_summary,
+            final_summary,
+            terminal_error,
         };
         let decision = stop_after_attempt(&record, &attempts, limits);
         attempts.push(record);
@@ -181,7 +199,7 @@ pub async fn run_sequential(config: SequentialRunConfig) -> Result<SequentialRun
     let confirmed_exact_success = stop_reason == SequentialStopReason::ConfirmedExactSuccess;
     let summary_file = next_summary_path(&experiment_dir.join("retry"))?;
     let summary = SequentialRunSummary {
-        schema_version: "sequential_retry.v1".to_string(),
+        schema_version: "sequential_retry.v2".to_string(),
         artifact: config.artifact,
         expected_artifact: config.expected_artifact,
         max_attempts: config.max_attempts,
@@ -266,6 +284,62 @@ fn inspect_trace(path: &Path) -> Result<TraceRetryEvidence> {
         }
     }
     Ok(evidence)
+}
+
+fn trace_paths(dir: &Path) -> Result<HashSet<PathBuf>> {
+    if !dir.exists() {
+        return Ok(HashSet::new());
+    }
+    let mut paths = HashSet::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("reading trace directory {}", dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("reading entry in {}", dir.display()))?
+            .path();
+        if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+            paths.insert(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn newly_failed_trace(dir: &Path, before: &HashSet<PathBuf>, tool_root: &Path) -> Result<PathBuf> {
+    let mut matches = Vec::new();
+    for path in trace_paths(dir)?.difference(before) {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading candidate failed trace {}", path.display()))?;
+        let mut matching_root = false;
+        let mut failed = false;
+        for (index, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: Value = serde_json::from_str(line)
+                .with_context(|| format!("parsing {} line {}", path.display(), index + 1))?;
+            if record["payload"]["tool_root"].as_str() == tool_root.to_str() {
+                matching_root = true;
+            }
+            if record["kind"].as_str() == Some("run.failed") {
+                failed = true;
+            }
+        }
+        if matching_root && failed {
+            matches.push(path.clone());
+        }
+    }
+    match matches.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => bail!(
+            "inner run failed without one new matching run.failed trace under {}",
+            dir.display()
+        ),
+        _ => bail!(
+            "inner run failure produced {} matching traces under {}",
+            matches.len(),
+            dir.display()
+        ),
+    }
 }
 
 fn snapshot(path: &Path) -> Result<ArtifactSnapshot> {
@@ -421,6 +495,7 @@ mod tests {
             runtime_seconds: Some(1.0),
             observed_output_tokens: 10,
             final_summary: String::new(),
+            terminal_error: None,
         }
     }
 
@@ -516,6 +591,59 @@ mod tests {
                 explicit_fail: false,
             }
         );
+    }
+
+    #[test]
+    fn failed_inner_run_adopts_exactly_one_new_matching_trace() {
+        let temp = tempdir().unwrap();
+        let traces = temp.path().join("traces");
+        std::fs::create_dir(&traces).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let before = trace_paths(&traces).unwrap();
+        let matching = traces.join("run-matching.jsonl");
+        std::fs::write(
+            &matching,
+            format!(
+                "{}\n{}\n",
+                json!({"kind": "run.started", "payload": {"tool_root": root}}),
+                json!({"kind": "run.failed", "payload": {"tool_root": root}})
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            traces.join("run-other.jsonl"),
+            format!(
+                "{}\n",
+                json!({"kind": "run.failed", "payload": {"tool_root": "/different/root"}})
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            newly_failed_trace(&traces, &before, &root).unwrap(),
+            matching
+        );
+    }
+
+    #[test]
+    fn failed_inner_run_trace_adoption_fails_closed_on_ambiguity() {
+        let temp = tempdir().unwrap();
+        let traces = temp.path().join("traces");
+        std::fs::create_dir(&traces).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let before = trace_paths(&traces).unwrap();
+        for name in ["run-one.jsonl", "run-two.jsonl"] {
+            std::fs::write(
+                traces.join(name),
+                format!(
+                    "{}\n",
+                    json!({"kind": "run.failed", "payload": {"tool_root": root}})
+                ),
+            )
+            .unwrap();
+        }
+
+        assert!(newly_failed_trace(&traces, &before, &root).is_err());
     }
 
     #[test]
