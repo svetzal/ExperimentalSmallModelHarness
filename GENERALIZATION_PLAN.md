@@ -675,6 +675,42 @@ Candidate. It is not yet a default: repeat the unchanged coordinator on a
 second fresh exact-artifact packet to test cross-packet generality before
 adoption. Full evidence is under Experiments/Generation34/.
 
+### Slice 12: Integrate An External Terminal Benchmark
+
+- Run the harness as the agent under test rather than translating external
+  benchmark tasks into harness-owned experiments.
+- Keep the external runner responsible for isolation, task limits, and hidden
+  verification.
+- Add a language- and framework-neutral terminal-work profile for mixed
+  terminal tasks.
+- Keep contracts and traces outside the tool-visible benchmark workspace.
+- Build a revision-pinned portable Linux harness artifact for task containers.
+
+Exit condition: a pinned Terminal-Bench 2.1 task reaches a natural Harbor
+terminal state, Harbor independently grades it, and the preserved harness trace
+shows the unchanged task instruction, terminal-work profile, scoped workspace,
+and no verifier or oracle material in model context.
+
+**Slice 12 measurement readiness (2026-08-05).** The harness now has a
+`terminal_work_profile.v1` profile with filesystem and shell capabilities but
+no language, framework, build-system, or benchmark identity in its prompts.
+Every workspace mutation invalidates evidence, while non-inspection,
+non-mutating shell commands provide generic deterministic-check feedback. A new
+optional `--trace-dir` keeps traces outside the tool-visible workspace without
+changing the legacy default. Mojentic is revision-pinned through its public Git
+repository so the harness can be built without a developer-local source path.
+
+The external staging area under `Benchmarks/terminal-bench-2.1/` pins Harbor,
+Terminal-Bench 2.1, the model packet, and the 16,384-token envelope. Its custom
+Harbor adapter uploads a revision-identified portable Linux binary, supplies
+the original instruction through an explicit contract with no declared hidden
+probes, and retains traces in Harbor's agent logs. Deterministic readiness is
+green: 214 unit/integration tests and seven structural tests pass, clippy is
+warning-free, the four adapter tests pass, and the preparation/build/smoke
+scripts pass syntax checks. The excluded `fix-git` container smoke remains the
+next measurement; no efficacy cell is registered until that end-to-end boundary
+passes.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`

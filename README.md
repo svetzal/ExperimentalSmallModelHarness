@@ -29,10 +29,7 @@ interfaces may change as experiments reveal better boundaries.
 
 - Rust with Cargo and support for the 2024 edition
 - A local Ollama-compatible model runner
-- A local checkout of Mojentic Rust
-
-The current `Cargo.toml` uses a developer-local path dependency for Mojentic.
-Update that path to the location of your Mojentic Rust checkout before building.
+- Network access for Cargo to fetch the revision-pinned Mojentic Rust dependency
 
 ## Build and Test
 

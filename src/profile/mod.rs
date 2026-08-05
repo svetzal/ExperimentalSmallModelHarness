@@ -7,10 +7,10 @@
 //! literals. Everything domain-specific — worker/system prompt text, run
 //! guidance, validation-command recognition and family normalization,
 //! artifact classification, the legacy shell-fence contract adapter, and so
-//! on — lives behind the [`DomainProfile`] trait, implemented today only by
-//! [`coding::CodingProfile`].
+//! on — lives behind the [`DomainProfile`] trait.
 
 pub mod coding;
+pub mod terminal;
 pub mod text_transform;
 
 use crate::contract::{Budgets, EvidenceInvalidation, MutableArtifactClasses, ResolvedRunContract};
@@ -118,9 +118,7 @@ pub trait DomainProfile: Send + Sync {
     fn action_intent_phrases(&self) -> &'static [&'static str];
 }
 
-/// Select the domain profile for a run. Only the coding profile exists this
-/// slice; the signature already takes no arguments so a future
-/// contract-driven selector can be introduced without changing callers.
+/// Select the backward-compatible default profile for legacy runs.
 pub fn default_profile() -> &'static dyn DomainProfile {
     const PROFILE: CodingProfile = CodingProfile;
     &PROFILE
@@ -128,10 +126,12 @@ pub fn default_profile() -> &'static dyn DomainProfile {
 
 pub fn profile_by_ref(profile: &ProfileRef) -> anyhow::Result<&'static dyn DomainProfile> {
     static CODING: CodingProfile = CodingProfile;
+    static TERMINAL_WORK: terminal::TerminalWorkProfile = terminal::TerminalWorkProfile;
     static TEXT_TRANSFORM: text_transform::TextTransformProfile =
         text_transform::TextTransformProfile;
     let selected: &'static dyn DomainProfile = match profile.id.as_str() {
         coding::CODING_PROFILE_ID => &CODING,
+        terminal::TERMINAL_PROFILE_ID => &TERMINAL_WORK,
         text_transform::TEXT_TRANSFORM_PROFILE_ID => &TEXT_TRANSFORM,
         other => anyhow::bail!("unknown domain profile {other:?}"),
     };

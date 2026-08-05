@@ -47,6 +47,9 @@ const ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS: usize = 512;
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
     pub experiment_dir: PathBuf,
+    /// Optional trace destination outside the tool-visible experiment root.
+    /// Defaults to `<experiment_dir>/traces` for backward compatibility.
+    pub trace_dir: Option<PathBuf>,
     pub goal_file: PathBuf,
     pub contract_file: Option<PathBuf>,
     pub model: String,
@@ -244,7 +247,11 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         .canonicalize()
         .with_context(|| format!("canonicalizing tool root {}", tool_root.display()))?;
 
-    let trace = Arc::new(TraceRecorder::create(&experiment_dir.join("traces"))?);
+    let trace_dir = config
+        .trace_dir
+        .clone()
+        .unwrap_or_else(|| experiment_dir.join("traces"));
+    let trace = Arc::new(TraceRecorder::create(&trace_dir)?);
     let harness_source_state = crate::provenance::capture();
     trace.event(
         "run.started",
@@ -5255,6 +5262,7 @@ mod tests {
         let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
         let config = AgentRunConfig {
             experiment_dir: temp.path().join("experiment"),
+            trace_dir: None,
             goal_file: PathBuf::from("task.md"),
             contract_file: None,
             model: "qwen3.6:27b-coding-mxfp8".to_string(),
@@ -5311,6 +5319,23 @@ mod tests {
         assert_eq!(turn_two_ledgers.len(), 1, "{turn_two_ledgers:?}");
         assert_eq!(turn_two_ledgers[0]["message_count"], 5);
         assert_eq!(turn_two_ledgers[0]["role_counts"]["tool"], 1);
+    }
+
+    #[tokio::test]
+    async fn fixture_writes_traces_outside_the_tool_visible_root_when_configured() {
+        let fixture = AgentFixture::new("Stop explicitly.");
+        let external_traces = fixture._temp.path().join("external-traces");
+        let gateway = ScriptedGateway::new(vec![vec![StreamChunk::Content(
+            "FAIL intentionally stopped".to_string(),
+        )]]);
+
+        let summary = fixture
+            .run_with_trace_dir(&gateway, 1, Some(external_traces.clone()))
+            .await;
+
+        assert!(summary.trace_file.starts_with(&external_traces));
+        assert!(!fixture.experiment.join("traces").exists());
+        assert!(summary.trace_file.is_file());
     }
 
     #[tokio::test]
@@ -5909,9 +5934,19 @@ mod tests {
         }
 
         async fn run(&self, gateway: &ScriptedGateway, max_iterations: usize) -> AgentRunSummary {
+            self.run_with_trace_dir(gateway, max_iterations, None).await
+        }
+
+        async fn run_with_trace_dir(
+            &self,
+            gateway: &ScriptedGateway,
+            max_iterations: usize,
+            trace_dir: Option<PathBuf>,
+        ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
+                    trace_dir,
                     goal_file: PathBuf::from("task.md"),
                     contract_file: None,
                     model: "fake-model".to_string(),
@@ -5941,6 +5976,7 @@ mod tests {
             run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
+                    trace_dir: None,
                     goal_file: PathBuf::from("task.md"),
                     contract_file: Some(PathBuf::from("contract.json")),
                     model: "fake-model".to_string(),
@@ -5970,6 +6006,7 @@ mod tests {
             run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
+                    trace_dir: None,
                     goal_file: PathBuf::from("task.md"),
                     contract_file: None,
                     model: "fake-model".to_string(),

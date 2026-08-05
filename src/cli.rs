@@ -25,6 +25,11 @@ struct RunArgs {
     #[arg(long)]
     experiment: PathBuf,
 
+    /// Trace destination. Defaults to `<experiment>/traces`; may be placed
+    /// outside the tool-visible experiment root by an external evaluator.
+    #[arg(long)]
+    trace_dir: Option<PathBuf>,
+
     /// Goal file, relative to the experiment root unless absolute.
     #[arg(long, default_value = "task.md")]
     goal: PathBuf,
@@ -100,6 +105,7 @@ impl RunArgs {
             .unwrap_or_else(default_repair_exit_thinking_tokens);
         Ok(AgentRunConfig {
             experiment_dir: self.experiment,
+            trace_dir: self.trace_dir,
             goal_file: self.goal,
             contract_file: self.contract,
             model: self.model,
