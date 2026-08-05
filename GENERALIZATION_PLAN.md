@@ -691,7 +691,7 @@ terminal state, Harbor independently grades it, and the preserved harness trace
 shows the unchanged task instruction, terminal-work profile, scoped workspace,
 and no verifier or oracle material in model context.
 
-**Slice 12 measurement readiness (2026-08-05).** The harness now has a
+**Slice 12 complete (2026-08-05).** The harness now has a
 `terminal_work_profile.v1` profile with filesystem and shell capabilities but
 no language, framework, build-system, or benchmark identity in its prompts.
 Every workspace mutation invalidates evidence, while non-inspection,
@@ -706,9 +706,14 @@ Harbor adapter uploads a revision-identified portable Linux binary, supplies
 the original instruction through an explicit contract with no declared hidden
 probes, and retains traces in Harbor's agent logs. Deterministic readiness is
 green: 214 unit/integration tests and seven structural tests pass, clippy is
-warning-free, the four adapter tests pass, and the preparation/build/smoke
-scripts pass syntax checks. The excluded `fix-git` container smoke remains the
-next measurement; no efficacy cell is registered until that end-to-end boundary
+warning-free, the five adapter tests pass, and the preparation/build/smoke
+scripts pass syntax checks. The excluded `fix-git` container smoke reached a
+natural Harbor terminal state in 1 minute 22 seconds. Harbor independently
+recorded one completed trial, no exceptions, and reward 0.0 after a traced
+harness inspection-loop hard stop. The portable binary, local Ollama connection,
+unchanged task delivery, external contract and trace roots, task-workspace tool
+scope, and verifier handoff all operated end to end. No efficacy cell is
+registered until the next deterministic pilot task selection
 passes.
 
 ## First Experimental Gate
