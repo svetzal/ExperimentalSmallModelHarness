@@ -1673,14 +1673,6 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     );
                     if latest_progress_state == ModelProgressState::PossiblyStalled {
                         stalled_candidate_checks += 1;
-                        latest_progress_state = classify_model_progress(
-                            latest_progress_state,
-                            started.elapsed(),
-                            last_observable_progress.elapsed(),
-                            projection.allowed_seconds,
-                            Some(&runner_activity),
-                            stalled_candidate_checks,
-                        );
                     } else if latest_progress_state.has_progress_evidence() {
                         stalled_candidate_checks = 0;
                     }
@@ -2750,7 +2742,7 @@ fn is_failed_validation_tool_result(content: &str) -> bool {
 fn classify_model_progress(
     latest_visible_state: ModelProgressState,
     elapsed: Duration,
-    _since_observable_progress: Duration,
+    since_observable_progress: Duration,
     allowed_seconds: f64,
     runner_activity: Option<&RunnerActivitySample>,
     stalled_candidate_checks: usize,
@@ -2765,6 +2757,13 @@ fn classify_model_progress(
     }
 
     if elapsed.as_secs_f64() <= allowed_seconds {
+        return latest_visible_state;
+    }
+
+    if latest_visible_state.has_progress_evidence()
+        && since_observable_progress.as_secs_f64()
+            <= DEFAULT_PROGRESS_STATUS_INTERVAL_SECONDS as f64
+    {
         return latest_visible_state;
     }
 
@@ -4195,6 +4194,20 @@ mod tests {
 
         assert_eq!(first_check, ModelProgressState::PossiblyStalled);
         assert_eq!(second_check, ModelProgressState::Stalled);
+    }
+
+    #[test]
+    fn recent_stream_progress_prevents_projected_allowance_interrupt() {
+        let state = classify_model_progress(
+            ModelProgressState::Generating,
+            Duration::from_secs(10_000),
+            Duration::from_millis(10),
+            30.0,
+            None,
+            STALLED_CONFIRMATION_CHECKS,
+        );
+
+        assert_eq!(state, ModelProgressState::Generating);
     }
 
     #[test]
