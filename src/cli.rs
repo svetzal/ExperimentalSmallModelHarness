@@ -81,6 +81,14 @@ struct RunArgs {
     /// Transcript retention policy for model/tool context.
     #[arg(long, default_value = "summarized-transcript")]
     transcript_policy: String,
+
+    /// Experiment-owned semantic context catalog JSON. Disabled when omitted.
+    #[arg(long)]
+    semantic_context_catalog: Option<PathBuf>,
+
+    /// Model used for the isolated semantic context-selection call. Defaults to the worker model.
+    #[arg(long)]
+    context_analyzer_model: Option<String>,
 }
 
 impl RunArgs {
@@ -119,6 +127,8 @@ impl RunArgs {
             repair_exit_thinking_tokens,
             action_boundary_interrupt_tokens: self.action_boundary_interrupt_tokens,
             transcript_policy,
+            semantic_context_catalog_file: self.semantic_context_catalog,
+            context_analyzer_model: self.context_analyzer_model,
         })
     }
 }

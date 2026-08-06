@@ -63,6 +63,12 @@ pub struct AgentRunConfig {
     pub repair_exit_thinking_tokens: usize,
     pub action_boundary_interrupt_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
+    /// Optional experiment-owned semantic context catalog. When present, one
+    /// isolated structured-output call selects the initial guidance packet.
+    pub semantic_context_catalog_file: Option<PathBuf>,
+    /// Optional model override for semantic context selection. Defaults to the
+    /// worker model when a catalog is configured.
+    pub context_analyzer_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +88,9 @@ pub struct AgentRunSummary {
     pub repair_exit_thinking_tokens: usize,
     pub action_boundary_interrupt_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
+    pub semantic_context_catalog_file: Option<PathBuf>,
+    pub context_analyzer_model: Option<String>,
+    pub selected_semantic_context_ids: Vec<String>,
     pub final_summary: String,
     pub harness_source_state: crate::provenance::HarnessSourceState,
 }
@@ -272,6 +281,8 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "action_boundary_interrupt_tokens": config.action_boundary_interrupt_tokens,
             "assembly_policy": config.transcript_policy.as_str(),
             "transcript_policy": config.transcript_policy,
+            "semantic_context_catalog_file": config.semantic_context_catalog_file,
+            "context_analyzer_model": config.context_analyzer_model,
             "requested_validation_commands": &requested_validation_commands,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
             "harness_package_version": env!("CARGO_PKG_VERSION"),
@@ -305,6 +316,50 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         }),
     )?;
 
+    let semantic_context_result: Result<_> = async {
+        if let Some(catalog_file) = &config.semantic_context_catalog_file {
+            let catalog_file = canonicalize_goal(&experiment_dir, catalog_file)?;
+            let catalog =
+                crate::semantic_analysis::SemanticContextCatalog::from_path(&catalog_file)?;
+            let analyzer_model = config
+                .context_analyzer_model
+                .as_deref()
+                .unwrap_or(&config.model);
+            Ok(Some(
+                crate::semantic_analysis::select_initial_context(
+                    gateway,
+                    analyzer_model,
+                    &resolved_contract.guidance,
+                    &catalog,
+                    &trace,
+                )
+                .await?,
+            ))
+        } else {
+            trace.event(
+                crate::runtime_events::SEMANTIC_CONTEXT_DISABLED,
+                serde_json::json!({
+                    "reason": "no semantic context catalog configured",
+                }),
+            )?;
+            Ok(None)
+        }
+    }
+    .await;
+    let semantic_context = match semantic_context_result {
+        Ok(context) => context,
+        Err(error) => {
+            trace.event(
+                crate::runtime_events::RUN_FAILED,
+                serde_json::json!({
+                    "stage": "semantic_context",
+                    "error": error.to_string(),
+                }),
+            )?;
+            return Err(error);
+        }
+    };
+
     let scope_rules = |scope: &crate::contract::Scope| match scope {
         crate::contract::Scope::Unrestricted => Vec::new(),
         crate::contract::Scope::Rules(rules) => rules.clone(),
@@ -330,6 +385,11 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         LlmMessage::system(system_prompt),
         LlmMessage::user(profile.run_guidance(&resolved_contract.guidance)),
     ];
+    if let Some(context) = &semantic_context
+        && !context.rendered_guidance.is_empty()
+    {
+        messages.push(LlmMessage::user(context.rendered_guidance.clone()));
+    }
     let num_predict = config
         .num_predict
         .map(i32::try_from)
@@ -897,6 +957,11 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
         action_boundary_interrupt_tokens: config.action_boundary_interrupt_tokens,
         transcript_policy: config.transcript_policy,
+        semantic_context_catalog_file: config.semantic_context_catalog_file,
+        context_analyzer_model: config.context_analyzer_model,
+        selected_semantic_context_ids: semantic_context
+            .map(|context| context.selected_ids)
+            .unwrap_or_default(),
         final_summary,
         harness_source_state,
     };
@@ -3064,6 +3129,13 @@ fn inclusion_reason(index: usize, message: &LlmMessage) -> &'static str {
     match message.role {
         MessageRole::System => "base_system_prompt",
         MessageRole::User if index == 1 => "benchmark_task_and_run_instructions",
+        MessageRole::User
+            if message.content.as_deref().is_some_and(|content| {
+                content.starts_with(crate::semantic_analysis::SEMANTIC_CONTEXT_INJECTION_PREFIX)
+            }) =>
+        {
+            "semantic_initial_context"
+        }
         MessageRole::User => "agent_loop_instruction_or_repair_prompt",
         MessageRole::Assistant
             if message
@@ -5276,6 +5348,8 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             action_boundary_interrupt_tokens: 0,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
+            semantic_context_catalog_file: None,
+            context_analyzer_model: None,
         };
         let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
 
@@ -5899,6 +5973,64 @@ mod tests {
         assert!(analysis.validation_probe_passed.is_some());
     }
 
+    #[tokio::test]
+    async fn fixture_injects_policy_accepted_semantic_context_before_worker_call() {
+        let fixture = AgentFixture::new("Create a release note with the required format.");
+        std::fs::write(
+            fixture.experiment.join("context-catalog.json"),
+            serde_json::to_string_pretty(&json!({
+                "schema_version": "semantic_context_catalog.v1",
+                "max_selected": 1,
+                "max_injected_chars": 2000,
+                "max_analysis_chars": 10000,
+                "min_confidence": 0.7,
+                "candidates": [
+                    {
+                        "id": "release-format",
+                        "description": "Exact release-note layout",
+                        "content": "Use a title followed by exactly two bullet points.",
+                        "source": "release-format.md"
+                    },
+                    {
+                        "id": "database-migrations",
+                        "description": "Database migration policy",
+                        "content": "Never rewrite an applied migration.",
+                        "source": "database.md"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::with_json(
+            vec![vec![StreamChunk::Content(
+                "FAIL fixture stops after context inspection".to_string(),
+            )]],
+            vec![json!({
+                "schema_version": "semantic_context_decision.v1",
+                "selected_ids": ["release-format"],
+                "confidence": 0.94,
+                "rationale": "The task explicitly requests a release note."
+            })],
+        );
+
+        let summary = fixture.run_with_semantic_context(&gateway).await;
+
+        assert_eq!(
+            summary.selected_semantic_context_ids,
+            vec!["release-format"]
+        );
+        let worker_calls = gateway.stream_messages();
+        assert_eq!(worker_calls.len(), 1);
+        let injected = worker_calls[0][2].content.as_deref().unwrap_or_default();
+        assert!(injected.contains("Use a title followed by exactly two bullet points."));
+        assert!(!injected.contains("Never rewrite an applied migration."));
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"semantic_context.analysis.started\""));
+        assert!(trace.contains("\"kind\":\"semantic_context.policy.evaluated\""));
+        assert!(trace.contains("\"inclusion_reason\":\"semantic_initial_context\""));
+    }
+
     struct AgentFixture {
         _temp: tempfile::TempDir,
         experiment: PathBuf,
@@ -5960,6 +6092,8 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                    semantic_context_catalog_file: None,
+                    context_analyzer_model: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -5990,6 +6124,8 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                    semantic_context_catalog_file: None,
+                    context_analyzer_model: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -6020,6 +6156,36 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     action_boundary_interrupt_tokens: 1,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                    semantic_context_catalog_file: None,
+                    context_analyzer_model: None,
+                },
+                gateway,
+                self.workspace.clone(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn run_with_semantic_context(&self, gateway: &ScriptedGateway) -> AgentRunSummary {
+            run_agent_with_gateway(
+                AgentRunConfig {
+                    experiment_dir: self.experiment.clone(),
+                    trace_dir: None,
+                    goal_file: PathBuf::from("task.md"),
+                    contract_file: None,
+                    model: "worker-model".to_string(),
+                    max_iterations: 1,
+                    max_tool_iterations: 10,
+                    context_window_tokens: Some(131_072),
+                    packet_type: "narrow-patch".to_string(),
+                    expected_output_tokens: 2_048,
+                    num_predict: None,
+                    max_thinking_only_tokens: 2_048,
+                    repair_exit_thinking_tokens: 16_384,
+                    action_boundary_interrupt_tokens: 0,
+                    transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                    semantic_context_catalog_file: Some(PathBuf::from("context-catalog.json")),
+                    context_analyzer_model: Some("context-curator-model".to_string()),
                 },
                 gateway,
                 self.workspace.clone(),
@@ -6082,14 +6248,27 @@ mod tests {
 
     struct ScriptedGateway {
         streams: StdMutex<VecDeque<Vec<StreamChunk>>>,
+        json_responses: StdMutex<VecDeque<Value>>,
         tool_counts: StdMutex<Vec<usize>>,
+        stream_messages: StdMutex<Vec<Vec<LlmMessage>>>,
     }
 
     impl ScriptedGateway {
         fn new(streams: Vec<Vec<StreamChunk>>) -> Self {
             Self {
                 streams: StdMutex::new(VecDeque::from(streams)),
+                json_responses: StdMutex::new(VecDeque::new()),
                 tool_counts: StdMutex::new(Vec::new()),
+                stream_messages: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn with_json(streams: Vec<Vec<StreamChunk>>, json_responses: Vec<Value>) -> Self {
+            Self {
+                streams: StdMutex::new(VecDeque::from(streams)),
+                json_responses: StdMutex::new(VecDeque::from(json_responses)),
+                tool_counts: StdMutex::new(Vec::new()),
+                stream_messages: StdMutex::new(Vec::new()),
             }
         }
 
@@ -6097,6 +6276,13 @@ mod tests {
             self.tool_counts
                 .lock()
                 .expect("scripted gateway tool-count mutex poisoned")
+                .clone()
+        }
+
+        fn stream_messages(&self) -> Vec<Vec<LlmMessage>> {
+            self.stream_messages
+                .lock()
+                .expect("scripted gateway message mutex poisoned")
                 .clone()
         }
     }
@@ -6120,7 +6306,12 @@ mod tests {
             _schema: Value,
             _config: &CompletionConfig,
         ) -> mojentic::Result<Value> {
-            unimplemented!("streaming path only")
+            Ok(self
+                .json_responses
+                .lock()
+                .expect("scripted gateway JSON mutex poisoned")
+                .pop_front()
+                .expect("unexpected structured-output call"))
         }
 
         async fn get_available_models(&self) -> mojentic::Result<Vec<String>> {
@@ -6143,6 +6334,10 @@ mod tests {
             _config: &'a CompletionConfig,
         ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
         {
+            self.stream_messages
+                .lock()
+                .expect("scripted gateway message mutex poisoned")
+                .push(_messages.to_vec());
             self.tool_counts
                 .lock()
                 .expect("scripted gateway tool-count mutex poisoned")

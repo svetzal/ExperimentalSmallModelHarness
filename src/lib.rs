@@ -7,6 +7,7 @@ pub mod provenance;
 pub mod retry;
 pub mod runtime;
 pub mod runtime_events;
+pub mod semantic_analysis;
 pub mod tools;
 pub mod trace;
 pub mod trace_analysis;

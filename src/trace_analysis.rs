@@ -20,6 +20,15 @@ pub struct TraceAnalysis {
     pub max_tool_iterations: Option<usize>,
     pub packet_type: Option<String>,
     pub expected_output_tokens: Option<usize>,
+    pub semantic_context_enabled: bool,
+    pub semantic_context_analyzer_model: Option<String>,
+    pub semantic_context_candidate_count: usize,
+    pub semantic_context_analysis_duration_ms: Option<u64>,
+    pub semantic_context_analysis_error: Option<String>,
+    pub semantic_context_policy_accepted: Option<bool>,
+    pub semantic_context_selected_ids: Vec<String>,
+    pub semantic_context_injected_chars: usize,
+    pub semantic_context_policy_violations: Vec<Value>,
     pub status: String,
     pub runtime_seconds: Option<f64>,
     pub llm_call_count: usize,
@@ -349,6 +358,40 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
                 analysis.contract_adapter_kind = value_string(payload, "adapter_kind");
                 analysis.resolved_contract =
                     serde_json::from_value(payload["resolved"].clone()).ok();
+            }
+            events::SEMANTIC_CONTEXT_ANALYSIS_STARTED => {
+                analysis.semantic_context_enabled = true;
+                analysis.semantic_context_analyzer_model = value_string(payload, "analyzer_model");
+                analysis.semantic_context_candidate_count = payload["candidate_count"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or_default();
+            }
+            events::SEMANTIC_CONTEXT_ANALYSIS_COMPLETED => {
+                analysis.semantic_context_analysis_duration_ms = payload["duration_ms"].as_u64();
+            }
+            events::SEMANTIC_CONTEXT_ANALYSIS_FAILED => {
+                analysis.semantic_context_analysis_duration_ms = payload["duration_ms"].as_u64();
+                analysis.semantic_context_analysis_error = value_string(payload, "error");
+            }
+            events::SEMANTIC_CONTEXT_POLICY_EVALUATED => {
+                analysis.semantic_context_policy_accepted = payload["accepted"].as_bool();
+                analysis.semantic_context_selected_ids =
+                    value_string_array(payload, "selected_ids");
+                analysis.semantic_context_injected_chars = payload["injected_chars"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or_default();
+                analysis.semantic_context_policy_violations = payload["violations"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+            events::SEMANTIC_CONTEXT_INJECTED => {
+                analysis.semantic_context_injected_chars = payload["injected_chars"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or_default();
             }
             events::AGENT_STAGE_FIRST_SOURCE_MUTATION => {
                 note_productive_milestone(
@@ -696,6 +739,18 @@ fn value_string(payload: &Value, key: &str) -> Option<String> {
     payload[key].as_str().map(ToString::to_string)
 }
 
+fn value_string_array(payload: &Value, key: &str) -> Vec<String> {
+    payload[key]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn value_usize(payload: &Value, key: &str) -> Option<usize> {
     payload[key].as_u64().map(|value| value as usize)
 }
@@ -768,6 +823,65 @@ mod tests {
         assert_eq!(analysis.runtime_seconds, Some(6.0));
         assert_eq!(analysis.outcome, RunOutcome::Finished);
         assert!(analysis.harness_source_state.is_none());
+    }
+
+    #[test]
+    fn analyzes_semantic_context_selection_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-semantic-context.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-08-06T00:00:00Z","kind":"run.started","payload":{"model":"worker"}}
+{"timestamp":"2026-08-06T00:00:01Z","kind":"semantic_context.analysis.started","payload":{"analyzer_model":"curator","candidate_count":3}}
+{"timestamp":"2026-08-06T00:00:02Z","kind":"semantic_context.analysis.completed","payload":{"duration_ms":875}}
+{"timestamp":"2026-08-06T00:00:02Z","kind":"semantic_context.policy.evaluated","payload":{"accepted":true,"selected_ids":["format","api"],"injected_chars":640,"violations":[]}}
+{"timestamp":"2026-08-06T00:00:02Z","kind":"semantic_context.injected","payload":{"selected_ids":["format","api"],"injected_chars":680}}
+{"timestamp":"2026-08-06T00:00:03Z","kind":"run.finished","payload":{"final_summary":"DONE"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert!(analysis.semantic_context_enabled);
+        assert_eq!(
+            analysis.semantic_context_analyzer_model.as_deref(),
+            Some("curator")
+        );
+        assert_eq!(analysis.semantic_context_candidate_count, 3);
+        assert_eq!(analysis.semantic_context_analysis_duration_ms, Some(875));
+        assert_eq!(analysis.semantic_context_policy_accepted, Some(true));
+        assert_eq!(
+            analysis.semantic_context_selected_ids,
+            vec!["format", "api"]
+        );
+        assert_eq!(analysis.semantic_context_injected_chars, 680);
+        assert!(analysis.semantic_context_policy_violations.is_empty());
+    }
+
+    #[test]
+    fn analyzes_semantic_context_failure_as_failed_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-semantic-context-failed.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-08-06T00:00:00Z","kind":"run.started","payload":{"model":"worker"}}
+{"timestamp":"2026-08-06T00:00:01Z","kind":"semantic_context.analysis.started","payload":{"analyzer_model":"curator","candidate_count":2}}
+{"timestamp":"2026-08-06T00:00:02Z","kind":"semantic_context.analysis.failed","payload":{"duration_ms":700,"error":"structured output decode failed"}}
+{"timestamp":"2026-08-06T00:00:02Z","kind":"run.failed","payload":{"stage":"semantic_context","error":"structured output decode failed"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert_eq!(analysis.status, "failed");
+        assert_eq!(analysis.outcome, RunOutcome::Failed);
+        assert_eq!(analysis.semantic_context_analysis_duration_ms, Some(700));
+        assert_eq!(
+            analysis.semantic_context_analysis_error.as_deref(),
+            Some("structured output decode failed")
+        );
     }
 
     fn fixture_path(name: &str) -> PathBuf {

@@ -59,6 +59,45 @@ The main commands are:
 
 Use `cargo run -- <command> --help` for command-specific options.
 
+### Experimental semantic context selection
+
+`run` and `run-sequential` accept an optional experiment-owned guidance catalog:
+
+```sh
+cargo run -- run \
+  --experiment ../Experiments/GenerationN \
+  --semantic-context-catalog context-catalog.json \
+  --context-analyzer-model qwen3.6:35b-a3b-coding-nvfp4
+```
+
+The catalog contains task-neutral candidate records plus selection and context
+budgets. One isolated structured-output call selects candidate IDs before the
+worker starts. The selector has no tools and cannot mutate the workspace.
+Unknown IDs, duplicates, low confidence, excess selections, and context-budget
+overflow fail closed. Accepted guidance is injected as a distinct initial
+context component and the full decision path is recorded in the run trace.
+
+```json
+{
+  "schema_version": "semantic_context_catalog.v1",
+  "max_selected": 2,
+  "max_injected_chars": 6000,
+  "max_analysis_chars": 20000,
+  "min_confidence": 0.75,
+  "candidates": [
+    {
+      "id": "release-format",
+      "description": "Required release-note layout",
+      "content": "Use a title followed by exactly two bullet points.",
+      "source": "release-format.md"
+    }
+  ]
+}
+```
+
+The feature is disabled when `--semantic-context-catalog` is omitted. It is an
+experimental measurement capability, not a default context policy.
+
 ## Design and Evidence
 
 The evolving architecture and experimental decisions are documented in

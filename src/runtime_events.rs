@@ -23,6 +23,24 @@ use serde_json::{Value, json};
 /// that preserves those names and payload shapes.
 pub const RUNTIME_EVENT_SCHEMA_VERSION: &str = "runtime_event.v1";
 
+/// An isolated semantic context-selection call was configured and started.
+/// Payload: analyzer model, exact messages, candidate metadata, and budgets.
+pub const SEMANTIC_CONTEXT_ANALYSIS_STARTED: &str = "semantic_context.analysis.started";
+/// The provider returned one raw structured semantic-context decision.
+/// Payload: analyzer model, duration, and raw decision.
+pub const SEMANTIC_CONTEXT_ANALYSIS_COMPLETED: &str = "semantic_context.analysis.completed";
+/// The isolated semantic-context call failed before policy evaluation.
+/// Payload: analyzer model, duration, and error.
+pub const SEMANTIC_CONTEXT_ANALYSIS_FAILED: &str = "semantic_context.analysis.failed";
+/// Deterministic gates evaluated the model's proposed candidate IDs.
+/// Payload: acceptance, selected IDs, injected characters, and violations.
+pub const SEMANTIC_CONTEXT_POLICY_EVALUATED: &str = "semantic_context.policy.evaluated";
+/// Accepted semantic guidance was added to the initial worker context.
+/// Payload: selected IDs, exact content, and injected characters.
+pub const SEMANTIC_CONTEXT_INJECTED: &str = "semantic_context.injected";
+/// Semantic context selection was not configured for this run.
+pub const SEMANTIC_CONTEXT_DISABLED: &str = "semantic_context.disabled";
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LegacyTraceEvent {
     pub kind: &'static str,
