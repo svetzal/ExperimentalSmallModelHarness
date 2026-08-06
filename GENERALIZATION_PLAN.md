@@ -716,23 +716,27 @@ scope, and verifier handoff all operated end to end. No efficacy cell is
 registered until the next deterministic pilot task selection
 passes.
 
-### Slice 13: Semantic Initial Context Selection
+### Slice 13: Native Initial Context and Semantic Advisory
 
-- Accept a task-neutral catalog of candidate guidance records supplied by the
-  experiment or adapter.
-- Ask one isolated structured-output model call to select the records relevant
-  to the current resolved task.
-- Keep candidate discovery and content extraction outside the model call; the
-  analyzer may select only catalog IDs and cannot read files, call tools, or
-  mutate the workspace.
-- Apply deterministic gates for known IDs, uniqueness, confidence, selection
-  count, and injected-character budget before adding selected content to the
-  worker's initial context.
-- Record the analyzer packet, raw decision, accepted and rejected selections,
-  policy outcome, resolved analyzer model, latency, and injected context in the
-  trace.
-- Keep the capability disabled by default so existing prompts, benchmarks, and
-  policy remain byte-stable until a replicated comparison supports activation.
+- Make initial context a harness-owned assembly phase on every run, rather than
+  an optional string appended by orchestration.
+- Accept adapter-owned guidance records with `required`, `selectable`, or
+  `excluded` disposition. Include required records deterministically, reveal
+  only selectable records to semantic analysis, and require excluded records
+  to omit content.
+- Expose isolated structured semantic analysis as a reusable proposal-only
+  effect with explicit harness-owned advisory kinds. It cannot read files, use
+  tools, mutate state, or directly authorize a runtime transition.
+- Enforce advisory input and output envelopes at the reusable effect boundary,
+  rejecting oversized requests before provider invocation.
+- Apply deterministic gates for schema, disposition, known IDs, uniqueness,
+  confidence, selection count, and the combined required-plus-selected context
+  budget before assembling the worker packet.
+- Record advisory packets, raw proposals, policy outcomes, resolved components,
+  provenance hashes, exclusions, latency, and the exact authoritative worker
+  packet in the trace.
+- Preserve the legacy Slice-13 trace vocabulary in the analyzer adapter while
+  making the native assembler and generic advisory vocabulary canonical.
 
 Hypothesis ID: `HYP-GEN35-01`
 
@@ -743,10 +747,10 @@ several potentially relevant sources. Keyword and phrase matching would be
 cheap, but cannot reliably distinguish semantic relevance, version policy,
 workflow constraints, and superficially similar documents.
 
-Hypothesis: a bounded isolated Qwen analysis call can select a smaller relevant
-initial context packet from a mixed guidance catalog without omitting required
-task constraints, while deterministic policy prevents the analyzer from
-expanding scope or directly controlling runtime actions.
+Hypothesis: a bounded isolated Qwen advisory can select a smaller relevant set
+of optional guidance from a mixed catalog, while native disposition and budget
+policy guarantees that required constraints cannot be omitted and excluded
+material cannot reach either model.
 
 Nearest alternative explanation: the selector adds latency and stochastic
 failure while choosing no better than an experiment-authored fixed packet; any
@@ -754,38 +758,42 @@ apparent benefit comes from extra prompt text rather than selection quality.
 
 Initial measurement:
 
-- Build deterministic fixtures for valid selection, unknown IDs, duplicates,
-  low confidence, over-count selection, and character-budget overflow.
-- Prove the disabled path leaves committed prompt fixtures and preserved trace
-  analysis unchanged.
-- Run a later paired Qwen cell with the task, candidate catalog, worker model,
+- Build deterministic fixtures for required inclusion, optional selection,
+  exclusion, unknown and non-selectable IDs, duplicates, low confidence,
+  over-count selection, and combined character-budget overflow.
+- Prove task-only assembly makes no advisory call and preserved legacy traces
+  remain analyzable.
+- Run a later paired Qwen cell with the task, guidance catalog, worker model,
   quantization, packet, transcript, tools, budgets, and validation held fixed.
   Compare a fixed experiment-authored packet with semantic selection from the
   same catalog.
 - Use at least three replicates for first signal and five before default-policy
-  consideration. Record required-guidance recall, injected tokens, analyzer
-  latency, analyzer validity, first action, validation reach, validation pass,
-  and final semantic quality.
+  consideration. Record required/excluded invariant checks, optional-selection
+  precision and recall, assembled characters, advisory latency and validity,
+  first action, validation reach, validation pass, and final semantic quality.
 
 Decision rule: deterministic gate failures invalidate the semantic-selection
-arm rather than silently broadening context. A first cell supports continued
-testing only if all valid treatment runs include every preregistered required
-guidance ID, inject fewer characters than the full catalog, and do not reduce
-validation-passed count versus fixed context. Activation remains opt-in until a
-five-replicate control comparison shows a quality or context-efficiency gain
-without a new systematic analyzer failure class.
+arm rather than silently broadening context. Required inclusion and exclusion
+are implementation invariants, not advisory efficacy metrics. A first cell
+supports continued testing only if valid treatment runs choose the
+preregistered relevant optional IDs, inject fewer characters than the full
+selectable set, and do not reduce validation-passed count versus fixed context.
+Semantic selection remains opt-in until a five-replicate control comparison
+shows a quality or context-efficiency gain without a new systematic advisory
+failure class.
 
-Rollback condition: disable or remove semantic selection if accepted output can
-name undeclared guidance, exceed the configured budget, mutate worker policy,
-hide analyzer failure in fallback behavior, or alter the disabled-path prompt
-and trace fixtures.
+Rollback condition: disable semantic selection if an accepted proposal can name
+undeclared or non-selectable guidance, exceed the combined budget, hide failure
+in fallback behavior, or control worker policy. Revert the native assembler if
+required guidance can be omitted, excluded content can enter either model
+packet, or task-only assembly changes worker semantics unexpectedly.
 
-Measurement readiness: the opt-in path, disabled path, deterministic rejection
-gates, initial-context ledger entry, analyzer failure classification, and trace
-reducer fields are covered by the green 224-test Rust suite and seven structural
-tests. Clippy is warning-free. No Qwen efficacy cell has run, so this is an
-instrumented hypothesis rather than evidence for enabling the policy by
-default.
+Measurement readiness: task-only assembly, the advisory path, deterministic
+dispositions and rejection gates, authoritative packet integration, advisory
+isolation, legacy trace compatibility, and canonical reducer fields are covered
+by the green 229-test Rust suite and seven structural tests. Clippy is
+warning-free. No Qwen efficacy cell has run, so semantic selection remains an
+instrumented hypothesis rather than evidence for default activation.
 
 ## First Experimental Gate
 

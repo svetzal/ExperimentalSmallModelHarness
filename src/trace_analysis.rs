@@ -20,6 +20,23 @@ pub struct TraceAnalysis {
     pub max_tool_iterations: Option<usize>,
     pub packet_type: Option<String>,
     pub expected_output_tokens: Option<usize>,
+    pub semantic_advisory_call_count: usize,
+    pub semantic_advisory_rejection_count: usize,
+    pub semantic_advisory_kinds: Vec<String>,
+    pub semantic_advisory_models: Vec<String>,
+    pub semantic_advisory_duration_ms_total: u64,
+    pub semantic_advisory_errors: Vec<String>,
+    pub initial_context_catalog_enabled: bool,
+    pub initial_context_required_ids: Vec<String>,
+    pub initial_context_advisory_selected_ids: Vec<String>,
+    pub initial_context_excluded_ids: Vec<String>,
+    pub initial_context_guidance_chars: usize,
+    pub initial_context_worker_message_chars: usize,
+    pub initial_context_components: Vec<Value>,
+    pub initial_context_policy_accepted: Option<bool>,
+    pub initial_context_policy_violations: Vec<Value>,
+    pub initial_context_policy_errors: Vec<String>,
+    // Legacy Slice-13 measurements remain populated for preserved traces.
     pub semantic_context_enabled: bool,
     pub semantic_context_analyzer_model: Option<String>,
     pub semantic_context_candidate_count: usize,
@@ -358,6 +375,93 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
                 analysis.contract_adapter_kind = value_string(payload, "adapter_kind");
                 analysis.resolved_contract =
                     serde_json::from_value(payload["resolved"].clone()).ok();
+            }
+            events::SEMANTIC_ADVISORY_REQUESTED => {
+                analysis.semantic_advisory_call_count += 1;
+                if let Some(kind) = value_string(payload, "advisory_kind")
+                    && !analysis.semantic_advisory_kinds.contains(&kind)
+                {
+                    analysis.semantic_advisory_kinds.push(kind);
+                }
+                if let Some(model) = value_string(payload, "model")
+                    && !analysis.semantic_advisory_models.contains(&model)
+                {
+                    analysis.semantic_advisory_models.push(model);
+                }
+            }
+            events::SEMANTIC_ADVISORY_REJECTED => {
+                analysis.semantic_advisory_rejection_count += 1;
+                if let Some(kind) = value_string(payload, "advisory_kind")
+                    && !analysis.semantic_advisory_kinds.contains(&kind)
+                {
+                    analysis.semantic_advisory_kinds.push(kind);
+                }
+                if let Some(model) = value_string(payload, "model")
+                    && !analysis.semantic_advisory_models.contains(&model)
+                {
+                    analysis.semantic_advisory_models.push(model);
+                }
+                if let Some(error) = value_string(payload, "error") {
+                    analysis.semantic_advisory_errors.push(error);
+                }
+            }
+            events::SEMANTIC_ADVISORY_COMPLETED => {
+                analysis.semantic_advisory_duration_ms_total = analysis
+                    .semantic_advisory_duration_ms_total
+                    .saturating_add(payload["duration_ms"].as_u64().unwrap_or_default());
+            }
+            events::SEMANTIC_ADVISORY_FAILED => {
+                analysis.semantic_advisory_duration_ms_total = analysis
+                    .semantic_advisory_duration_ms_total
+                    .saturating_add(payload["duration_ms"].as_u64().unwrap_or_default());
+                if let Some(error) = value_string(payload, "error") {
+                    analysis.semantic_advisory_errors.push(error);
+                }
+            }
+            events::INITIAL_CONTEXT_CATALOG_RESOLVED => {
+                analysis.initial_context_catalog_enabled = true;
+                analysis.initial_context_required_ids = value_string_array(payload, "required_ids");
+                analysis.initial_context_excluded_ids = value_string_array(payload, "excluded_ids");
+            }
+            events::INITIAL_CONTEXT_POLICY_EVALUATED => {
+                analysis.initial_context_policy_accepted = payload["accepted"].as_bool();
+                analysis.initial_context_required_ids = value_string_array(payload, "required_ids");
+                analysis.initial_context_advisory_selected_ids =
+                    value_string_array(payload, "advisory_selected_ids");
+                analysis.initial_context_excluded_ids = value_string_array(payload, "excluded_ids");
+                analysis.initial_context_guidance_chars = payload["total_guidance_chars"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or_default();
+                analysis.initial_context_policy_violations = payload["violations"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+            events::INITIAL_CONTEXT_POLICY_FAILED => {
+                if let Some(error) = value_string(payload, "error") {
+                    analysis.initial_context_policy_errors.push(error);
+                }
+            }
+            events::INITIAL_CONTEXT_ASSEMBLED => {
+                analysis.initial_context_catalog_enabled =
+                    payload["catalog_enabled"].as_bool().unwrap_or_default();
+                analysis.initial_context_required_ids = value_string_array(payload, "required_ids");
+                analysis.initial_context_advisory_selected_ids =
+                    value_string_array(payload, "advisory_selected_ids");
+                analysis.initial_context_excluded_ids = value_string_array(payload, "excluded_ids");
+                analysis.initial_context_guidance_chars = payload["guidance_chars"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or_default();
+                analysis.initial_context_worker_message_chars = payload["worker_message_chars"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or_default();
+                analysis.initial_context_components = payload["components"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
             }
             events::SEMANTIC_CONTEXT_ANALYSIS_STARTED => {
                 analysis.semantic_context_enabled = true;
@@ -857,6 +961,74 @@ mod tests {
         );
         assert_eq!(analysis.semantic_context_injected_chars, 680);
         assert!(analysis.semantic_context_policy_violations.is_empty());
+    }
+
+    #[test]
+    fn analyzes_native_initial_context_and_semantic_advisory_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-initial-context.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-08-06T00:00:00Z","kind":"run.started","payload":{"model":"worker"}}
+{"timestamp":"2026-08-06T00:00:01Z","kind":"initial_context.catalog.resolved","payload":{"required_ids":["policy"],"selectable_ids":["format"],"excluded_ids":["private"]}}
+{"timestamp":"2026-08-06T00:00:01Z","kind":"semantic_advisory.requested","payload":{"advisory_kind":"initial_context_selection","model":"small"}}
+{"timestamp":"2026-08-06T00:00:02Z","kind":"semantic_advisory.completed","payload":{"advisory_kind":"initial_context_selection","duration_ms":425}}
+{"timestamp":"2026-08-06T00:00:02Z","kind":"initial_context.policy.evaluated","payload":{"accepted":true,"required_ids":["policy"],"advisory_selected_ids":["format"],"excluded_ids":["private"],"total_guidance_chars":420,"violations":[]}}
+{"timestamp":"2026-08-06T00:00:02Z","kind":"initial_context.assembled","payload":{"catalog_enabled":true,"required_ids":["policy"],"advisory_selected_ids":["format"],"excluded_ids":["private"],"guidance_chars":420,"worker_message_chars":900,"components":[{"id":"policy"},{"id":"format"}]}}
+{"timestamp":"2026-08-06T00:00:03Z","kind":"run.finished","payload":{"final_summary":"DONE"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert_eq!(analysis.semantic_advisory_call_count, 1);
+        assert_eq!(
+            analysis.semantic_advisory_kinds,
+            vec!["initial_context_selection"]
+        );
+        assert_eq!(analysis.semantic_advisory_models, vec!["small"]);
+        assert_eq!(analysis.semantic_advisory_duration_ms_total, 425);
+        assert!(analysis.initial_context_catalog_enabled);
+        assert_eq!(analysis.initial_context_required_ids, vec!["policy"]);
+        assert_eq!(
+            analysis.initial_context_advisory_selected_ids,
+            vec!["format"]
+        );
+        assert_eq!(analysis.initial_context_excluded_ids, vec!["private"]);
+        assert_eq!(analysis.initial_context_guidance_chars, 420);
+        assert_eq!(analysis.initial_context_worker_message_chars, 900);
+        assert_eq!(analysis.initial_context_components.len(), 2);
+        assert_eq!(analysis.initial_context_policy_accepted, Some(true));
+    }
+
+    #[test]
+    fn analyzes_semantic_advisory_preflight_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-advisory-rejected.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-08-06T00:00:00Z","kind":"run.started","payload":{"model":"worker"}}
+{"timestamp":"2026-08-06T00:00:01Z","kind":"semantic_advisory.rejected","payload":{"advisory_kind":"failure_classification","model":"small","reason":"input_budget_exceeded","error":"request exceeds budget"}}
+{"timestamp":"2026-08-06T00:00:01Z","kind":"run.failed","payload":{"stage":"semantic_advisory","error":"request exceeds budget"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert_eq!(analysis.semantic_advisory_call_count, 0);
+        assert_eq!(analysis.semantic_advisory_rejection_count, 1);
+        assert_eq!(
+            analysis.semantic_advisory_kinds,
+            vec!["failure_classification"]
+        );
+        assert_eq!(analysis.semantic_advisory_models, vec!["small"]);
+        assert_eq!(
+            analysis.semantic_advisory_errors,
+            vec!["request exceeds budget"]
+        );
+        assert_eq!(analysis.outcome, RunOutcome::Failed);
     }
 
     #[test]

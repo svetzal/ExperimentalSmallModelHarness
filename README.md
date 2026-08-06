@@ -59,44 +59,75 @@ The main commands are:
 
 Use `cargo run -- <command> --help` for command-specific options.
 
-### Experimental semantic context selection
+### Native initial-context assembly
 
-`run` and `run-sequential` accept an optional experiment-owned guidance catalog:
+Every run now constructs one authoritative initial-context packet before the
+worker starts. By default that packet contains the resolved task and profile
+guidance. `run` and `run-sequential` can also accept an adapter-owned guidance
+catalog:
 
 ```sh
 cargo run -- run \
   --experiment ../Experiments/GenerationN \
-  --semantic-context-catalog context-catalog.json \
-  --context-analyzer-model qwen3.6:35b-a3b-coding-nvfp4
+  --initial-context-catalog context-catalog.json \
+  --semantic-advisor-model qwen3.6:35b-a3b-coding-nvfp4
 ```
 
-The catalog contains task-neutral candidate records plus selection and context
-budgets. One isolated structured-output call selects candidate IDs before the
-worker starts. The selector has no tools and cannot mutate the workspace.
-Unknown IDs, duplicates, low confidence, excess selections, and context-budget
-overflow fail closed. Accepted guidance is injected as a distinct initial
-context component and the full decision path is recorded in the run trace.
+Catalog records have one harness-enforced disposition:
+
+- `required` records always enter the worker packet and never enter the
+  advisory call.
+- `selectable` records are the only records visible to an isolated structured
+  semantic advisory.
+- `excluded` records must omit content and enter neither model packet.
+
+The advisory has no tools or mutation authority. It proposes optional record
+IDs; the initial-context assembler validates schema, disposition, IDs,
+uniqueness, confidence, selection count, and the combined required-plus-selected
+guidance budget. Invalid proposals fail closed. The trace records exact advisory
+inputs and outputs plus the assembler's authoritative components and decision.
+`max_advisory_chars` bounds the complete advisory request, including the task,
+instructions, and selectable records; oversized calls are rejected before the
+provider is invoked.
 
 ```json
 {
-  "schema_version": "semantic_context_catalog.v1",
+  "schema_version": "initial_context_catalog.v2",
   "max_selected": 2,
-  "max_injected_chars": 6000,
-  "max_analysis_chars": 20000,
+  "max_total_guidance_chars": 6000,
+  "max_advisory_chars": 20000,
   "min_confidence": 0.75,
-  "candidates": [
+  "records": [
+    {
+      "id": "release-safety",
+      "disposition": "required",
+      "description": "Release claims require observed evidence",
+      "content": "Never claim validation that was not observed.",
+      "source": "release-safety.md"
+    },
     {
       "id": "release-format",
-      "description": "Required release-note layout",
+      "disposition": "selectable",
+      "description": "Release-note layout used only for release tasks",
       "content": "Use a title followed by exactly two bullet points.",
       "source": "release-format.md"
+    },
+    {
+      "id": "private-roadmap",
+      "disposition": "excluded",
+      "description": "Material prohibited from worker context",
+      "source": "private-roadmap.md"
     }
   ]
 }
 ```
 
-The feature is disabled when `--semantic-context-catalog` is omitted. It is an
-experimental measurement capability, not a default context policy.
+Semantic advisories are a reusable proposal-only harness effect with explicit
+kinds for initial-context selection, situation analysis, and failure
+classification. Initial-context selection is the first active consumer. When
+the catalog is omitted—or contains no selectable records—no advisory call is
+made. The semantic-selection policy remains experimental even though native
+context assembly is now foundational.
 
 ## Design and Evidence
 

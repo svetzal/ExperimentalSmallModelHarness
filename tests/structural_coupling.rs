@@ -41,6 +41,8 @@ const CORE_SOURCE_FILES: &[&str] = &[
     "src/trace_analysis.rs",
     "src/runtime_events.rs",
     "src/runtime.rs",
+    "src/initial_context.rs",
+    "src/semantic_advisory.rs",
     "src/provenance.rs",
     "src/retry.rs",
     "src/lib.rs",

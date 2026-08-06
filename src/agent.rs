@@ -63,12 +63,12 @@ pub struct AgentRunConfig {
     pub repair_exit_thinking_tokens: usize,
     pub action_boundary_interrupt_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
-    /// Optional experiment-owned semantic context catalog. When present, one
-    /// isolated structured-output call selects the initial guidance packet.
-    pub semantic_context_catalog_file: Option<PathBuf>,
-    /// Optional model override for semantic context selection. Defaults to the
-    /// worker model when a catalog is configured.
-    pub context_analyzer_model: Option<String>,
+    /// Optional adapter-owned initial-context catalog. Required, selectable,
+    /// and excluded guidance dispositions are enforced by the assembler.
+    pub initial_context_catalog_file: Option<PathBuf>,
+    /// Optional model override for isolated semantic advisory calls. Defaults
+    /// to the worker model when an advisory is required.
+    pub semantic_advisor_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,9 +88,11 @@ pub struct AgentRunSummary {
     pub repair_exit_thinking_tokens: usize,
     pub action_boundary_interrupt_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
-    pub semantic_context_catalog_file: Option<PathBuf>,
-    pub context_analyzer_model: Option<String>,
-    pub selected_semantic_context_ids: Vec<String>,
+    pub initial_context_catalog_file: Option<PathBuf>,
+    pub semantic_advisor_model: Option<String>,
+    pub required_initial_context_ids: Vec<String>,
+    pub advisory_selected_context_ids: Vec<String>,
+    pub excluded_initial_context_ids: Vec<String>,
     pub final_summary: String,
     pub harness_source_state: crate::provenance::HarnessSourceState,
 }
@@ -281,8 +283,8 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "action_boundary_interrupt_tokens": config.action_boundary_interrupt_tokens,
             "assembly_policy": config.transcript_policy.as_str(),
             "transcript_policy": config.transcript_policy,
-            "semantic_context_catalog_file": config.semantic_context_catalog_file,
-            "context_analyzer_model": config.context_analyzer_model,
+            "initial_context_catalog_file": config.initial_context_catalog_file,
+            "semantic_advisor_model": config.semantic_advisor_model,
             "requested_validation_commands": &requested_validation_commands,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
             "harness_package_version": env!("CARGO_PKG_VERSION"),
@@ -316,43 +318,38 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         }),
     )?;
 
-    let semantic_context_result: Result<_> = async {
-        if let Some(catalog_file) = &config.semantic_context_catalog_file {
+    let profile = crate::profile::profile_by_ref(&resolved_contract.profile)?;
+    let initial_context_result: Result<_> = async {
+        let catalog = if let Some(catalog_file) = &config.initial_context_catalog_file {
             let catalog_file = canonicalize_goal(&experiment_dir, catalog_file)?;
-            let catalog =
-                crate::semantic_analysis::SemanticContextCatalog::from_path(&catalog_file)?;
-            let analyzer_model = config
-                .context_analyzer_model
-                .as_deref()
-                .unwrap_or(&config.model);
-            Ok(Some(
-                crate::semantic_analysis::select_initial_context(
-                    gateway,
-                    analyzer_model,
-                    &resolved_contract.guidance,
-                    &catalog,
-                    &trace,
-                )
-                .await?,
-            ))
+            Some(crate::initial_context::InitialContextCatalog::from_path(
+                &catalog_file,
+            )?)
         } else {
-            trace.event(
-                crate::runtime_events::SEMANTIC_CONTEXT_DISABLED,
-                serde_json::json!({
-                    "reason": "no semantic context catalog configured",
-                }),
-            )?;
-            Ok(None)
-        }
+            None
+        };
+        let advisor_model = config
+            .semantic_advisor_model
+            .as_deref()
+            .unwrap_or(&config.model);
+        crate::initial_context::assemble_initial_context(
+            gateway,
+            advisor_model,
+            &resolved_contract.guidance,
+            profile.run_guidance(&resolved_contract.guidance),
+            catalog.as_ref(),
+            &trace,
+        )
+        .await
     }
     .await;
-    let semantic_context = match semantic_context_result {
+    let initial_context = match initial_context_result {
         Ok(context) => context,
         Err(error) => {
             trace.event(
                 crate::runtime_events::RUN_FAILED,
                 serde_json::json!({
-                    "stage": "semantic_context",
+                    "stage": "initial_context",
                     "error": error.to_string(),
                 }),
             )?;
@@ -378,18 +375,12 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         .map(|probe| (probe.command.clone(), probe.id.clone()))
         .collect::<BTreeMap<_, _>>();
     scope.configure_probes(resolved_contract.probes.clone())?;
-    let profile = crate::profile::profile_by_ref(&resolved_contract.profile)?;
     let system_prompt = profile.system_guidance();
     let tools = tools_for_profile(&scope, profile);
     let mut messages = vec![
         LlmMessage::system(system_prompt),
-        LlmMessage::user(profile.run_guidance(&resolved_contract.guidance)),
+        LlmMessage::user(initial_context.worker_message.clone()),
     ];
-    if let Some(context) = &semantic_context
-        && !context.rendered_guidance.is_empty()
-    {
-        messages.push(LlmMessage::user(context.rendered_guidance.clone()));
-    }
     let num_predict = config
         .num_predict
         .map(i32::try_from)
@@ -957,11 +948,11 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
         action_boundary_interrupt_tokens: config.action_boundary_interrupt_tokens,
         transcript_policy: config.transcript_policy,
-        semantic_context_catalog_file: config.semantic_context_catalog_file,
-        context_analyzer_model: config.context_analyzer_model,
-        selected_semantic_context_ids: semantic_context
-            .map(|context| context.selected_ids)
-            .unwrap_or_default(),
+        initial_context_catalog_file: config.initial_context_catalog_file,
+        semantic_advisor_model: config.semantic_advisor_model,
+        required_initial_context_ids: initial_context.required_ids,
+        advisory_selected_context_ids: initial_context.advisory_selected_ids,
+        excluded_initial_context_ids: initial_context.excluded_ids,
         final_summary,
         harness_source_state,
     };
@@ -3128,14 +3119,7 @@ fn component_ledger(index: usize, message: &LlmMessage) -> ContextComponentLedge
 fn inclusion_reason(index: usize, message: &LlmMessage) -> &'static str {
     match message.role {
         MessageRole::System => "base_system_prompt",
-        MessageRole::User if index == 1 => "benchmark_task_and_run_instructions",
-        MessageRole::User
-            if message.content.as_deref().is_some_and(|content| {
-                content.starts_with(crate::semantic_analysis::SEMANTIC_CONTEXT_INJECTION_PREFIX)
-            }) =>
-        {
-            "semantic_initial_context"
-        }
+        MessageRole::User if index == 1 => "authoritative_initial_context_packet",
         MessageRole::User => "agent_loop_instruction_or_repair_prompt",
         MessageRole::Assistant
             if message
@@ -3891,7 +3875,7 @@ mod tests {
         assert_eq!(ledger.components[0].inclusion_reason, "base_system_prompt");
         assert_eq!(
             ledger.components[1].inclusion_reason,
-            "benchmark_task_and_run_instructions"
+            "authoritative_initial_context_packet"
         );
         assert_eq!(
             ledger.components[2].inclusion_reason,
@@ -5348,8 +5332,8 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             action_boundary_interrupt_tokens: 0,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
-            semantic_context_catalog_file: None,
-            context_analyzer_model: None,
+            initial_context_catalog_file: None,
+            semantic_advisor_model: None,
         };
         let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
 
@@ -5974,28 +5958,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixture_injects_policy_accepted_semantic_context_before_worker_call() {
+    async fn fixture_assembles_required_selected_and_excluded_initial_context() {
         let fixture = AgentFixture::new("Create a release note with the required format.");
         std::fs::write(
             fixture.experiment.join("context-catalog.json"),
             serde_json::to_string_pretty(&json!({
-                "schema_version": "semantic_context_catalog.v1",
+                "schema_version": "initial_context_catalog.v2",
                 "max_selected": 1,
-                "max_injected_chars": 2000,
-                "max_analysis_chars": 10000,
+                "max_total_guidance_chars": 3000,
+                "max_advisory_chars": 10000,
                 "min_confidence": 0.7,
-                "candidates": [
+                "records": [
+                    {
+                        "id": "release-safety",
+                        "disposition": "required",
+                        "description": "Mandatory release safety rule",
+                        "content": "Never claim validation that was not observed.",
+                        "source": "release-safety.md"
+                    },
                     {
                         "id": "release-format",
+                        "disposition": "selectable",
                         "description": "Exact release-note layout",
                         "content": "Use a title followed by exactly two bullet points.",
                         "source": "release-format.md"
                     },
                     {
                         "id": "database-migrations",
+                        "disposition": "selectable",
                         "description": "Database migration policy",
                         "content": "Never rewrite an applied migration.",
                         "source": "database.md"
+                    },
+                    {
+                        "id": "private-roadmap",
+                        "disposition": "excluded",
+                        "description": "Material prohibited from this task",
+                        "source": "private-roadmap.md"
                     }
                 ]
             }))
@@ -6007,28 +6006,130 @@ mod tests {
                 "FAIL fixture stops after context inspection".to_string(),
             )]],
             vec![json!({
-                "schema_version": "semantic_context_decision.v1",
+                "schema_version": "initial_context_decision.v2",
                 "selected_ids": ["release-format"],
                 "confidence": 0.94,
                 "rationale": "The task explicitly requests a release note."
             })],
         );
 
-        let summary = fixture.run_with_semantic_context(&gateway).await;
+        let summary = fixture.run_with_initial_context(&gateway).await;
 
+        assert_eq!(summary.required_initial_context_ids, vec!["release-safety"]);
         assert_eq!(
-            summary.selected_semantic_context_ids,
+            summary.advisory_selected_context_ids,
             vec!["release-format"]
+        );
+        assert_eq!(
+            summary.excluded_initial_context_ids,
+            vec!["private-roadmap"]
         );
         let worker_calls = gateway.stream_messages();
         assert_eq!(worker_calls.len(), 1);
-        let injected = worker_calls[0][2].content.as_deref().unwrap_or_default();
+        assert_eq!(worker_calls[0].len(), 2);
+        let injected = worker_calls[0][1].content.as_deref().unwrap_or_default();
+        assert!(injected.contains("Create a release note with the required format."));
+        assert!(injected.contains("Never claim validation that was not observed."));
         assert!(injected.contains("Use a title followed by exactly two bullet points."));
         assert!(!injected.contains("Never rewrite an applied migration."));
+        assert!(!injected.contains("private-roadmap"));
+        let advisory_calls = gateway.json_messages();
+        assert_eq!(advisory_calls.len(), 1);
+        let advisory_packet = advisory_calls[0]
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<String>();
+        assert!(advisory_packet.contains("release-format"));
+        assert!(advisory_packet.contains("database-migrations"));
+        assert!(!advisory_packet.contains("release-safety"));
+        assert!(!advisory_packet.contains("private-roadmap"));
         let trace = std::fs::read_to_string(summary.trace_file).unwrap();
-        assert!(trace.contains("\"kind\":\"semantic_context.analysis.started\""));
-        assert!(trace.contains("\"kind\":\"semantic_context.policy.evaluated\""));
-        assert!(trace.contains("\"inclusion_reason\":\"semantic_initial_context\""));
+        assert!(trace.contains("\"kind\":\"semantic_advisory.requested\""));
+        assert!(trace.contains("\"kind\":\"initial_context.policy.evaluated\""));
+        assert!(trace.contains("\"kind\":\"initial_context.assembled\""));
+        assert!(trace.contains("\"inclusion_reason\":\"authoritative_initial_context_packet\""));
+    }
+
+    #[tokio::test]
+    async fn fixture_task_only_initial_context_makes_no_advisory_call() {
+        let fixture = AgentFixture::new("Produce the requested outcome.");
+        let gateway = ScriptedGateway::new(vec![vec![StreamChunk::Content(
+            "FAIL fixture stops after packet inspection".to_string(),
+        )]]);
+
+        let summary = fixture.run(&gateway, 1).await;
+
+        assert!(summary.required_initial_context_ids.is_empty());
+        assert!(summary.advisory_selected_context_ids.is_empty());
+        assert!(summary.excluded_initial_context_ids.is_empty());
+        assert!(gateway.json_messages().is_empty());
+        let worker_calls = gateway.stream_messages();
+        assert_eq!(worker_calls.len(), 1);
+        assert!(
+            worker_calls[0][1]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Produce the requested outcome.")
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"initial_context.assembled\""));
+        assert!(trace.contains("\"catalog_enabled\":false"));
+        assert!(!trace.contains("\"kind\":\"semantic_advisory.requested\""));
+    }
+
+    #[tokio::test]
+    async fn fixture_required_only_catalog_skips_advisory_and_excludes_content() {
+        let fixture = AgentFixture::new("Produce the requested outcome.");
+        std::fs::write(
+            fixture.experiment.join("context-catalog.json"),
+            serde_json::to_string_pretty(&json!({
+                "schema_version": "initial_context_catalog.v2",
+                "max_selected": 0,
+                "max_total_guidance_chars": 2000,
+                "max_advisory_chars": 1000,
+                "min_confidence": 0.7,
+                "records": [
+                    {
+                        "id": "mandatory-policy",
+                        "disposition": "required",
+                        "description": "Mandatory task policy",
+                        "content": "State only observed facts."
+                    },
+                    {
+                        "id": "prohibited-context",
+                        "disposition": "excluded",
+                        "description": "Must never enter model context"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![vec![StreamChunk::Content(
+            "FAIL fixture stops after packet inspection".to_string(),
+        )]]);
+
+        let summary = fixture.run_with_initial_context(&gateway).await;
+
+        assert_eq!(
+            summary.required_initial_context_ids,
+            vec!["mandatory-policy"]
+        );
+        assert!(summary.advisory_selected_context_ids.is_empty());
+        assert_eq!(
+            summary.excluded_initial_context_ids,
+            vec!["prohibited-context"]
+        );
+        assert!(gateway.json_messages().is_empty());
+        let worker_packet = gateway.stream_messages()[0][1]
+            .content
+            .clone()
+            .unwrap_or_default();
+        assert!(worker_packet.contains("State only observed facts."));
+        assert!(!worker_packet.contains("prohibited-context"));
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"initial_context.advisory.skipped\""));
     }
 
     struct AgentFixture {
@@ -6092,8 +6193,8 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
-                    semantic_context_catalog_file: None,
-                    context_analyzer_model: None,
+                    initial_context_catalog_file: None,
+                    semantic_advisor_model: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -6124,8 +6225,8 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
-                    semantic_context_catalog_file: None,
-                    context_analyzer_model: None,
+                    initial_context_catalog_file: None,
+                    semantic_advisor_model: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -6156,8 +6257,8 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     action_boundary_interrupt_tokens: 1,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
-                    semantic_context_catalog_file: None,
-                    context_analyzer_model: None,
+                    initial_context_catalog_file: None,
+                    semantic_advisor_model: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -6166,7 +6267,7 @@ mod tests {
             .unwrap()
         }
 
-        async fn run_with_semantic_context(&self, gateway: &ScriptedGateway) -> AgentRunSummary {
+        async fn run_with_initial_context(&self, gateway: &ScriptedGateway) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
@@ -6184,8 +6285,8 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
-                    semantic_context_catalog_file: Some(PathBuf::from("context-catalog.json")),
-                    context_analyzer_model: Some("context-curator-model".to_string()),
+                    initial_context_catalog_file: Some(PathBuf::from("context-catalog.json")),
+                    semantic_advisor_model: Some("context-curator-model".to_string()),
                 },
                 gateway,
                 self.workspace.clone(),
@@ -6249,6 +6350,7 @@ mod tests {
     struct ScriptedGateway {
         streams: StdMutex<VecDeque<Vec<StreamChunk>>>,
         json_responses: StdMutex<VecDeque<Value>>,
+        json_messages: StdMutex<Vec<Vec<LlmMessage>>>,
         tool_counts: StdMutex<Vec<usize>>,
         stream_messages: StdMutex<Vec<Vec<LlmMessage>>>,
     }
@@ -6258,6 +6360,7 @@ mod tests {
             Self {
                 streams: StdMutex::new(VecDeque::from(streams)),
                 json_responses: StdMutex::new(VecDeque::new()),
+                json_messages: StdMutex::new(Vec::new()),
                 tool_counts: StdMutex::new(Vec::new()),
                 stream_messages: StdMutex::new(Vec::new()),
             }
@@ -6267,6 +6370,7 @@ mod tests {
             Self {
                 streams: StdMutex::new(VecDeque::from(streams)),
                 json_responses: StdMutex::new(VecDeque::from(json_responses)),
+                json_messages: StdMutex::new(Vec::new()),
                 tool_counts: StdMutex::new(Vec::new()),
                 stream_messages: StdMutex::new(Vec::new()),
             }
@@ -6283,6 +6387,13 @@ mod tests {
             self.stream_messages
                 .lock()
                 .expect("scripted gateway message mutex poisoned")
+                .clone()
+        }
+
+        fn json_messages(&self) -> Vec<Vec<LlmMessage>> {
+            self.json_messages
+                .lock()
+                .expect("scripted gateway JSON-message mutex poisoned")
                 .clone()
         }
     }
@@ -6302,10 +6413,14 @@ mod tests {
         async fn complete_json(
             &self,
             _model: &str,
-            _messages: &[LlmMessage],
+            messages: &[LlmMessage],
             _schema: Value,
             _config: &CompletionConfig,
         ) -> mojentic::Result<Value> {
+            self.json_messages
+                .lock()
+                .expect("scripted gateway JSON-message mutex poisoned")
+                .push(messages.to_vec());
             Ok(self
                 .json_responses
                 .lock()

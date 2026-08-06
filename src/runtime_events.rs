@@ -23,6 +23,30 @@ use serde_json::{Value, json};
 /// that preserves those names and payload shapes.
 pub const RUNTIME_EVENT_SCHEMA_VERSION: &str = "runtime_event.v1";
 
+/// An isolated, proposal-only semantic advisory was requested.
+/// Payload: kind, model, exact messages, schema, budgets, and authority.
+pub const SEMANTIC_ADVISORY_REQUESTED: &str = "semantic_advisory.requested";
+/// Deterministic preflight rejected an advisory before a provider call.
+/// Payload: kind, model, bounded-input measurements, reason, and error.
+pub const SEMANTIC_ADVISORY_REJECTED: &str = "semantic_advisory.rejected";
+/// A semantic advisory returned one raw structured proposal.
+/// Payload: kind, model, duration, and raw proposal.
+pub const SEMANTIC_ADVISORY_COMPLETED: &str = "semantic_advisory.completed";
+/// A semantic advisory provider call failed.
+/// Payload: kind, model, duration, and error.
+pub const SEMANTIC_ADVISORY_FAILED: &str = "semantic_advisory.failed";
+/// Initial-context dispositions and budgets were resolved from a catalog.
+pub const INITIAL_CONTEXT_CATALOG_RESOLVED: &str = "initial_context.catalog.resolved";
+/// No semantic advisory was needed because no selectable guidance existed.
+pub const INITIAL_CONTEXT_ADVISORY_SKIPPED: &str = "initial_context.advisory.skipped";
+/// Deterministic context authority evaluated an advisory proposal.
+pub const INITIAL_CONTEXT_POLICY_EVALUATED: &str = "initial_context.policy.evaluated";
+/// A proposal could not be decoded into the typed context-selection shape.
+pub const INITIAL_CONTEXT_POLICY_FAILED: &str = "initial_context.policy.failed";
+/// The authoritative worker initial-context packet was assembled.
+pub const INITIAL_CONTEXT_ASSEMBLED: &str = "initial_context.assembled";
+
+// Legacy Slice-13 vocabulary remains readable by the trace adapter.
 /// An isolated semantic context-selection call was configured and started.
 /// Payload: analyzer model, exact messages, candidate metadata, and budgets.
 pub const SEMANTIC_CONTEXT_ANALYSIS_STARTED: &str = "semantic_context.analysis.started";
