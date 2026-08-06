@@ -12,6 +12,7 @@ dependencies = [
  "clap",
  "futures",
  "ignore",
+ "libc",
  "mojentic",
  "serde",
  "serde_json",

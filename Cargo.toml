@@ -10,6 +10,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 ignore = "0.4"
+libc = "0.2"
 mojentic = { git = "https://github.com/svetzal/mojentic-ru.git", rev = "d7ec3db5230ebb0adb471b60d12a190b631da7b1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

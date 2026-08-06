@@ -242,21 +242,28 @@ impl ToolScope {
         crate::profile::profile_by_ref(&self.profile).expect("validated domain profile")
     }
 
-    fn resolve_existing_or_new(&self, relative: &str) -> Result<PathBuf> {
-        let path = Path::new(relative);
+    fn resolve_existing_or_new(&self, input: &str) -> Result<PathBuf> {
+        let path = Path::new(input);
         if path.as_os_str().is_empty() {
             bail!("path must not be empty");
         }
-        if path.is_absolute() {
-            bail!("absolute paths are outside the tool scope");
-        }
-        for component in path.components() {
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&*self.root).with_context(|| {
+                format!(
+                    "absolute path is outside the tool scope: {}",
+                    path.display()
+                )
+            })?
+        } else {
+            path
+        };
+        for component in relative.components() {
             match component {
                 Component::Normal(_) | Component::CurDir => {}
-                _ => bail!("path escapes the tool scope: {relative}"),
+                _ => bail!("path escapes the tool scope: {input}"),
             }
         }
-        Ok(self.root.join(path))
+        Ok(self.root.join(relative))
     }
 
     fn resolve_scoped_path_input(&self, input: &str) -> Result<PathBuf> {
@@ -2106,19 +2113,31 @@ impl ShellCommandTool {
             &[Path::new("/bin/bash"), Path::new("/bin/sh")],
         );
         let shell_command = format!("(set -o pipefail) 2>/dev/null && set -o pipefail; {command}");
-        let output = timeout(
-            Duration::from_secs(timeout_secs),
-            Command::new(shell)
-                .arg("-lc")
-                .arg(&shell_command)
-                .current_dir(&cwd)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output(),
-        )
-        .await
-        .with_context(|| format!("command timed out after {timeout_secs}s"))?
-        .with_context(|| format!("running command {command:?}"))?;
+        let mut shell_process = Command::new(shell);
+        shell_process
+            .arg("-lc")
+            .arg(&shell_command)
+            .current_dir(&cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        shell_process.process_group(0);
+        let child = shell_process
+            .spawn()
+            .with_context(|| format!("spawning command {command:?}"))?;
+        let child_pid = child.id();
+        let output =
+            match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+                Ok(result) => result.with_context(|| format!("running command {command:?}"))?,
+                Err(_) => {
+                    #[cfg(unix)]
+                    if let Some(pid) = child_pid {
+                        kill_process_group(pid);
+                    }
+                    bail!("command timed out after {timeout_secs}s");
+                }
+            };
         let stdout = capture_output(&output.stdout);
         let stderr = capture_output(&output.stderr);
         let (shell_mutation_paths, shell_mutation_snapshot_error) =
@@ -2669,7 +2688,7 @@ fn parse_path_rules(values: Vec<String>) -> Result<Vec<PathRule>> {
 impl PathRule {
     fn matches(&self, path: &Path) -> bool {
         if self.recursive {
-            path == self.path || path.starts_with(&self.path)
+            self.path == Path::new(".") || path == self.path || path.starts_with(&self.path)
         } else {
             path == self.path
         }
@@ -2677,6 +2696,17 @@ impl PathRule {
 
     fn is_descendant_of(&self, path: &Path) -> bool {
         self.path.starts_with(path)
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    if let Ok(process_group) = i32::try_from(pid) {
+        // SAFETY: the child was started in a new process group whose id is its
+        // pid. A negative target asks kill(2) to signal that group only.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
     }
 }
 
@@ -2731,6 +2761,17 @@ mod tests {
         .unwrap()
     }
 
+    fn recursive_root_scope(temp: &tempfile::TempDir) -> ToolScope {
+        let trace = Arc::new(TraceRecorder::create(&temp.path().join("traces")).unwrap());
+        ToolScope::new_restricted(
+            temp.path().to_path_buf(),
+            trace,
+            vec!["./**".to_string()],
+            vec!["./**".to_string()],
+        )
+        .unwrap()
+    }
+
     fn text_scope(temp: &tempfile::TempDir) -> ToolScope {
         let trace = Arc::new(TraceRecorder::create(&temp.path().join("traces")).unwrap());
         ToolScope::new_profiled(
@@ -2759,6 +2800,72 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
         assert!(scope.resolve_existing_or_new("/tmp/outside").is_err());
+    }
+
+    #[test]
+    fn accepts_absolute_paths_inside_tool_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let inside = scope.root.join("nested/file.txt");
+
+        assert_eq!(
+            scope
+                .resolve_existing_or_new(inside.to_str().unwrap())
+                .unwrap(),
+            inside
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_root_scope_allows_structured_descendant_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = recursive_root_scope(&temp);
+        let absolute = scope.root.join("nested/run.py");
+
+        let write = WriteFileTool {
+            scope: scope.clone(),
+        };
+        write
+            .write(&HashMap::from([
+                (
+                    "path".to_string(),
+                    json!(absolute.to_string_lossy().to_string()),
+                ),
+                ("content".to_string(), json!("print('old')\n")),
+            ]))
+            .await
+            .unwrap();
+
+        let read = ReadFileTool {
+            scope: scope.clone(),
+        };
+        let read_result = read
+            .read(&HashMap::from([(
+                "path".to_string(),
+                json!(absolute.to_string_lossy().to_string()),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(read_result["content"], "print('old')");
+
+        let edit = EditFileTool {
+            scope: scope.clone(),
+        };
+        edit.edit(&HashMap::from([
+            ("path".to_string(), json!("nested/run.py")),
+            (
+                "edits".to_string(),
+                json!([{
+                    "kind": "replace_exact",
+                    "old": "old",
+                    "new": "new"
+                }]),
+            ),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(absolute).unwrap(), "print('new')\n");
     }
 
     #[test]
@@ -4080,6 +4187,44 @@ bytes[0..5] \"cafe\\n\""
         assert_eq!(snapshot.writes_since_shell_probe, 1);
         assert_eq!(snapshot.writes_since_shell_probe_paths["src/lib.rs"], 1);
         assert!(snapshot.validation_required_after_write);
+    }
+
+    #[tokio::test]
+    async fn recursive_root_scope_senses_shell_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = recursive_root_scope(&temp);
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+        let args = HashMap::from([("command".to_string(), json!("printf 'print(1)\n' > run.py"))]);
+
+        let result = tool.shell(&args).await.unwrap();
+
+        assert_eq!(result["shell_mutation_sensed"], true);
+        assert_eq!(result["shell_mutation_paths"], json!(["run.py"]));
+        assert!(scope.policy_snapshot().validation_required_after_write);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_shell_command_kills_descendant_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let tool = ShellCommandTool {
+            scope: scope(&temp),
+        };
+        let args = HashMap::from([
+            (
+                "command".to_string(),
+                json!("(sleep 2; printf 'late\n' > late.txt) & wait"),
+            ),
+            ("timeout_secs".to_string(), json!(1)),
+        ]);
+
+        let error = tool.shell(&args).await.unwrap_err().to_string();
+        assert!(error.contains("timed out after 1s"));
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!temp.path().join("late.txt").exists());
     }
 
     #[tokio::test]
