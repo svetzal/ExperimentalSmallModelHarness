@@ -12,6 +12,7 @@ use mojentic::llm::tools::{FunctionDescriptor, LlmTool, ToolDescriptor, ToolRunC
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
@@ -2100,8 +2101,11 @@ impl ShellCommandTool {
                 None
             }
         };
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let shell_command = format!("set -o pipefail; {command}");
+        let shell = select_shell_path(
+            std::env::var_os("SHELL").as_deref(),
+            &[Path::new("/bin/bash"), Path::new("/bin/sh")],
+        );
+        let shell_command = format!("(set -o pipefail) 2>/dev/null && set -o pipefail; {command}");
         let output = timeout(
             Duration::from_secs(timeout_secs),
             Command::new(shell)
@@ -2185,6 +2189,19 @@ impl ShellCommandTool {
             "repair_required": repair_required
         }))
     }
+}
+
+fn select_shell_path(configured: Option<&OsStr>, fallbacks: &[&Path]) -> PathBuf {
+    configured
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            fallbacks
+                .iter()
+                .find(|path| path.is_file())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
 fn required_str<'a>(args: &'a HashMap<String, Value>, key: &str) -> Result<&'a str> {
@@ -4132,5 +4149,18 @@ bytes[0..5] \"cafe\\n\""
         let result = tool.shell(&args).await.unwrap();
 
         assert_eq!(result["success"], false);
+    }
+
+    #[test]
+    fn shell_selection_falls_back_when_configured_shell_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-shell");
+        let fallback = temp.path().join("portable-shell");
+        std::fs::write(&fallback, "#!/bin/sh\n").unwrap();
+
+        assert_eq!(
+            select_shell_path(Some(missing.as_os_str()), &[fallback.as_path()]),
+            fallback
+        );
     }
 }
