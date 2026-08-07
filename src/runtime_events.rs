@@ -272,6 +272,17 @@ pub const AGENT_STAGE_FIRST_VALIDATION_PROBE: &str = "agent.stage.first_validati
 /// fields consumed: `command`, `command_family`, `status`, `success`.
 pub const AGENT_VALIDATION_PROBE_OBSERVED: &str = "agent.validation_probe.observed";
 
+/// A structured lifecycle phase reported by an adapter-declared command probe.
+/// The harness accepts these markers only from the exact command registered in
+/// the run contract. Payload fields: `probe_id`, `command_family`, `stream`,
+/// `phase`, and the complete bounded `evidence` object printed by the probe.
+pub const AGENT_VALIDATION_PROBE_PHASE_OBSERVED: &str = "agent.validation_probe.phase_observed";
+
+/// A lifecycle marker from an adapter-declared command probe could not be
+/// decoded. Payload fields: `probe_id`, `command_family`, `stream`, `reason`,
+/// and `marker_preview`.
+pub const AGENT_VALIDATION_PROBE_PHASE_INVALID: &str = "agent.validation_probe.phase_invalid";
+
 /// Escalated hard-stop: repeated action-boundary interrupts without source
 /// mutation or validation. Maps to
 /// [`crate::trace_analysis::HardStopReason::ActionBoundary`].

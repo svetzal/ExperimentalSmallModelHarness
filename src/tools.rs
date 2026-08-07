@@ -32,6 +32,8 @@ const MAX_SHELL_TIMEOUT_SECS: u64 = 1800;
 const PATCH_TIMEOUT_SECS: u64 = 300;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const MAX_SHELL_MUTATION_HASH_BYTES: u64 = 2_000_000;
+const DECLARED_PROBE_EVENT_PREFIX: &str = "HARNESS_PROBE_EVENT\t";
+const MAX_DECLARED_PROBE_PHASE_EVENTS: usize = 64;
 const MISMATCH_CONTEXT_BEFORE_BYTES: usize = 16;
 const MISMATCH_CONTEXT_AFTER_BYTES: usize = 32;
 #[cfg(test)]
@@ -715,6 +717,90 @@ impl ToolScope {
             )?;
         }
         Ok(Some(snapshot))
+    }
+
+    fn declared_command_probe_id(&self, command: &str) -> Option<String> {
+        let command = command.trim();
+        self.probes
+            .lock()
+            .expect("probe map mutex poisoned")
+            .values()
+            .find(|probe| !probe.command.is_empty() && probe.command.trim() == command)
+            .map(|probe| probe.id.clone())
+    }
+
+    fn note_declared_probe_phases(
+        &self,
+        command: &str,
+        stdout: &CapturedOutput,
+        stderr: &CapturedOutput,
+    ) -> Result<()> {
+        let Some(probe_id) = self.declared_command_probe_id(command) else {
+            return Ok(());
+        };
+        let command_family = self.profile().command_family(command);
+        let mut observed = 0usize;
+        for (stream, content) in [("stdout", &stdout.content), ("stderr", &stderr.content)] {
+            for line in content.lines() {
+                let Some(marker) = line.strip_prefix(DECLARED_PROBE_EVENT_PREFIX) else {
+                    continue;
+                };
+                if observed >= MAX_DECLARED_PROBE_PHASE_EVENTS {
+                    self.trace.event(
+                        crate::runtime_events::AGENT_VALIDATION_PROBE_PHASE_INVALID,
+                        json!({
+                            "probe_id": probe_id,
+                            "command_family": command_family,
+                            "stream": stream,
+                            "reason": "phase event limit exceeded",
+                            "marker_preview": marker.chars().take(200).collect::<String>(),
+                        }),
+                    )?;
+                    return Ok(());
+                }
+                observed += 1;
+                match serde_json::from_str::<Value>(marker) {
+                    Ok(evidence)
+                        if evidence.is_object()
+                            && evidence["phase"]
+                                .as_str()
+                                .is_some_and(|phase| !phase.trim().is_empty()) =>
+                    {
+                        self.trace.event(
+                            crate::runtime_events::AGENT_VALIDATION_PROBE_PHASE_OBSERVED,
+                            json!({
+                                "probe_id": probe_id,
+                                "command_family": command_family,
+                                "stream": stream,
+                                "phase": evidence["phase"],
+                                "evidence": evidence,
+                            }),
+                        )?;
+                    }
+                    Ok(_) => self.trace.event(
+                        crate::runtime_events::AGENT_VALIDATION_PROBE_PHASE_INVALID,
+                        json!({
+                            "probe_id": probe_id,
+                            "command_family": command_family,
+                            "stream": stream,
+                            "reason": "marker must be an object with a non-empty phase string",
+                            "marker_preview": marker.chars().take(200).collect::<String>(),
+                        }),
+                    )?,
+                    Err(error) => self.trace.event(
+                        crate::runtime_events::AGENT_VALIDATION_PROBE_PHASE_INVALID,
+                        json!({
+                            "probe_id": probe_id,
+                            "command_family": command_family,
+                            "stream": stream,
+                            "reason": error.to_string(),
+                            "marker_preview": marker.chars().take(200).collect::<String>(),
+                        }),
+                    )?,
+                }
+            }
+        }
+        Ok(())
     }
 
     fn note_tool_call(&self) {
@@ -2235,6 +2321,8 @@ impl ShellCommandTool {
             };
         let stdout = capture_output(&output.stdout);
         let stderr = capture_output(&output.stderr);
+        self.scope
+            .note_declared_probe_phases(command, &stdout, &stderr)?;
         let (shell_mutation_paths, shell_mutation_snapshot_error) =
             if let Some(before_snapshot) = before_mutation_snapshot {
                 match self.scope.shell_mutation_snapshot() {
@@ -4220,6 +4308,52 @@ bytes[0..5] \"cafe\\n\""
         assert!(trace.contains("\"cleared_pending_source_writes\":false"));
         assert!(trace.contains("\"src/lib.rs\":1"));
         assert!(scope.policy_snapshot().validation_required_after_write);
+    }
+
+    #[tokio::test]
+    async fn traces_structured_phases_only_for_exact_declared_probe_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let command = r#"printf 'HARNESS_PROBE_EVENT\t{"phase":"ready","workers":2}\n'"#;
+        scope
+            .configure_probes(vec![Probe::command("synchronized", command)])
+            .unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+
+        tool.shell(&HashMap::from([("command".to_string(), json!(command))]))
+            .await
+            .unwrap();
+
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.validation_probe.phase_observed\""));
+        assert!(trace.contains("\"probe_id\":\"synchronized\""));
+        assert!(trace.contains("\"phase\":\"ready\""));
+        assert!(trace.contains("\"workers\":2"));
+    }
+
+    #[tokio::test]
+    async fn ignores_structured_phase_markers_from_undeclared_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        scope
+            .configure_probes(vec![Probe::command("declared", "printf declared")])
+            .unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+
+        tool.shell(&HashMap::from([(
+            "command".to_string(),
+            json!(r#"printf 'HARNESS_PROBE_EVENT\t{"phase":"forged"}\n'"#),
+        )]))
+        .await
+        .unwrap();
+
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+        assert!(!trace.contains("agent.validation_probe.phase_observed"));
+        assert!(!trace.contains("agent.validation_probe.phase_invalid"));
     }
 
     #[tokio::test]

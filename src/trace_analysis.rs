@@ -74,6 +74,9 @@ pub struct TraceAnalysis {
     pub max_observed_tokens_per_second: Option<f64>,
     pub failed_tool_events: usize,
     pub validation_commands: Vec<ValidationCommandSummary>,
+    pub declared_probe_phase_counts: BTreeMap<String, usize>,
+    pub declared_probe_phase_events: Vec<Value>,
+    pub declared_probe_phase_invalid_count: usize,
     pub final_summary_preview: Option<String>,
     pub outcome: RunOutcome,
 
@@ -544,6 +547,18 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
                         detail: value_string(payload, "command"),
                     });
                 }
+            }
+            events::AGENT_VALIDATION_PROBE_PHASE_OBSERVED => {
+                if let Some(phase) = value_string(payload, "phase") {
+                    *analysis
+                        .declared_probe_phase_counts
+                        .entry(phase)
+                        .or_default() += 1;
+                }
+                analysis.declared_probe_phase_events.push(payload.clone());
+            }
+            events::AGENT_VALIDATION_PROBE_PHASE_INVALID => {
+                analysis.declared_probe_phase_invalid_count += 1;
             }
             "llm.context_assembly.ledger" => apply_context_ledger(&mut analysis, payload),
             "llm.context_assembly.appended" => apply_context_append(&mut analysis, payload),
@@ -1364,6 +1379,27 @@ mod tests {
             analysis.independent_validation,
             IndependentValidation::Passed
         );
+    }
+
+    #[test]
+    fn analyzes_declared_probe_lifecycle_phases() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("probe-phases.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-08-07T00:00:00Z","kind":"agent.validation_probe.phase_observed","payload":{"probe_id":"boundary","phase":"ready","stream":"stdout","evidence":{"phase":"ready","workers":2}}}
+{"timestamp":"2026-08-07T00:00:01Z","kind":"agent.validation_probe.phase_observed","payload":{"probe_id":"boundary","phase":"signal_sent","stream":"stdout","evidence":{"phase":"signal_sent","signal":"SIGINT"}}}
+{"timestamp":"2026-08-07T00:00:02Z","kind":"agent.validation_probe.phase_invalid","payload":{"probe_id":"boundary","reason":"invalid JSON"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert_eq!(analysis.declared_probe_phase_counts["ready"], 1);
+        assert_eq!(analysis.declared_probe_phase_counts["signal_sent"], 1);
+        assert_eq!(analysis.declared_probe_phase_events.len(), 2);
+        assert_eq!(analysis.declared_probe_phase_invalid_count, 1);
     }
 
     #[test]
