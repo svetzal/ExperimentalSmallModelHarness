@@ -7,7 +7,7 @@
 use crate::trace::TraceRecorder;
 use anyhow::{Context, Result, bail};
 use mojentic::llm::LlmGateway;
-use mojentic::llm::gateway::CompletionConfig;
+use mojentic::llm::gateway::{CompletionConfig, ResponseFormat};
 use mojentic::llm::models::LlmMessage;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -44,6 +44,9 @@ pub struct SemanticAdvisoryRequest<'a> {
     pub max_input_chars: usize,
     pub max_output_tokens: usize,
     pub temperature: f32,
+    /// Use the ordinary non-streaming completion path so provider-exposed
+    /// thinking can be measured when structured content is empty.
+    pub capture_reasoning: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -123,20 +126,50 @@ pub async fn request_semantic_advisory<G: LlmGateway + ?Sized>(
     let num_predict = i32::try_from(request.max_output_tokens)
         .context("semantic advisory max_output_tokens exceeds i32 range")?;
     let started = Instant::now();
-    let result = gateway
-        .complete_json(
-            request.model,
-            request.messages,
-            request.response_schema,
-            &CompletionConfig {
-                temperature: request.temperature,
-                max_tokens: request.max_output_tokens,
-                num_predict: Some(num_predict),
-                max_tool_iterations: 0,
-                ..Default::default()
-            },
-        )
-        .await;
+    let completion_config = CompletionConfig {
+        temperature: request.temperature,
+        max_tokens: request.max_output_tokens,
+        num_predict: Some(num_predict),
+        max_tool_iterations: 0,
+        response_format: Some(ResponseFormat::JsonObject {
+            schema: Some(request.response_schema.clone()),
+        }),
+        ..Default::default()
+    };
+    let mut thinking_chars = None;
+    let mut content_chars = None;
+    let result = if request.capture_reasoning {
+        match gateway
+            .complete(request.model, request.messages, None, &completion_config)
+            .await
+        {
+            Ok(response) => {
+                thinking_chars = Some(
+                    response
+                        .thinking
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .count(),
+                );
+                let content = response.content.unwrap_or_default();
+                content_chars = Some(content.chars().count());
+                serde_json::from_str(&content)
+                    .context("decoding structured semantic advisory content")
+            }
+            Err(error) => Err(error.into()),
+        }
+    } else {
+        gateway
+            .complete_json(
+                request.model,
+                request.messages,
+                request.response_schema,
+                &completion_config,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+    };
     let duration_ms = started.elapsed().as_millis();
 
     match result {
@@ -149,6 +182,9 @@ pub async fn request_semantic_advisory<G: LlmGateway + ?Sized>(
                     "model": request.model,
                     "duration_ms": duration_ms,
                     "raw_proposal": &raw_proposal,
+                    "capture_reasoning": request.capture_reasoning,
+                    "thinking_chars": thinking_chars,
+                    "content_chars": content_chars,
                 }),
             )?;
             Ok(SemanticAdvisoryResponse {
@@ -165,9 +201,12 @@ pub async fn request_semantic_advisory<G: LlmGateway + ?Sized>(
                     "model": request.model,
                     "duration_ms": duration_ms,
                     "error": error.to_string(),
+                    "capture_reasoning": request.capture_reasoning,
+                    "thinking_chars": thinking_chars,
+                    "content_chars": content_chars,
                 }),
             )?;
-            Err(error.into())
+            Err(error)
         }
     }
 }
@@ -260,6 +299,7 @@ mod tests {
                 max_input_chars: 1_000,
                 max_output_tokens: 64,
                 temperature: 0.0,
+                capture_reasoning: false,
             },
             &trace,
         )
@@ -294,6 +334,7 @@ mod tests {
                 max_input_chars: 4,
                 max_output_tokens: 64,
                 temperature: 0.0,
+                capture_reasoning: false,
             },
             &trace,
         )

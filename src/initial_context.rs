@@ -297,6 +297,7 @@ pub async fn assemble_initial_context<G: LlmGateway + ?Sized>(
                 max_input_chars: catalog.max_advisory_chars,
                 max_output_tokens: 1_024,
                 temperature: 0.1,
+                capture_reasoning: false,
             },
             trace,
         )

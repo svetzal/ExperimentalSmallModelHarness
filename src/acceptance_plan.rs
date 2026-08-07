@@ -106,6 +106,7 @@ pub async fn plan_acceptance_with_gateway<G: LlmGateway + ?Sized>(
             max_input_chars: DEFAULT_MAX_PLAN_INPUT_CHARS,
             max_output_tokens: DEFAULT_MAX_PLAN_OUTPUT_TOKENS,
             temperature: 0.2,
+            capture_reasoning: true,
         },
         &trace,
     )
@@ -276,11 +277,19 @@ mod tests {
         async fn complete(
             &self,
             _model: &str,
-            _messages: &[LlmMessage],
+            messages: &[LlmMessage],
             _tools: Option<&[Box<dyn LlmTool>]>,
-            _config: &CompletionConfig,
+            config: &CompletionConfig,
         ) -> std::result::Result<LlmGatewayResponse, MojenticError> {
-            unreachable!("acceptance planning uses structured completion")
+            assert_eq!(config.max_tool_iterations, 0);
+            assert!(messages[0].content.as_deref().unwrap().contains("isolated"));
+            *self.calls.lock().unwrap() += 1;
+            Ok(LlmGatewayResponse {
+                content: Some(serde_json::to_string(&self.proposal).unwrap()),
+                object: None,
+                tool_calls: Vec::new(),
+                thinking: Some("brief reasoning".into()),
+            })
         }
 
         async fn complete_json(
@@ -290,10 +299,8 @@ mod tests {
             _schema: Value,
             config: &CompletionConfig,
         ) -> std::result::Result<Value, MojenticError> {
-            assert_eq!(config.max_tool_iterations, 0);
-            assert!(messages[0].content.as_deref().unwrap().contains("isolated"));
-            *self.calls.lock().unwrap() += 1;
-            Ok(self.proposal.clone())
+            let _ = (messages, config);
+            unreachable!("acceptance planning captures reasoning through complete")
         }
 
         async fn get_available_models(&self) -> std::result::Result<Vec<String>, MojenticError> {
@@ -396,5 +403,7 @@ mod tests {
         assert!(events.contains("\"advisory_kind\":\"acceptance_planning\""));
         assert!(events.contains("acceptance_plan.policy_evaluated"));
         assert!(events.contains("\"authority\":\"measurement_only\""));
+        assert!(events.contains("\"capture_reasoning\":true"));
+        assert!(events.contains("\"thinking_chars\":15"));
     }
 }
