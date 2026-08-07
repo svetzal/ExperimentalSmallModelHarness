@@ -497,11 +497,14 @@ pub(crate) fn is_ignored_dir(dir_name: &str) -> bool {
             | ".svn"
             | ".venv"
             | "venv"
+            | "__pycache__"
             | "target"
             | "node_modules"
             | ".next"
             | ".pytest_cache"
             | ".mypy_cache"
+            | ".ruff_cache"
+            | "build"
             | "coverage"
             | "dist"
     )
@@ -808,6 +811,7 @@ mod tests {
         assert!(is_ignored_dir("target"));
         assert!(is_ignored_dir("node_modules"));
         assert!(is_ignored_dir(".venv"));
+        assert!(is_ignored_dir("__pycache__"));
         assert!(!is_ignored_dir("src"));
     }
 

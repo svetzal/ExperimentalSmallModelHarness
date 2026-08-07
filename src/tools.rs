@@ -167,6 +167,13 @@ struct AccessPolicy {
     write_allow: Vec<PathRule>,
 }
 
+/// Shared workspace visibility policy for model-facing file tools and
+/// mutation sensing. Rules are reloaded per operation so a newly-created
+/// `.gitignore` takes effect immediately.
+struct WorkspaceIgnore {
+    gitignore: Gitignore,
+}
+
 #[derive(Debug)]
 struct PathRule {
     path: PathBuf,
@@ -286,11 +293,37 @@ impl ToolScope {
     }
 
     fn check_read(&self, path: &Path) -> Result<()> {
+        self.check_not_ignored("read", path, path.is_dir())?;
         self.check_access("read", path, &self.access.read_allow)
     }
 
     fn check_write(&self, path: &Path) -> Result<()> {
+        self.check_not_ignored("write", path, path.is_dir())?;
         self.check_access("write", path, &self.access.write_allow)
+    }
+
+    fn check_not_ignored(&self, operation: &str, path: &Path, is_dir: bool) -> Result<()> {
+        if self.relative_path(path)? == Path::new(".gitignore") {
+            return Ok(());
+        }
+        if !self.workspace_ignore()?.is_ignored(self, path, is_dir)? {
+            return Ok(());
+        }
+        let relative = self.relative_path(path)?;
+        let payload = json!({
+            "operation": operation,
+            "path": relative.display().to_string(),
+            "reason": "path is ignored by workspace visibility policy",
+        });
+        let _ = self.trace.value_event("tool.access.denied", payload);
+        bail!(
+            "{operation} denied because path is ignored by workspace visibility policy: {}",
+            relative.display()
+        )
+    }
+
+    fn workspace_ignore(&self) -> Result<WorkspaceIgnore> {
+        WorkspaceIgnore::load(&self.root)
     }
 
     fn check_access(&self, operation: &str, path: &Path, rules: &[PathRule]) -> Result<()> {
@@ -311,6 +344,17 @@ impl ToolScope {
     }
 
     fn is_read_visible(&self, path: &Path) -> bool {
+        if self
+            .workspace_ignore()
+            .and_then(|policy| policy.is_ignored(self, path, path.is_dir()))
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        self.is_read_allowed_by_scope(path)
+    }
+
+    fn is_read_allowed_by_scope(&self, path: &Path) -> bool {
         if self.access.read_allow.is_empty() {
             return true;
         }
@@ -517,9 +561,9 @@ impl ToolScope {
     }
 
     fn shell_mutation_snapshot(&self) -> Result<BTreeMap<String, FileFingerprint>> {
-        let gitignore = load_gitignore(&self.root)?;
+        let ignore = self.workspace_ignore()?;
         let mut snapshot = BTreeMap::new();
-        collect_shell_mutation_snapshot(self, &self.root, &gitignore, &mut snapshot)?;
+        collect_shell_mutation_snapshot(self, &self.root, &ignore, &mut snapshot)?;
         Ok(snapshot)
     }
 
@@ -1280,13 +1324,13 @@ impl ListTreeTool {
             .unwrap_or(false);
         let mut entries = Vec::new();
         let mut truncated = false;
-        let gitignore = load_gitignore(&self.scope.root)?;
+        let ignore = self.scope.workspace_ignore()?;
         let mut context = TreeCollectContext {
             scope: &self.scope,
             max_depth,
             max_entries,
             include_hidden,
-            gitignore,
+            ignore,
         };
         collect_tree(&mut context, &root, 0, &mut entries, &mut truncated)?;
         Ok(json!({
@@ -1306,7 +1350,7 @@ struct TreeCollectContext<'a> {
     max_depth: usize,
     max_entries: usize,
     include_hidden: bool,
-    gitignore: Gitignore,
+    ignore: WorkspaceIgnore,
 }
 
 fn collect_tree(
@@ -1340,13 +1384,12 @@ fn collect_tree(
             .metadata()
             .with_context(|| format!("reading metadata {}", path.display()))?;
         if context
-            .gitignore
-            .matched(&path, metadata.is_dir())
-            .is_ignore()
+            .ignore
+            .is_ignored(context.scope, &path, metadata.is_dir())?
         {
             continue;
         }
-        if !context.scope.is_read_visible(&path) {
+        if !context.scope.is_read_allowed_by_scope(&path) {
             continue;
         }
         let kind = if metadata.is_dir() {
@@ -1382,10 +1425,58 @@ fn load_gitignore(root: &Path) -> Result<Gitignore> {
         .with_context(|| format!("loading gitignore rules from {}", root.display()))
 }
 
+impl WorkspaceIgnore {
+    fn load(root: &Path) -> Result<Self> {
+        Ok(Self {
+            gitignore: load_gitignore(root)?,
+        })
+    }
+
+    fn is_ignored(&self, scope: &ToolScope, path: &Path, is_dir: bool) -> Result<bool> {
+        let relative = scope.relative_path(path)?;
+        if relative == Path::new(".") || relative == Path::new(".gitignore") {
+            return Ok(false);
+        }
+
+        let components = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let directory_components = if is_dir {
+            components.as_slice()
+        } else {
+            &components[..components.len().saturating_sub(1)]
+        };
+        if directory_components
+            .iter()
+            .any(|name| scope.profile().is_ignored_dir(&name.to_string_lossy()))
+        {
+            return Ok(true);
+        }
+
+        let mut ancestor = PathBuf::new();
+        for name in directory_components {
+            ancestor.push(name);
+            if self
+                .gitignore
+                .matched(scope.root.join(&ancestor), true)
+                .is_ignore()
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(self.gitignore.matched(path, is_dir).is_ignore())
+    }
+}
+
 fn collect_shell_mutation_snapshot(
     scope: &ToolScope,
     dir: &Path,
-    gitignore: &Gitignore,
+    ignore: &WorkspaceIgnore,
     snapshot: &mut BTreeMap<String, FileFingerprint>,
 ) -> Result<()> {
     let mut children = fs::read_dir(dir)
@@ -1398,18 +1489,14 @@ fn collect_shell_mutation_snapshot(
         let metadata = child
             .metadata()
             .with_context(|| format!("reading metadata {}", path.display()))?;
-        let relative = scope.relative_path(&path)?;
-        if is_shell_mutation_snapshot_excluded(scope, &relative) {
+        if ignore.is_ignored(scope, &path, metadata.is_dir())? {
             continue;
         }
-        if gitignore.matched(&path, metadata.is_dir()).is_ignore() {
-            continue;
-        }
-        if !scope.is_read_visible(&path) {
+        if !scope.is_read_allowed_by_scope(&path) {
             continue;
         }
         if metadata.is_dir() {
-            collect_shell_mutation_snapshot(scope, &path, gitignore, snapshot)?;
+            collect_shell_mutation_snapshot(scope, &path, ignore, snapshot)?;
         } else if metadata.is_file() {
             let relative = scope.relative_display(&path);
             if scope
@@ -1421,15 +1508,6 @@ fn collect_shell_mutation_snapshot(
         }
     }
     Ok(())
-}
-
-fn is_shell_mutation_snapshot_excluded(scope: &ToolScope, relative: &Path) -> bool {
-    relative.components().any(|component| {
-        let Component::Normal(name) = component else {
-            return false;
-        };
-        scope.profile().is_ignored_dir(&name.to_string_lossy())
-    })
 }
 
 fn file_fingerprint(path: &Path, metadata: &fs::Metadata) -> Result<FileFingerprint> {
@@ -3727,7 +3805,7 @@ bytes[0..5] \"cafe\\n\""
     }
 
     #[test]
-    fn list_tree_does_not_special_case_target_without_gitignore() {
+    fn list_tree_hides_profile_ignored_directories_without_gitignore() {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
         std::fs::create_dir_all(temp.path().join("target/debug")).unwrap();
@@ -3743,8 +3821,123 @@ bytes[0..5] \"cafe\\n\""
             .map(|entry| entry["path"].as_str().unwrap())
             .collect::<Vec<_>>();
 
-        assert!(paths.contains(&"target"));
-        assert!(paths.contains(&"target/debug"));
+        assert!(!paths.contains(&"target"));
+        assert!(!paths.contains(&"target/debug"));
+    }
+
+    #[tokio::test]
+    async fn gitignored_paths_are_invisible_to_direct_file_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::write(temp.path().join(".gitignore"), "ignored.txt\ncache/\n").unwrap();
+        std::fs::write(temp.path().join("ignored.txt"), "secret\n").unwrap();
+        std::fs::create_dir_all(temp.path().join("cache")).unwrap();
+        std::fs::write(temp.path().join("cache/value.txt"), "generated\n").unwrap();
+
+        let reader = ReadFileTool {
+            scope: scope.clone(),
+        };
+        let read_error = reader
+            .read(&HashMap::from([("path".to_string(), json!("ignored.txt"))]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(read_error.contains("ignored by workspace visibility policy"));
+
+        let writer = WriteFileTool {
+            scope: scope.clone(),
+        };
+        let write_error = writer
+            .write(&HashMap::from([
+                ("path".to_string(), json!("cache/new.txt")),
+                ("content".to_string(), json!("new\n")),
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(write_error.contains("ignored by workspace visibility policy"));
+        assert!(!temp.path().join("cache/new.txt").exists());
+
+        let tree = ListTreeTool { scope };
+        let result = tree.list(&HashMap::new()).unwrap();
+        let paths = result["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!paths.contains(&"ignored.txt"));
+        assert!(!paths.contains(&"cache"));
+    }
+
+    #[tokio::test]
+    async fn generated_python_cache_does_not_count_as_shell_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::write(temp.path().join("run.py"), "value = 1\n").unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+
+        let result = tool
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("mkdir -p __pycache__ && printf generated > __pycache__/run.pyc"),
+            )]))
+            .await
+            .unwrap();
+
+        assert!(temp.path().join("__pycache__").is_dir());
+        assert_eq!(result["shell_mutation_sensed"], false);
+        assert_eq!(result["shell_mutation_paths"], json!([]));
+        assert_eq!(scope.policy_snapshot().total_write_operations, 0);
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+        assert!(!trace.contains("agent.stage.first_source_mutation"));
+        assert!(!trace.contains("agent.stage.first_post_validation_repair_action"));
+    }
+
+    #[tokio::test]
+    async fn gitignored_shell_artifact_does_not_count_as_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::write(temp.path().join(".gitignore"), "generated.log\n").unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+
+        let result = tool
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("printf generated > generated.log"),
+            )]))
+            .await
+            .unwrap();
+
+        assert!(temp.path().join("generated.log").is_file());
+        assert_eq!(result["shell_mutation_sensed"], false);
+        assert_eq!(result["shell_mutation_paths"], json!([]));
+        assert_eq!(scope.policy_snapshot().total_write_operations, 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_gitignore_can_be_repaired_through_write_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::write(temp.path().join(".gitignore"), "[unterminated\n").unwrap();
+        let writer = WriteFileTool { scope };
+
+        writer
+            .write(&HashMap::from([
+                ("path".to_string(), json!(".gitignore")),
+                ("content".to_string(), json!("target/\n")),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".gitignore")).unwrap(),
+            "target/\n"
+        );
     }
 
     #[test]
