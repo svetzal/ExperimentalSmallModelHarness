@@ -11,6 +11,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use mojentic::llm::tools::{FunctionDescriptor, LlmTool, ToolDescriptor, ToolRunCtx};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -1518,6 +1519,18 @@ impl WriteFileTool {
         let content = required_str(args, "content")?;
         let path = self.scope.resolve_existing_or_new(path_arg)?;
         self.scope.check_write(&path)?;
+        let previous_content = match tokio::fs::read(&path).await {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        let new_content = content.as_bytes();
+        let content_changed = previous_content.as_deref() != Some(new_content);
+        let previous_bytes = previous_content.as_ref().map(Vec::len);
+        let before_sha256 = previous_content
+            .as_deref()
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+        let after_sha256 = format!("{:x}", Sha256::digest(new_content));
         self.scope.note_write_intent(std::slice::from_ref(&path))?;
         self.scope
             .note_patch_fallback_choice(std::slice::from_ref(&path), "write_file", None)?;
@@ -1531,7 +1544,11 @@ impl WriteFileTool {
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(json!({
             "path": self.scope.relative_display(&path),
-            "bytes_written": content.len()
+            "bytes_written": content.len(),
+            "previous_bytes": previous_bytes,
+            "content_changed": content_changed,
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256
         }))
     }
 }
@@ -2866,6 +2883,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read_to_string(absolute).unwrap(), "print('new')\n");
+    }
+
+    #[tokio::test]
+    async fn write_file_reports_content_identity_without_exposing_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = recursive_root_scope(&temp);
+        let write = WriteFileTool {
+            scope: scope.clone(),
+        };
+        let args = HashMap::from([
+            ("path".to_string(), json!("run.py")),
+            ("content".to_string(), json!("print('one')\n")),
+        ]);
+
+        let created = write.write(&args).await.unwrap();
+        assert_eq!(created["previous_bytes"], Value::Null);
+        assert_eq!(created["content_changed"], true);
+        assert_eq!(created["before_sha256"], Value::Null);
+        assert_eq!(created["after_sha256"].as_str().unwrap().len(), 64);
+        assert!(created.get("content").is_none());
+
+        let unchanged = write.write(&args).await.unwrap();
+        assert_eq!(unchanged["previous_bytes"], 13);
+        assert_eq!(unchanged["content_changed"], false);
+        assert_eq!(unchanged["before_sha256"], unchanged["after_sha256"]);
+
+        let changed = write
+            .write(&HashMap::from([
+                ("path".to_string(), json!("run.py")),
+                ("content".to_string(), json!("print('two')\n")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(changed["previous_bytes"], 13);
+        assert_eq!(changed["content_changed"], true);
+        assert_ne!(changed["before_sha256"], changed["after_sha256"]);
     }
 
     #[test]

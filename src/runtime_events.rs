@@ -213,7 +213,9 @@ pub const TOOL_CALL_KIND_PREFIX: &str = "tool.";
 /// `result_estimated_tokens`.
 pub const TOOL_PAYLOAD_MEASURED: &str = "tool.payload.measured";
 
-/// A file write. Payload fields: `path`, `bytes_written`.
+/// A file write. Payload fields: `path`, `bytes_written`, `previous_bytes`,
+/// `content_changed`, `before_sha256`, and `after_sha256`. Fingerprints expose
+/// file identity without retaining generated source content in the trace.
 pub const TOOL_WRITE_FILE: &str = "tool.write_file";
 
 /// A file edit (search/replace). Payload fields: `path`.
