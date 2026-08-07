@@ -38,6 +38,9 @@ pub const SEMANTIC_ADVISORY_FAILED: &str = "semantic_advisory.failed";
 /// Deterministic policy evaluated a proposed acceptance plan.
 /// Payload: schema, accepted plan, item counts, and validation violations.
 pub const ACCEPTANCE_PLAN_POLICY_EVALUATED: &str = "acceptance_plan.policy_evaluated";
+/// One bounded acceptance-planning attempt finished.
+/// Payload: attempt number, maximum attempts, outcome, and optional error.
+pub const ACCEPTANCE_PLAN_ATTEMPT_FINISHED: &str = "acceptance_plan.attempt_finished";
 /// Initial-context dispositions and budgets were resolved from a catalog.
 pub const INITIAL_CONTEXT_CATALOG_RESOLVED: &str = "initial_context.catalog.resolved";
 /// No semantic advisory was needed because no selectable guidance existed.

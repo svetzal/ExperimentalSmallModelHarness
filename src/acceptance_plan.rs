@@ -9,7 +9,7 @@ use crate::semantic_advisory::{
     SemanticAdvisoryKind, SemanticAdvisoryRequest, request_semantic_advisory,
 };
 use crate::trace::TraceRecorder;
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow, bail};
 use mojentic::llm::LlmGateway;
 use mojentic::llm::gateways::OllamaGateway;
 use mojentic::llm::models::LlmMessage;
@@ -17,11 +17,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub const ACCEPTANCE_PLAN_SCHEMA_VERSION: &str = "acceptance_plan.v1";
 pub const DEFAULT_MAX_PLAN_ITEMS: usize = 16;
 pub const DEFAULT_MAX_PLAN_INPUT_CHARS: usize = 16_000;
 pub const DEFAULT_MAX_PLAN_OUTPUT_TOKENS: usize = 2_048;
+pub const DEFAULT_MAX_PLAN_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +76,7 @@ pub struct AcceptancePlanningSummary {
     pub trace_file: PathBuf,
     pub duration_ms: u128,
     pub max_output_tokens: usize,
+    pub attempts: usize,
     pub plan: AcceptancePlan,
     pub policy: AcceptancePlanPolicyOutcome,
 }
@@ -106,43 +109,114 @@ pub async fn plan_acceptance_with_gateway<G: LlmGateway + ?Sized>(
     max_output_tokens: usize,
 ) -> Result<AcceptancePlanningSummary> {
     let trace = TraceRecorder::create(trace_dir)?;
-    let messages = planning_messages(guidance, max_items);
-    let response = request_semantic_advisory(
-        gateway,
-        SemanticAdvisoryRequest {
-            advisory_kind: SemanticAdvisoryKind::AcceptancePlanning,
-            model,
-            messages: &messages,
-            response_schema: planning_schema(max_items),
-            max_input_chars: DEFAULT_MAX_PLAN_INPUT_CHARS,
-            max_output_tokens,
-            temperature: 0.2,
-            capture_reasoning: true,
-        },
-        &trace,
-    )
-    .await?;
-    let plan: AcceptancePlan = serde_json::from_value(response.raw_proposal)
-        .context("decoding acceptance planning proposal")?;
-    let policy = evaluate_plan(guidance, &plan, max_items);
-    trace.event(
-        crate::runtime_events::ACCEPTANCE_PLAN_POLICY_EVALUATED,
-        json!({
-            "schema_version": ACCEPTANCE_PLAN_SCHEMA_VERSION,
-            "plan": &plan,
-            "policy": &policy,
-            "authority": "measurement_only",
-        }),
-    )?;
+    let transaction_started = Instant::now();
+    let mut messages = planning_messages(guidance, max_items);
+    let mut last_error = "no planning attempt completed".to_string();
 
-    Ok(AcceptancePlanningSummary {
-        model: model.to_string(),
-        trace_file: trace.path().to_path_buf(),
-        duration_ms: response.duration_ms,
-        max_output_tokens,
-        plan,
-        policy,
-    })
+    for attempt in 1..=DEFAULT_MAX_PLAN_ATTEMPTS {
+        let response = request_semantic_advisory(
+            gateway,
+            SemanticAdvisoryRequest {
+                advisory_kind: SemanticAdvisoryKind::AcceptancePlanning,
+                model,
+                messages: &messages,
+                response_schema: planning_schema(max_items),
+                max_input_chars: DEFAULT_MAX_PLAN_INPUT_CHARS,
+                max_output_tokens,
+                temperature: 0.2,
+                capture_reasoning: true,
+            },
+            &trace,
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = error.to_string();
+                trace_plan_attempt(&trace, attempt, "advisory_failed", Some(&last_error))?;
+                continue;
+            }
+        };
+        let raw_proposal = response.raw_proposal;
+        let plan = match serde_json::from_value::<AcceptancePlan>(raw_proposal.clone()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                last_error = format!("decoding acceptance planning proposal: {error}");
+                trace_plan_attempt(&trace, attempt, "decode_failed", Some(&last_error))?;
+                messages = repair_messages(guidance, max_items, &raw_proposal, &last_error)?;
+                continue;
+            }
+        };
+        let policy = evaluate_plan(guidance, &plan, max_items);
+        trace.event(
+            crate::runtime_events::ACCEPTANCE_PLAN_POLICY_EVALUATED,
+            json!({
+                "schema_version": ACCEPTANCE_PLAN_SCHEMA_VERSION,
+                "attempt": attempt,
+                "plan": &plan,
+                "policy": &policy,
+                "authority": "measurement_only",
+            }),
+        )?;
+        if policy.accepted {
+            trace_plan_attempt(&trace, attempt, "accepted", None)?;
+            return Ok(AcceptancePlanningSummary {
+                model: model.to_string(),
+                trace_file: trace.path().to_path_buf(),
+                duration_ms: transaction_started.elapsed().as_millis(),
+                max_output_tokens,
+                attempts: attempt,
+                plan,
+                policy,
+            });
+        }
+
+        last_error = serde_json::to_string(&policy.violations)?;
+        trace_plan_attempt(&trace, attempt, "policy_rejected", Some(&last_error))?;
+        messages = repair_messages(guidance, max_items, &raw_proposal, &last_error)?;
+    }
+
+    bail!(
+        "acceptance planning exhausted {} attempts: {last_error}",
+        DEFAULT_MAX_PLAN_ATTEMPTS
+    )
+}
+
+fn trace_plan_attempt(
+    trace: &TraceRecorder,
+    attempt: usize,
+    outcome: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    trace.event(
+        crate::runtime_events::ACCEPTANCE_PLAN_ATTEMPT_FINISHED,
+        json!({
+            "attempt": attempt,
+            "maximum_attempts": DEFAULT_MAX_PLAN_ATTEMPTS,
+            "outcome": outcome,
+            "error": error,
+        }),
+    )
+}
+
+fn repair_messages(
+    guidance: &str,
+    max_items: usize,
+    previous: &Value,
+    feedback: &str,
+) -> Result<Vec<LlmMessage>> {
+    if previous.is_null() {
+        return Err(anyhow!("planning repair requires a previous proposal"));
+    }
+    Ok(vec![
+        LlmMessage::system(
+            "You are repairing only the protocol shape of an acceptance-plan proposal. Preserve every supported requirement and its meaning. Remove unsupported fields. Return exactly one JSON object matching the supplied schema. The first response character must be `{` and the last must be `}`. Do not use Markdown or code fences.",
+        ),
+        LlmMessage::user(format!(
+            "Task guidance:\n{guidance}\n\nPrevious proposal:\n{}\n\nDeterministic validation feedback:\n{feedback}\n\nReturn at most {max_items} canonical items. Every source_excerpt must remain an exact substring of the task guidance.",
+            serde_json::to_string_pretty(previous)?
+        )),
+    ])
 }
 
 pub fn evaluate_plan(
@@ -223,7 +297,7 @@ fn planning_messages(guidance: &str, max_items: usize) -> Vec<LlmMessage> {
             "You are an isolated acceptance-planning advisor. Decompose public task guidance into a small checklist of externally observable required outcomes. Preserve interactions between requirements when those interactions need separate evidence. Do not solve the task, use tools, invent requirements, or claim anything is complete. Each source_excerpt must be copied verbatim from the task guidance. Return exactly one JSON object matching the supplied schema. The first response character must be `{` and the last must be `}`. Do not use Markdown or code fences.",
         ),
         LlmMessage::user(format!(
-            "/no_think\nTask guidance:\n{guidance}\n\nReturn at most {max_items} required acceptance items. Use stable concise IDs. Classify each item as artifact, behavior, or constraint. suggested_evidence describes a deterministic observation that could verify the requirement; it is a proposal, not authority."
+            "Task guidance:\n{guidance}\n\nReturn at most {max_items} required acceptance items. Use stable concise IDs. Classify each item as artifact, behavior, or constraint. suggested_evidence describes a deterministic observation that could verify the requirement; it is a proposal, not authority."
         )),
     ]
 }
@@ -277,11 +351,21 @@ mod tests {
     use mojentic::llm::gateway::StreamChunk;
     use mojentic::llm::models::LlmGatewayResponse;
     use mojentic::llm::tools::LlmTool;
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     struct ProposalGateway {
-        proposal: Value,
+        proposals: Mutex<VecDeque<Value>>,
         calls: Mutex<usize>,
+    }
+
+    impl ProposalGateway {
+        fn new(proposals: Vec<Value>) -> Self {
+            Self {
+                proposals: Mutex::new(proposals.into()),
+                calls: Mutex::new(0),
+            }
+        }
     }
 
     #[async_trait]
@@ -295,17 +379,23 @@ mod tests {
         ) -> std::result::Result<LlmGatewayResponse, MojenticError> {
             assert_eq!(config.max_tool_iterations, 0);
             let system = messages[0].content.as_deref().unwrap();
-            assert!(system.contains("isolated"));
+            assert!(system.contains("isolated") || system.contains("repairing only"));
             assert!(
                 messages[1]
                     .content
                     .as_deref()
                     .unwrap()
-                    .starts_with("/no_think\n")
+                    .contains("Task guidance:")
             );
             *self.calls.lock().unwrap() += 1;
+            let proposal = self
+                .proposals
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted planning proposal");
             Ok(LlmGatewayResponse {
-                content: Some(serde_json::to_string(&self.proposal).unwrap()),
+                content: Some(serde_json::to_string(&proposal).unwrap()),
                 object: None,
                 tool_calls: Vec::new(),
                 thinking: Some("brief reasoning".into()),
@@ -403,10 +493,7 @@ mod tests {
     async fn planning_is_measurement_only_and_traceable() {
         let temp = tempfile::tempdir().unwrap();
         let plan = accepted_plan();
-        let gateway = ProposalGateway {
-            proposal: serde_json::to_value(&plan).unwrap(),
-            calls: Mutex::new(0),
-        };
+        let gateway = ProposalGateway::new(vec![serde_json::to_value(&plan).unwrap()]);
         let summary = plan_acceptance_with_gateway(
             &gateway,
             "small-model",
@@ -419,6 +506,7 @@ mod tests {
         .unwrap();
 
         assert!(summary.policy.accepted);
+        assert_eq!(summary.attempts, 1);
         assert_eq!(*gateway.calls.lock().unwrap(), 1);
         let events = std::fs::read_to_string(summary.trace_file).unwrap();
         assert!(events.contains("\"advisory_kind\":\"acceptance_planning\""));
@@ -426,5 +514,30 @@ mod tests {
         assert!(events.contains("\"authority\":\"measurement_only\""));
         assert!(events.contains("\"capture_reasoning\":true"));
         assert!(events.contains("\"thinking_chars\":15"));
+    }
+
+    #[tokio::test]
+    async fn planning_repairs_a_decodable_wrong_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let gateway = ProposalGateway::new(vec![
+            json!({"checklist": [{"description": "wrong shape"}]}),
+            serde_json::to_value(accepted_plan()).unwrap(),
+        ]);
+        let summary = plan_acceptance_with_gateway(
+            &gateway,
+            "small-model",
+            "Preserve the requested output.",
+            temp.path(),
+            4,
+            64,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.attempts, 2);
+        assert_eq!(*gateway.calls.lock().unwrap(), 2);
+        let events = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(events.contains("\"outcome\":\"decode_failed\""));
+        assert!(events.contains("\"outcome\":\"accepted\""));
     }
 }
