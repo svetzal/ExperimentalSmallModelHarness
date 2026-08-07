@@ -220,10 +220,10 @@ fn valid_id(id: &str) -> bool {
 fn planning_messages(guidance: &str, max_items: usize) -> Vec<LlmMessage> {
     vec![
         LlmMessage::system(
-            "/no_think\nYou are an isolated acceptance-planning advisor. Decompose public task guidance into a small checklist of externally observable required outcomes. Preserve interactions between requirements when those interactions need separate evidence. Do not solve the task, use tools, invent requirements, or claim anything is complete. Each source_excerpt must be copied verbatim from the task guidance. Return exactly one JSON object matching the supplied schema. The first response character must be `{` and the last must be `}`. Do not use Markdown or code fences.",
+            "You are an isolated acceptance-planning advisor. Decompose public task guidance into a small checklist of externally observable required outcomes. Preserve interactions between requirements when those interactions need separate evidence. Do not solve the task, use tools, invent requirements, or claim anything is complete. Each source_excerpt must be copied verbatim from the task guidance. Return exactly one JSON object matching the supplied schema. The first response character must be `{` and the last must be `}`. Do not use Markdown or code fences.",
         ),
         LlmMessage::user(format!(
-            "Task guidance:\n{guidance}\n\nReturn at most {max_items} required acceptance items. Use stable concise IDs. Classify each item as artifact, behavior, or constraint. suggested_evidence describes a deterministic observation that could verify the requirement; it is a proposal, not authority."
+            "/no_think\nTask guidance:\n{guidance}\n\nReturn at most {max_items} required acceptance items. Use stable concise IDs. Classify each item as artifact, behavior, or constraint. suggested_evidence describes a deterministic observation that could verify the requirement; it is a proposal, not authority."
         )),
     ]
 }
@@ -295,8 +295,14 @@ mod tests {
         ) -> std::result::Result<LlmGatewayResponse, MojenticError> {
             assert_eq!(config.max_tool_iterations, 0);
             let system = messages[0].content.as_deref().unwrap();
-            assert!(system.starts_with("/no_think\n"));
             assert!(system.contains("isolated"));
+            assert!(
+                messages[1]
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("/no_think\n")
+            );
             *self.calls.lock().unwrap() += 1;
             Ok(LlmGatewayResponse {
                 content: Some(serde_json::to_string(&self.proposal).unwrap()),
