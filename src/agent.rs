@@ -635,6 +635,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 total_write_operations_after_turn: policy.total_write_operations,
                 total_shell_probes_before_turn: policy_before_turn.total_shell_probes,
                 total_shell_probes_after_turn: policy.total_shell_probes,
+                validation_required_after_turn: policy.validation_required_after_write,
             })
         });
         if let Some(decision) = &action_boundary_no_action {
@@ -646,7 +647,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 break;
             }
             final_summary = format!(
-                "turn {turn} action-boundary interrupt after hidden reasoning with no source mutation or validation probe"
+                "turn {turn} action-boundary interrupt after hidden reasoning without required source progress or fresh validation"
             );
             trace.event("agent.action_boundary.prompted", &decision.interrupt)?;
             if !response.trim().is_empty() {
@@ -1333,7 +1334,7 @@ fn hidden_only_no_action_hard_failure_summary(
 
 fn action_boundary_no_action_failure_summary(decision: &ActionBoundaryNoActionDecision) -> String {
     format!(
-        "turn {} produced {} consecutive action-boundary interrupts without source mutation or validation probe",
+        "turn {} produced {} consecutive action-boundary interrupts without required source progress or fresh validation",
         decision.turn, decision.consecutive_no_action_turns
     )
 }
@@ -1435,6 +1436,7 @@ struct ActionBoundaryNoActionDecision {
     total_write_operations_after_turn: usize,
     total_shell_probes_before_turn: usize,
     total_shell_probes_after_turn: usize,
+    validation_required_after_turn: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3549,25 +3551,32 @@ fn action_boundary_interrupt_prompt(decision: &ActionBoundaryNoActionDecision) -
         &decision.interrupt,
         decision.consecutive_no_action_turns,
         decision.escalation_required,
+        decision.validation_required_after_turn,
     )
 }
 
 fn action_boundary_interrupt_prompt_for_interrupt(interrupt: &ActionBoundaryInterrupt) -> String {
-    action_boundary_interrupt_prompt_text(interrupt, 1, false)
+    action_boundary_interrupt_prompt_text(interrupt, 1, false, false)
 }
 
 fn action_boundary_interrupt_prompt_text(
     interrupt: &ActionBoundaryInterrupt,
     consecutive_no_action_turns: usize,
     escalation_required: bool,
+    validation_required_after_turn: bool,
 ) -> String {
+    let required_action = if validation_required_after_turn {
+        "The workspace has unvalidated source changes. Your next turn must run exactly one fresh deterministic validation or diagnostic probe, or reply FAIL with a concrete blocker. Do not write again before observing that feedback."
+    } else {
+        "Your next turn must take exactly one concrete action: write or edit the next source change, run one deterministic validation or diagnostic probe, or reply FAIL with a concrete blocker."
+    };
     let pressure = if escalation_required {
         format!(
-            "Action-boundary escalation is active after {consecutive_no_action_turns} consecutive interrupted action-intent turns without a source edit or validation probe."
+            "Action-boundary escalation is active after {consecutive_no_action_turns} consecutive interrupted action-intent turns without the required source progress or validation probe."
         )
     } else {
         format!(
-            "Action-boundary no-action count: {consecutive_no_action_turns} consecutive interrupted action-intent turn(s) without a source edit or validation probe."
+            "Action-boundary no-action count: {consecutive_no_action_turns} consecutive interrupted action-intent turn(s) without the required source progress or validation probe."
         )
     };
     format!(
@@ -3578,8 +3587,7 @@ fn action_boundary_interrupt_prompt_text(
          Estimated hidden-thinking tokens in the interrupted call: {tokens}. \
          Action-intent hits: {hits} of required {hit_limit}. \
          Latest preview: {preview}\n\
-         Your next turn must take exactly one concrete action: write or edit the next source change, \
-         run one deterministic validation or diagnostic probe, or reply FAIL with a concrete blocker. \
+         {required_action} \
          Do not restate the plan. Do not repeat broad inspection.",
         tokens = interrupt.call_thinking_estimated_tokens,
         hits = interrupt.action_intent_hits,
@@ -5209,6 +5217,29 @@ mod tests {
     }
 
     #[test]
+    fn dirty_action_boundary_prompt_requires_fresh_probe_before_more_writes() {
+        let prompt = action_boundary_interrupt_prompt_text(
+            &ActionBoundaryInterrupt {
+                turn: 2,
+                llm_call_depth: 1,
+                call_thinking_chars: 65_536,
+                call_thinking_estimated_tokens: 16_384,
+                action_boundary_interrupt_tokens: 16_384,
+                action_intent_hits: 4,
+                hit_limit: 2,
+                latest_preview: "I will write it now".to_string(),
+            },
+            1,
+            false,
+            true,
+        );
+
+        assert!(prompt.contains("workspace has unvalidated source changes"));
+        assert!(prompt.contains("exactly one fresh deterministic validation"));
+        assert!(prompt.contains("Do not write again before observing that feedback"));
+    }
+
+    #[test]
     fn validation_repair_prompt_carries_failure_evidence() {
         let prompt = validation_repair_prompt(&ValidationRepairSnapshot {
             active: true,
@@ -5516,7 +5547,7 @@ mod tests {
 
         assert_eq!(
             summary.final_summary,
-            "turn 2 produced 2 consecutive action-boundary interrupts without source mutation or validation probe"
+            "turn 2 produced 2 consecutive action-boundary interrupts without required source progress or fresh validation"
         );
         let trace = std::fs::read_to_string(summary.trace_file).unwrap();
         assert!(trace.contains("\"kind\":\"agent.action_boundary.no_action\""));

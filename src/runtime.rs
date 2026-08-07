@@ -471,7 +471,8 @@ impl RuntimeState {
                 action_boundary_interrupted,
             } => {
                 let acted = *mutated || *probed;
-                if acted {
+                let action_boundary_progress = *probed || (*mutated && !self.validation_required());
+                if action_boundary_progress {
                     self.consecutive_action_boundary_no_action_turns = 0;
                 } else if *action_boundary_interrupted
                     || self.last_action_boundary_interrupt_turn == Some(*turn)
@@ -974,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn two_action_boundary_interrupts_stop_and_action_resets() {
+    fn action_boundary_stops_after_two_interrupts_and_only_probe_resets_dirty_state() {
         let policy = RuntimePolicy;
         let mut state = RuntimeState::default();
         for turn in 1..=2 {
@@ -998,9 +999,23 @@ mod tests {
             assert_eq!(policy.decide(&state, &finished), expected);
             state.reduce(&finished);
         }
+
+        let mut state = RuntimeState::default();
+        state.reduce(&RuntimeEvent::ActionBoundaryInterrupted { turn: 1 });
+        state.reduce(&RuntimeEvent::TurnFinished {
+            turn: 1,
+            content: false,
+            thinking: true,
+            tool_calls: 0,
+            mutated: false,
+            probed: false,
+            repair_was_active_before: false,
+            repair_interrupted: false,
+            action_boundary_interrupted: true,
+        });
         state.reduce(&mutation());
         state.reduce(&RuntimeEvent::TurnFinished {
-            turn: 3,
+            turn: 2,
             content: false,
             thinking: false,
             tool_calls: 1,
@@ -1009,6 +1024,77 @@ mod tests {
             repair_was_active_before: false,
             repair_interrupted: false,
             action_boundary_interrupted: false,
+        });
+        assert_eq!(state.consecutive_action_boundary_no_action_turns, 1);
+
+        state.reduce(&probe(None, true, true));
+        state.reduce(&RuntimeEvent::TurnFinished {
+            turn: 3,
+            content: false,
+            thinking: false,
+            tool_calls: 1,
+            mutated: false,
+            probed: true,
+            repair_was_active_before: false,
+            repair_interrupted: false,
+            action_boundary_interrupted: false,
+        });
+        assert_eq!(state.consecutive_action_boundary_no_action_turns, 0);
+    }
+
+    #[test]
+    fn dirty_action_boundary_requires_a_probe_instead_of_another_write() {
+        let policy = RuntimePolicy;
+        let mut state = RuntimeState::default();
+        state.reduce(&mutation());
+        state.reduce(&RuntimeEvent::ActionBoundaryInterrupted { turn: 1 });
+        let dirty_write_turn = RuntimeEvent::TurnFinished {
+            turn: 1,
+            content: false,
+            thinking: true,
+            tool_calls: 1,
+            mutated: true,
+            probed: false,
+            repair_was_active_before: false,
+            repair_interrupted: false,
+            action_boundary_interrupted: true,
+        };
+
+        assert_eq!(
+            policy.decide(&state, &dirty_write_turn),
+            RuntimeDecision::PromptActionBoundary
+        );
+        state.reduce(&dirty_write_turn);
+        assert_eq!(state.consecutive_action_boundary_no_action_turns, 1);
+
+        state.reduce(&RuntimeEvent::ActionBoundaryInterrupted { turn: 2 });
+        let repeated_dirty_write = RuntimeEvent::TurnFinished {
+            turn: 2,
+            content: false,
+            thinking: true,
+            tool_calls: 1,
+            mutated: true,
+            probed: false,
+            repair_was_active_before: false,
+            repair_interrupted: false,
+            action_boundary_interrupted: true,
+        };
+        assert_eq!(
+            policy.decide(&state, &repeated_dirty_write),
+            RuntimeDecision::HardStopActionBoundary
+        );
+
+        state.reduce(&probe(None, true, true));
+        state.reduce(&RuntimeEvent::TurnFinished {
+            turn: 2,
+            content: false,
+            thinking: false,
+            tool_calls: 1,
+            mutated: false,
+            probed: true,
+            repair_was_active_before: false,
+            repair_interrupted: false,
+            action_boundary_interrupted: true,
         });
         assert_eq!(state.consecutive_action_boundary_no_action_turns, 0);
     }
