@@ -112,6 +112,13 @@ pub struct TraceAnalysis {
     /// `resolved_contract.adapter_kind`, duplicated here as a plain string
     /// for convenient filtering without deserializing the full contract.
     pub contract_adapter_kind: Option<String>,
+    /// Number of times adapter-owned probes were rendered into initial worker
+    /// context. Current runs emit at most one delivery event.
+    pub contract_probe_delivery_count: usize,
+    pub delivered_contract_probe_ids: Vec<String>,
+    pub delivered_contract_command_probe_ids: Vec<String>,
+    pub delivered_contract_assertion_probe_ids: Vec<String>,
+    pub contract_probe_worker_message_chars: Option<usize>,
     /// The full resolved contract from [`crate::runtime_events::AGENT_CONTRACT_RESOLVED`].
     pub resolved_contract: Option<crate::contract::ResolvedRunContract>,
     /// What was supplied to resolution, from
@@ -381,6 +388,17 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
                 analysis.contract_adapter_kind = value_string(payload, "adapter_kind");
                 analysis.resolved_contract =
                     serde_json::from_value(payload["resolved"].clone()).ok();
+            }
+            events::AGENT_CONTRACT_PROBES_DELIVERED => {
+                analysis.contract_probe_delivery_count += 1;
+                analysis.delivered_contract_probe_ids = value_string_array(payload, "probe_ids");
+                analysis.delivered_contract_command_probe_ids =
+                    value_string_array(payload, "command_probe_ids");
+                analysis.delivered_contract_assertion_probe_ids =
+                    value_string_array(payload, "assertion_probe_ids");
+                analysis.contract_probe_worker_message_chars = payload["worker_message_chars"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok());
             }
             events::SEMANTIC_ADVISORY_REQUESTED => {
                 analysis.semantic_advisory_call_count += 1;
@@ -1006,6 +1024,37 @@ mod tests {
         assert_eq!(analysis.initial_context_worker_message_chars, 900);
         assert_eq!(analysis.initial_context_components.len(), 2);
         assert_eq!(analysis.initial_context_policy_accepted, Some(true));
+    }
+
+    #[test]
+    fn analyzes_native_contract_probe_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-contract-probes.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-08-07T00:00:00Z","kind":"run.started","payload":{"model":"worker"}}
+{"timestamp":"2026-08-07T00:00:01Z","kind":"agent.contract.probes.delivered","payload":{"probe_ids":["boundary","artifact"],"command_probe_ids":["boundary"],"assertion_probe_ids":["artifact"],"worker_message_chars":2400}}
+{"timestamp":"2026-08-07T00:00:02Z","kind":"run.finished","payload":{"final_summary":"DONE"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert_eq!(analysis.contract_probe_delivery_count, 1);
+        assert_eq!(
+            analysis.delivered_contract_probe_ids,
+            vec!["boundary", "artifact"]
+        );
+        assert_eq!(
+            analysis.delivered_contract_command_probe_ids,
+            vec!["boundary"]
+        );
+        assert_eq!(
+            analysis.delivered_contract_assertion_probe_ids,
+            vec!["artifact"]
+        );
+        assert_eq!(analysis.contract_probe_worker_message_chars, Some(2400));
     }
 
     #[test]

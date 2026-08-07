@@ -377,9 +377,38 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     scope.configure_probes(resolved_contract.probes.clone())?;
     let system_prompt = profile.system_guidance();
     let tools = tools_for_profile(&scope, profile);
+    let worker_message = worker_message_with_declared_probes(
+        &initial_context.worker_message,
+        &resolved_contract.probes,
+    );
+    if !resolved_contract.probes.is_empty() {
+        trace.event(
+            crate::runtime_events::AGENT_CONTRACT_PROBES_DELIVERED,
+            serde_json::json!({
+                "probe_ids": resolved_contract
+                    .probes
+                    .iter()
+                    .map(|probe| probe.id.as_str())
+                    .collect::<Vec<_>>(),
+                "command_probe_ids": resolved_contract
+                    .probes
+                    .iter()
+                    .filter(|probe| !probe.command.is_empty())
+                    .map(|probe| probe.id.as_str())
+                    .collect::<Vec<_>>(),
+                "assertion_probe_ids": resolved_contract
+                    .probes
+                    .iter()
+                    .filter(|probe| probe.assertion.is_some())
+                    .map(|probe| probe.id.as_str())
+                    .collect::<Vec<_>>(),
+                "worker_message_chars": worker_message.chars().count(),
+            }),
+        )?;
+    }
     let mut messages = vec![
         LlmMessage::system(system_prompt),
-        LlmMessage::user(initial_context.worker_message.clone()),
+        LlmMessage::user(worker_message),
     ];
     let num_predict = config
         .num_predict
@@ -1310,6 +1339,34 @@ fn done_rejected_prompt(ledger: &RequestedValidationLedger) -> String {
          Run only the missing, stale, or failed validation commands above. \
          Reply DONE only after every listed command passes after the latest \
          source mutation. Reply FAIL only if blocked."
+    )
+}
+
+fn worker_message_with_declared_probes(base: &str, probes: &[crate::contract::Probe]) -> String {
+    if probes.is_empty() {
+        return base.to_string();
+    }
+
+    let rendered = probes
+        .iter()
+        .map(|probe| {
+            if probe.command.is_empty() {
+                format!(
+                    "Probe `{}` is an adapter-owned artifact assertion. Execute it by probe ID after the latest relevant mutation.",
+                    probe.id
+                )
+            } else {
+                format!(
+                    "Probe `{}` is an adapter-owned command. Run this exact command after the latest relevant mutation:\n```sh\n{}\n```",
+                    probe.id, probe.command
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!(
+        "{base}\n\nAuthoritative validation contract:\n{rendered}\n\nDo not replace a declared probe with a synthetic approximation. DONE is accepted only after every declared probe passes for the latest source state."
     )
 }
 
@@ -3724,6 +3781,42 @@ mod tests {
     #[test]
     fn default_repair_exit_thinking_tokens_uses_bounded_retry_threshold() {
         assert_eq!(default_repair_exit_thinking_tokens(), 16_384);
+    }
+
+    #[test]
+    fn empty_declared_probe_list_leaves_worker_message_byte_identical() {
+        let base = "Complete the task.";
+        assert_eq!(worker_message_with_declared_probes(base, &[]), base);
+    }
+
+    #[test]
+    fn declared_command_probe_is_delivered_exactly_and_authoritatively() {
+        let command = "python3 verify_boundary.py --signal SIGINT";
+        let message = worker_message_with_declared_probes(
+            "Complete the task.",
+            &[crate::contract::Probe::command("boundary-sigint", command)],
+        );
+
+        assert!(message.contains("Authoritative validation contract:"));
+        assert!(message.contains("Probe `boundary-sigint`"));
+        assert!(message.contains(&format!("```sh\n{command}\n```")));
+        assert!(message.contains("Do not replace a declared probe"));
+    }
+
+    #[test]
+    fn declared_assertion_probe_is_addressed_by_stable_id() {
+        let message = worker_message_with_declared_probes(
+            "Complete the task.",
+            &[crate::contract::Probe::file_text_equals(
+                "artifact-exact",
+                "result.txt",
+                "expected\n",
+            )],
+        );
+
+        assert!(message.contains("Probe `artifact-exact`"));
+        assert!(message.contains("Execute it by probe ID"));
+        assert!(!message.contains("expected"));
     }
 
     #[test]

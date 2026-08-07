@@ -348,6 +348,10 @@ pub const AGENT_CONTRACT_SUPPLIED: &str = "agent.contract.supplied";
 /// fields: `schema_version`, `adapter_kind`, `resolved` (a
 /// [`crate::contract::ResolvedRunContract`]).
 pub const AGENT_CONTRACT_RESOLVED: &str = "agent.contract.resolved";
+/// Adapter-owned validation probes were rendered into the worker's initial
+/// context. Payload fields: `probe_ids`, `command_probe_ids`,
+/// `assertion_probe_ids`, and `worker_message_chars`.
+pub const AGENT_CONTRACT_PROBES_DELIVERED: &str = "agent.contract.probes.delivered";
 
 #[cfg(test)]
 mod tests {
