@@ -11,6 +11,7 @@ use mojentic::llm::gateway::{CompletionConfig, ResponseFormat};
 use mojentic::llm::models::LlmMessage;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 pub const SEMANTIC_ADVISORY_SCHEMA_VERSION: &str = "semantic_advisory.v1";
@@ -138,6 +139,8 @@ pub async fn request_semantic_advisory<G: LlmGateway + ?Sized>(
     };
     let mut thinking_chars = None;
     let mut content_chars = None;
+    let mut content_sha256 = None;
+    let mut content_preview = None;
     let result = if request.capture_reasoning {
         match gateway
             .complete(request.model, request.messages, None, &completion_config)
@@ -154,6 +157,8 @@ pub async fn request_semantic_advisory<G: LlmGateway + ?Sized>(
                 );
                 let content = response.content.unwrap_or_default();
                 content_chars = Some(content.chars().count());
+                content_sha256 = Some(format!("{:x}", Sha256::digest(content.as_bytes())));
+                content_preview = Some(content.chars().take(256).collect::<String>());
                 serde_json::from_str(&content)
                     .context("decoding structured semantic advisory content")
             }
@@ -185,6 +190,7 @@ pub async fn request_semantic_advisory<G: LlmGateway + ?Sized>(
                     "capture_reasoning": request.capture_reasoning,
                     "thinking_chars": thinking_chars,
                     "content_chars": content_chars,
+                    "content_sha256": content_sha256,
                 }),
             )?;
             Ok(SemanticAdvisoryResponse {
@@ -204,6 +210,8 @@ pub async fn request_semantic_advisory<G: LlmGateway + ?Sized>(
                     "capture_reasoning": request.capture_reasoning,
                     "thinking_chars": thinking_chars,
                     "content_chars": content_chars,
+                    "content_sha256": content_sha256,
+                    "content_preview": content_preview,
                 }),
             )?;
             Err(error)
