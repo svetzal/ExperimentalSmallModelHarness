@@ -205,7 +205,10 @@ pub struct RuntimeState {
     pub manual_stop: Option<String>,
     pub environment_stop: Option<String>,
     pub effect_failures: Vec<EffectFailure>,
+    action_boundary_followup_pending: bool,
+    action_boundary_followup_requires_probe: bool,
     last_action_boundary_interrupt_turn: Option<usize>,
+    last_action_boundary_interrupt_requires_probe: bool,
     last_repair_interrupt_turn: Option<usize>,
 }
 
@@ -262,7 +265,10 @@ impl RuntimeState {
             manual_stop: None,
             environment_stop: None,
             effect_failures: Vec::new(),
+            action_boundary_followup_pending: false,
+            action_boundary_followup_requires_probe: false,
             last_action_boundary_interrupt_turn: None,
+            last_action_boundary_interrupt_requires_probe: false,
             last_repair_interrupt_turn: None,
         }
     }
@@ -446,7 +452,8 @@ impl RuntimeState {
                 self.recompute_terminal_readiness();
             }
             RuntimeEvent::ActionBoundaryInterrupted { turn } => {
-                self.last_action_boundary_interrupt_turn = Some(*turn)
+                self.last_action_boundary_interrupt_turn = Some(*turn);
+                self.last_action_boundary_interrupt_requires_probe = self.validation_required();
             }
             RuntimeEvent::RepairNoContentInterrupted { turn } => {
                 self.last_repair_interrupt_turn = Some(*turn)
@@ -471,13 +478,25 @@ impl RuntimeState {
                 action_boundary_interrupted,
             } => {
                 let acted = *mutated || *probed;
-                let action_boundary_progress = *probed || (*mutated && !self.validation_required());
-                if action_boundary_progress {
+                let action_boundary_progress =
+                    *probed || (*mutated && !self.action_boundary_followup_requires_probe);
+                let interrupted = *action_boundary_interrupted
+                    || self.last_action_boundary_interrupt_turn == Some(*turn);
+                if interrupted {
+                    if self.action_boundary_followup_pending && !action_boundary_progress {
+                        self.consecutive_action_boundary_no_action_turns += 1;
+                    } else {
+                        // Progress can satisfy only an obligation opened by an
+                        // earlier interrupt. This interrupt opens the next one.
+                        self.consecutive_action_boundary_no_action_turns = 1;
+                    }
+                    self.action_boundary_followup_pending = true;
+                    self.action_boundary_followup_requires_probe =
+                        self.last_action_boundary_interrupt_requires_probe;
+                } else if self.action_boundary_followup_pending && action_boundary_progress {
                     self.consecutive_action_boundary_no_action_turns = 0;
-                } else if *action_boundary_interrupted
-                    || self.last_action_boundary_interrupt_turn == Some(*turn)
-                {
-                    self.consecutive_action_boundary_no_action_turns += 1;
+                    self.action_boundary_followup_pending = false;
+                    self.action_boundary_followup_requires_probe = false;
                 }
                 if self.validation_repair.is_none() {
                     self.active_repair_failure_key = None;
@@ -507,6 +526,7 @@ impl RuntimeState {
                     self.consecutive_hidden_only_no_action_turns = 0;
                 }
                 self.last_action_boundary_interrupt_turn = None;
+                self.last_action_boundary_interrupt_requires_probe = false;
                 self.last_repair_interrupt_turn = None;
             }
             RuntimeEvent::TerminalToken { token } => self.terminal_token = Some(*token),
@@ -975,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn action_boundary_stops_after_two_interrupts_and_only_probe_resets_dirty_state() {
+    fn action_boundary_stops_after_two_interrupts_and_clean_source_followup_resets() {
         let policy = RuntimePolicy;
         let mut state = RuntimeState::default();
         for turn in 1..=2 {
@@ -1025,20 +1045,6 @@ mod tests {
             repair_interrupted: false,
             action_boundary_interrupted: false,
         });
-        assert_eq!(state.consecutive_action_boundary_no_action_turns, 1);
-
-        state.reduce(&probe(None, true, true));
-        state.reduce(&RuntimeEvent::TurnFinished {
-            turn: 3,
-            content: false,
-            thinking: false,
-            tool_calls: 1,
-            mutated: false,
-            probed: true,
-            repair_was_active_before: false,
-            repair_interrupted: false,
-            action_boundary_interrupted: false,
-        });
         assert_eq!(state.consecutive_action_boundary_no_action_turns, 0);
     }
 
@@ -1067,7 +1073,8 @@ mod tests {
         state.reduce(&dirty_write_turn);
         assert_eq!(state.consecutive_action_boundary_no_action_turns, 1);
 
-        state.reduce(&RuntimeEvent::ActionBoundaryInterrupted { turn: 2 });
+        let mut ignored = state.clone();
+        ignored.reduce(&RuntimeEvent::ActionBoundaryInterrupted { turn: 2 });
         let repeated_dirty_write = RuntimeEvent::TurnFinished {
             turn: 2,
             content: false,
@@ -1080,7 +1087,7 @@ mod tests {
             action_boundary_interrupted: true,
         };
         assert_eq!(
-            policy.decide(&state, &repeated_dirty_write),
+            policy.decide(&ignored, &repeated_dirty_write),
             RuntimeDecision::HardStopActionBoundary
         );
 
@@ -1094,9 +1101,52 @@ mod tests {
             probed: true,
             repair_was_active_before: false,
             repair_interrupted: false,
-            action_boundary_interrupted: true,
+            action_boundary_interrupted: false,
         });
         assert_eq!(state.consecutive_action_boundary_no_action_turns, 0);
+    }
+
+    #[test]
+    fn pre_interrupt_probe_does_not_satisfy_the_new_action_obligation() {
+        let policy = RuntimePolicy;
+        let mut state = RuntimeState::default();
+        state.reduce(&probe(None, true, true));
+        state.reduce(&RuntimeEvent::ActionBoundaryInterrupted { turn: 1 });
+        let first_interrupted_turn = RuntimeEvent::TurnFinished {
+            turn: 1,
+            content: false,
+            thinking: true,
+            tool_calls: 1,
+            mutated: false,
+            probed: true,
+            repair_was_active_before: false,
+            repair_interrupted: false,
+            action_boundary_interrupted: true,
+        };
+
+        assert_eq!(
+            policy.decide(&state, &first_interrupted_turn),
+            RuntimeDecision::PromptActionBoundary
+        );
+        state.reduce(&first_interrupted_turn);
+        assert_eq!(state.consecutive_action_boundary_no_action_turns, 1);
+
+        state.reduce(&RuntimeEvent::ActionBoundaryInterrupted { turn: 2 });
+        let ignored_followup = RuntimeEvent::TurnFinished {
+            turn: 2,
+            content: false,
+            thinking: true,
+            tool_calls: 0,
+            mutated: false,
+            probed: false,
+            repair_was_active_before: false,
+            repair_interrupted: false,
+            action_boundary_interrupted: true,
+        };
+        assert_eq!(
+            policy.decide(&state, &ignored_followup),
+            RuntimeDecision::HardStopActionBoundary
+        );
     }
 
     #[test]
