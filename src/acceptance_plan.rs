@@ -138,6 +138,13 @@ pub async fn plan_acceptance_with_gateway<G: LlmGateway + ?Sized>(
             }
         };
         let raw_proposal = response.raw_proposal;
+        let shape_violations = proposal_shape_violations(&raw_proposal, max_items);
+        if !shape_violations.is_empty() {
+            last_error = serde_json::to_string(&shape_violations)?;
+            trace_plan_attempt(&trace, attempt, "decode_failed", Some(&last_error))?;
+            messages = repair_messages(guidance, max_items, &raw_proposal, &last_error)?;
+            continue;
+        }
         let plan = match serde_json::from_value::<AcceptancePlan>(raw_proposal.clone()) {
             Ok(plan) => plan,
             Err(error) => {
@@ -180,6 +187,85 @@ pub async fn plan_acceptance_with_gateway<G: LlmGateway + ?Sized>(
         "acceptance planning exhausted {} attempts: {last_error}",
         DEFAULT_MAX_PLAN_ATTEMPTS
     )
+}
+
+fn proposal_shape_violations(proposal: &Value, max_items: usize) -> Vec<String> {
+    let Some(root) = proposal.as_object() else {
+        return vec!["root must be a JSON object".to_string()];
+    };
+    let mut violations = Vec::new();
+    let root_fields = ["schema_version", "items"];
+    for field in root_fields {
+        if !root.contains_key(field) {
+            violations.push(format!("root is missing required field `{field}`"));
+        }
+    }
+    for field in root.keys() {
+        if !root_fields.contains(&field.as_str()) {
+            violations.push(format!("root has unsupported field `{field}`; remove it"));
+        }
+    }
+    if let Some(version) = root.get("schema_version")
+        && version.as_str() != Some(ACCEPTANCE_PLAN_SCHEMA_VERSION)
+    {
+        violations.push(format!(
+            "schema_version must equal `{ACCEPTANCE_PLAN_SCHEMA_VERSION}`"
+        ));
+    }
+
+    let Some(items) = root.get("items") else {
+        return violations;
+    };
+    let Some(items) = items.as_array() else {
+        violations.push("`items` must be an array".to_string());
+        return violations;
+    };
+    if items.is_empty() {
+        violations.push("`items` must contain at least one item".to_string());
+    }
+    if items.len() > max_items {
+        violations.push(format!("`items` must contain at most {max_items} items"));
+    }
+
+    let item_fields = [
+        "id",
+        "requirement",
+        "kind",
+        "source_excerpt",
+        "suggested_evidence",
+    ];
+    for (index, item) in items.iter().enumerate() {
+        let Some(item) = item.as_object() else {
+            violations.push(format!("items[{index}] must be a JSON object"));
+            continue;
+        };
+        for field in item_fields {
+            match item.get(field) {
+                None => violations.push(format!(
+                    "items[{index}] is missing required field `{field}`"
+                )),
+                Some(value) if !value.is_string() => {
+                    violations.push(format!("items[{index}].{field} must be a string"))
+                }
+                Some(_) => {}
+            }
+        }
+        for field in item.keys() {
+            if !item_fields.contains(&field.as_str()) {
+                violations.push(format!(
+                    "items[{index}] has unsupported field `{field}`; remove it"
+                ));
+            }
+        }
+        if let Some(kind) = item.get("kind").and_then(Value::as_str)
+            && !matches!(kind, "artifact" | "behavior" | "constraint")
+        {
+            violations.push(format!(
+                "items[{index}].kind must be `artifact`, `behavior`, or `constraint`"
+            ));
+        }
+    }
+    violations
 }
 
 fn trace_plan_attempt(
@@ -487,6 +573,58 @@ mod tests {
                 id: "preserve_output".into()
             }
         ));
+    }
+
+    #[test]
+    fn shape_feedback_reports_all_missing_extra_and_constant_errors() {
+        let proposal = json!({
+            "schema_version": "semantic_advisory.v1",
+            "items": [{
+                "id": "A",
+                "description": "wrong alias",
+                "type": "artifact",
+                "suggested_evidence": "inspect"
+            }],
+            "checklist": []
+        });
+
+        let violations = proposal_shape_violations(&proposal, 16);
+
+        assert!(
+            violations
+                .iter()
+                .any(|entry| entry.contains("schema_version must"))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|entry| entry.contains("root has unsupported field `checklist`"))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|entry| entry.contains("missing required field `requirement`"))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|entry| entry.contains("missing required field `kind`"))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|entry| entry.contains("missing required field `source_excerpt`"))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|entry| entry.contains("unsupported field `description`"))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|entry| entry.contains("unsupported field `type`"))
+        );
     }
 
     #[tokio::test]
