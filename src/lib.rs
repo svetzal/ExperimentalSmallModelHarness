@@ -1,3 +1,4 @@
+pub mod acceptance_plan;
 pub mod agent;
 pub mod baseline;
 pub mod cli;

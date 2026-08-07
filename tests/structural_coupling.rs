@@ -34,6 +34,7 @@ use std::path::Path;
 /// (see module doc).
 const CORE_SOURCE_FILES: &[&str] = &[
     "src/agent.rs",
+    "src/acceptance_plan.rs",
     "src/tools.rs",
     "src/contract.rs",
     "src/cli.rs",

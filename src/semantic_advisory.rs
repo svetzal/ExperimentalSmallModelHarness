@@ -20,6 +20,7 @@ pub const SEMANTIC_ADVISORY_SCHEMA_VERSION: &str = "semantic_advisory.v1";
 #[non_exhaustive]
 pub enum SemanticAdvisoryKind {
     InitialContextSelection,
+    AcceptancePlanning,
     SituationAnalysis,
     FailureClassification,
 }
@@ -28,6 +29,7 @@ impl SemanticAdvisoryKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InitialContextSelection => "initial_context_selection",
+            Self::AcceptancePlanning => "acceptance_planning",
             Self::SituationAnalysis => "situation_analysis",
             Self::FailureClassification => "failure_classification",
         }

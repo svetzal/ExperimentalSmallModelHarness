@@ -1,3 +1,4 @@
+use crate::acceptance_plan::{DEFAULT_MAX_PLAN_ITEMS, plan_acceptance};
 use crate::agent::{
     AgentRunConfig, TranscriptPolicy, default_expected_output_tokens,
     default_max_thinking_only_tokens, default_repair_exit_thinking_tokens, run_agent,
@@ -190,6 +191,30 @@ enum Command {
         #[arg(long)]
         contract: Option<PathBuf>,
     },
+
+    /// Propose and validate a measurement-only acceptance checklist without
+    /// starting the worker loop or exposing tools.
+    PlanTask {
+        /// Legacy Markdown goal file. Mutually exclusive with --contract.
+        #[arg(long)]
+        goal: Option<PathBuf>,
+
+        /// Explicit run contract. Mutually exclusive with --goal.
+        #[arg(long)]
+        contract: Option<PathBuf>,
+
+        /// Trace directory for the isolated planning call.
+        #[arg(long)]
+        trace_dir: PathBuf,
+
+        /// Ollama model name.
+        #[arg(long, default_value = DEFAULT_MODEL)]
+        model: String,
+
+        /// Maximum acceptance items allowed in the proposal.
+        #[arg(long, default_value_t = DEFAULT_MAX_PLAN_ITEMS)]
+        max_items: usize,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -231,33 +256,50 @@ pub async fn run() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Command::ResolveContract { goal, contract } => {
-            let source = match (goal, contract) {
-                (Some(_), Some(_)) => {
-                    bail!("--goal and --contract are mutually exclusive; supply exactly one")
-                }
-                (None, None) => {
-                    bail!("one of --goal or --contract is required")
-                }
-                (Some(goal), None) => {
-                    let goal_text = std::fs::read_to_string(&goal)
-                        .with_context(|| format!("reading goal file {}", goal.display()))?;
-                    ContractSource::Legacy {
-                        goal_path: goal.display().to_string(),
-                        goal_text,
-                    }
-                }
-                (None, Some(contract)) => {
-                    let json_text = std::fs::read_to_string(&contract)
-                        .with_context(|| format!("reading contract file {}", contract.display()))?;
-                    ContractSource::Explicit {
-                        source_path: Some(contract.display().to_string()),
-                        json_text,
-                    }
-                }
-            };
+            let source = contract_source(goal, contract)?;
             let resolved = resolve_contract(source, Budgets::default())?;
             println!("{}", serde_json::to_string_pretty(&resolved)?);
         }
+        Command::PlanTask {
+            goal,
+            contract,
+            trace_dir,
+            model,
+            max_items,
+        } => {
+            if max_items == 0 {
+                bail!("--max-items must be greater than zero");
+            }
+            let resolved = resolve_contract(contract_source(goal, contract)?, Budgets::default())?;
+            let summary =
+                plan_acceptance(&model, &resolved.guidance, &trace_dir, max_items).await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
     }
     Ok(())
+}
+
+fn contract_source(goal: Option<PathBuf>, contract: Option<PathBuf>) -> Result<ContractSource> {
+    match (goal, contract) {
+        (Some(_), Some(_)) => {
+            bail!("--goal and --contract are mutually exclusive; supply exactly one")
+        }
+        (None, None) => bail!("one of --goal or --contract is required"),
+        (Some(goal), None) => {
+            let goal_text = std::fs::read_to_string(&goal)
+                .with_context(|| format!("reading goal file {}", goal.display()))?;
+            Ok(ContractSource::Legacy {
+                goal_path: goal.display().to_string(),
+                goal_text,
+            })
+        }
+        (None, Some(contract)) => {
+            let json_text = std::fs::read_to_string(&contract)
+                .with_context(|| format!("reading contract file {}", contract.display()))?;
+            Ok(ContractSource::Explicit {
+                source_path: Some(contract.display().to_string()),
+                json_text,
+            })
+        }
+    }
 }
