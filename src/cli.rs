@@ -1,4 +1,6 @@
-use crate::acceptance_plan::{DEFAULT_MAX_PLAN_ITEMS, plan_acceptance};
+use crate::acceptance_plan::{
+    DEFAULT_MAX_PLAN_ITEMS, DEFAULT_MAX_PLAN_OUTPUT_TOKENS, plan_acceptance,
+};
 use crate::agent::{
     AgentRunConfig, TranscriptPolicy, default_expected_output_tokens,
     default_max_thinking_only_tokens, default_repair_exit_thinking_tokens, run_agent,
@@ -214,6 +216,10 @@ enum Command {
         /// Maximum acceptance items allowed in the proposal.
         #[arg(long, default_value_t = DEFAULT_MAX_PLAN_ITEMS)]
         max_items: usize,
+
+        /// Maximum generated tokens for the isolated planning call.
+        #[arg(long, default_value_t = DEFAULT_MAX_PLAN_OUTPUT_TOKENS)]
+        max_output_tokens: usize,
     },
 }
 
@@ -266,13 +272,23 @@ pub async fn run() -> Result<()> {
             trace_dir,
             model,
             max_items,
+            max_output_tokens,
         } => {
             if max_items == 0 {
                 bail!("--max-items must be greater than zero");
             }
+            if max_output_tokens == 0 {
+                bail!("--max-output-tokens must be greater than zero");
+            }
             let resolved = resolve_contract(contract_source(goal, contract)?, Budgets::default())?;
-            let summary =
-                plan_acceptance(&model, &resolved.guidance, &trace_dir, max_items).await?;
+            let summary = plan_acceptance(
+                &model,
+                &resolved.guidance,
+                &trace_dir,
+                max_items,
+                max_output_tokens,
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
     }

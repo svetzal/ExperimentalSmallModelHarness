@@ -73,6 +73,7 @@ pub struct AcceptancePlanningSummary {
     pub model: String,
     pub trace_file: PathBuf,
     pub duration_ms: u128,
+    pub max_output_tokens: usize,
     pub plan: AcceptancePlan,
     pub policy: AcceptancePlanPolicyOutcome,
 }
@@ -82,9 +83,18 @@ pub async fn plan_acceptance(
     guidance: &str,
     trace_dir: &Path,
     max_items: usize,
+    max_output_tokens: usize,
 ) -> Result<AcceptancePlanningSummary> {
     let gateway = OllamaGateway::new();
-    plan_acceptance_with_gateway(&gateway, model, guidance, trace_dir, max_items).await
+    plan_acceptance_with_gateway(
+        &gateway,
+        model,
+        guidance,
+        trace_dir,
+        max_items,
+        max_output_tokens,
+    )
+    .await
 }
 
 pub async fn plan_acceptance_with_gateway<G: LlmGateway + ?Sized>(
@@ -93,6 +103,7 @@ pub async fn plan_acceptance_with_gateway<G: LlmGateway + ?Sized>(
     guidance: &str,
     trace_dir: &Path,
     max_items: usize,
+    max_output_tokens: usize,
 ) -> Result<AcceptancePlanningSummary> {
     let trace = TraceRecorder::create(trace_dir)?;
     let messages = planning_messages(guidance, max_items);
@@ -104,7 +115,7 @@ pub async fn plan_acceptance_with_gateway<G: LlmGateway + ?Sized>(
             messages: &messages,
             response_schema: planning_schema(max_items),
             max_input_chars: DEFAULT_MAX_PLAN_INPUT_CHARS,
-            max_output_tokens: DEFAULT_MAX_PLAN_OUTPUT_TOKENS,
+            max_output_tokens,
             temperature: 0.2,
             capture_reasoning: true,
         },
@@ -128,6 +139,7 @@ pub async fn plan_acceptance_with_gateway<G: LlmGateway + ?Sized>(
         model: model.to_string(),
         trace_file: trace.path().to_path_buf(),
         duration_ms: response.duration_ms,
+        max_output_tokens,
         plan,
         policy,
     })
@@ -393,6 +405,7 @@ mod tests {
             "Preserve the requested output.",
             temp.path(),
             4,
+            64,
         )
         .await
         .unwrap();
