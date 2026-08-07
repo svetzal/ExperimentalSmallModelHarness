@@ -22,6 +22,7 @@ pub const SEMANTIC_ADVISORY_SCHEMA_VERSION: &str = "semantic_advisory.v1";
 pub enum SemanticAdvisoryKind {
     InitialContextSelection,
     AcceptancePlanning,
+    AcceptanceInteractionPlanning,
     SituationAnalysis,
     FailureClassification,
 }
@@ -31,6 +32,7 @@ impl SemanticAdvisoryKind {
         match self {
             Self::InitialContextSelection => "initial_context_selection",
             Self::AcceptancePlanning => "acceptance_planning",
+            Self::AcceptanceInteractionPlanning => "acceptance_interaction_planning",
             Self::SituationAnalysis => "situation_analysis",
             Self::FailureClassification => "failure_classification",
         }

@@ -1,5 +1,9 @@
+use crate::acceptance_interactions::{
+    DEFAULT_MAX_INTERACTION_OUTPUT_TOKENS, DEFAULT_MAX_INTERACTION_SCENARIOS,
+    plan_acceptance_interactions,
+};
 use crate::acceptance_plan::{
-    DEFAULT_MAX_PLAN_ITEMS, DEFAULT_MAX_PLAN_OUTPUT_TOKENS, plan_acceptance,
+    AcceptancePlan, DEFAULT_MAX_PLAN_ITEMS, DEFAULT_MAX_PLAN_OUTPUT_TOKENS, plan_acceptance,
 };
 use crate::agent::{
     AgentRunConfig, TranscriptPolicy, default_expected_output_tokens,
@@ -221,6 +225,38 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_MAX_PLAN_OUTPUT_TOKENS)]
         max_output_tokens: usize,
     },
+
+    /// Propose and validate measurement-only combined scenarios over a fixed
+    /// acceptance plan without starting the worker loop or exposing tools.
+    PlanInteractions {
+        /// Legacy Markdown goal file. Mutually exclusive with --contract.
+        #[arg(long)]
+        goal: Option<PathBuf>,
+
+        /// Explicit run contract. Mutually exclusive with --goal.
+        #[arg(long)]
+        contract: Option<PathBuf>,
+
+        /// Validated atomic acceptance-plan JSON file.
+        #[arg(long)]
+        plan: PathBuf,
+
+        /// Trace directory for isolated interaction planning.
+        #[arg(long)]
+        trace_dir: PathBuf,
+
+        /// Ollama model name.
+        #[arg(long, default_value = DEFAULT_MODEL)]
+        model: String,
+
+        /// Maximum interaction scenarios allowed in the proposal.
+        #[arg(long, default_value_t = DEFAULT_MAX_INTERACTION_SCENARIOS)]
+        max_scenarios: usize,
+
+        /// Maximum generated tokens for each isolated attempt.
+        #[arg(long, default_value_t = DEFAULT_MAX_INTERACTION_OUTPUT_TOKENS)]
+        max_output_tokens: usize,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -286,6 +322,37 @@ pub async fn run() -> Result<()> {
                 &resolved.guidance,
                 &trace_dir,
                 max_items,
+                max_output_tokens,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::PlanInteractions {
+            goal,
+            contract,
+            plan,
+            trace_dir,
+            model,
+            max_scenarios,
+            max_output_tokens,
+        } => {
+            if max_scenarios == 0 {
+                bail!("--max-scenarios must be greater than zero");
+            }
+            if max_output_tokens == 0 {
+                bail!("--max-output-tokens must be greater than zero");
+            }
+            let resolved = resolve_contract(contract_source(goal, contract)?, Budgets::default())?;
+            let plan_text = std::fs::read_to_string(&plan)
+                .with_context(|| format!("reading atomic plan file {}", plan.display()))?;
+            let plan: AcceptancePlan = serde_json::from_str(&plan_text)
+                .with_context(|| format!("decoding atomic plan file {}", plan.display()))?;
+            let summary = plan_acceptance_interactions(
+                &model,
+                &resolved.guidance,
+                &plan,
+                &trace_dir,
+                max_scenarios,
                 max_output_tokens,
             )
             .await?;

@@ -41,6 +41,14 @@ pub const ACCEPTANCE_PLAN_POLICY_EVALUATED: &str = "acceptance_plan.policy_evalu
 /// One bounded acceptance-planning attempt finished.
 /// Payload: attempt number, maximum attempts, outcome, and optional error.
 pub const ACCEPTANCE_PLAN_ATTEMPT_FINISHED: &str = "acceptance_plan.attempt_finished";
+/// One bounded acceptance-interaction attempt finished.
+/// Payload: attempt number, maximum attempts, outcome, and optional error.
+pub const ACCEPTANCE_INTERACTIONS_ATTEMPT_FINISHED: &str =
+    "acceptance_interactions.attempt_finished";
+/// Deterministic policy evaluated proposed acceptance interactions.
+/// Payload: schema, scenarios, validation outcome, and measurement-only authority.
+pub const ACCEPTANCE_INTERACTIONS_POLICY_EVALUATED: &str =
+    "acceptance_interactions.policy_evaluated";
 /// Initial-context dispositions and budgets were resolved from a catalog.
 pub const INITIAL_CONTEXT_CATALOG_RESOLVED: &str = "initial_context.catalog.resolved";
 /// No semantic advisory was needed because no selectable guidance existed.
