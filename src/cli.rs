@@ -1,6 +1,6 @@
 use crate::acceptance_interactions::{
-    DEFAULT_MAX_INTERACTION_OUTPUT_TOKENS, DEFAULT_MAX_INTERACTION_SCENARIOS,
-    plan_acceptance_interactions,
+    AcceptanceInteractionCandidate, DEFAULT_MAX_INTERACTION_OUTPUT_TOKENS,
+    DEFAULT_MAX_INTERACTION_SCENARIOS, author_interaction_evidence, plan_acceptance_interactions,
 };
 use crate::acceptance_plan::{
     AcceptancePlan, DEFAULT_MAX_PLAN_ITEMS, DEFAULT_MAX_PLAN_OUTPUT_TOKENS, plan_acceptance,
@@ -257,6 +257,38 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_MAX_INTERACTION_OUTPUT_TOKENS)]
         max_output_tokens: usize,
     },
+
+    /// Author and validate measurement-only evidence for one deterministic
+    /// interaction candidate without starting the worker loop or exposing tools.
+    AuthorInteractionEvidence {
+        /// Legacy Markdown goal file. Mutually exclusive with --contract.
+        #[arg(long)]
+        goal: Option<PathBuf>,
+
+        /// Explicit run contract. Mutually exclusive with --goal.
+        #[arg(long)]
+        contract: Option<PathBuf>,
+
+        /// Validated atomic acceptance-plan JSON file.
+        #[arg(long)]
+        plan: PathBuf,
+
+        /// Deterministically supplied interaction-candidate JSON file.
+        #[arg(long)]
+        candidate: PathBuf,
+
+        /// Trace directory for isolated evidence authoring.
+        #[arg(long)]
+        trace_dir: PathBuf,
+
+        /// Ollama model name.
+        #[arg(long, default_value = DEFAULT_MODEL)]
+        model: String,
+
+        /// Maximum generated tokens for each isolated attempt.
+        #[arg(long, default_value_t = DEFAULT_MAX_INTERACTION_OUTPUT_TOKENS)]
+        max_output_tokens: usize,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -353,6 +385,44 @@ pub async fn run() -> Result<()> {
                 &plan,
                 &trace_dir,
                 max_scenarios,
+                max_output_tokens,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Command::AuthorInteractionEvidence {
+            goal,
+            contract,
+            plan,
+            candidate,
+            trace_dir,
+            model,
+            max_output_tokens,
+        } => {
+            if max_output_tokens == 0 {
+                bail!("--max-output-tokens must be greater than zero");
+            }
+            let resolved = resolve_contract(contract_source(goal, contract)?, Budgets::default())?;
+            let plan_text = std::fs::read_to_string(&plan)
+                .with_context(|| format!("reading atomic plan file {}", plan.display()))?;
+            let plan: AcceptancePlan = serde_json::from_str(&plan_text)
+                .with_context(|| format!("decoding atomic plan file {}", plan.display()))?;
+            let candidate_text = std::fs::read_to_string(&candidate).with_context(|| {
+                format!("reading interaction candidate file {}", candidate.display())
+            })?;
+            let candidate: AcceptanceInteractionCandidate = serde_json::from_str(&candidate_text)
+                .with_context(|| {
+                format!(
+                    "decoding interaction candidate file {}",
+                    candidate.display()
+                )
+            })?;
+            let summary = author_interaction_evidence(
+                &model,
+                &resolved.guidance,
+                &plan,
+                &candidate,
+                &trace_dir,
                 max_output_tokens,
             )
             .await?;

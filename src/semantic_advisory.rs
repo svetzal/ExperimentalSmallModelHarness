@@ -23,6 +23,7 @@ pub enum SemanticAdvisoryKind {
     InitialContextSelection,
     AcceptancePlanning,
     AcceptanceInteractionPlanning,
+    AcceptanceInteractionEvidence,
     SituationAnalysis,
     FailureClassification,
 }
@@ -33,6 +34,7 @@ impl SemanticAdvisoryKind {
             Self::InitialContextSelection => "initial_context_selection",
             Self::AcceptancePlanning => "acceptance_planning",
             Self::AcceptanceInteractionPlanning => "acceptance_interaction_planning",
+            Self::AcceptanceInteractionEvidence => "acceptance_interaction_evidence",
             Self::SituationAnalysis => "situation_analysis",
             Self::FailureClassification => "failure_classification",
         }
