@@ -129,6 +129,22 @@ the catalog is omitted—or contains no selectable records—no advisory call is
 made. The semantic-selection policy remains experimental even though native
 context assembly is now foundational.
 
+### Declared probe delivery
+
+Adapter-owned probes in an explicit run contract are part of the initial worker
+packet and terminal authority. Command probes are rendered with their stable ID
+and exact command; artifact assertions are rendered by stable ID without
+exposing their expected content. The worker is told not to substitute a
+synthetic approximation. After a relevant mutation, every declared probe must
+pass in the current mutation generation before `DONE` is accepted.
+
+Probe delivery is trace-visible as `agent.contract.probes.delivered`, including
+the delivered IDs, probe kinds, and resulting worker-message size. Empty probe
+lists leave the worker message unchanged and emit no delivery event. Probe
+expectations remain adapter-owned: model-authored semantic advisories may
+propose candidate evidence, but they do not gain terminal authority without
+deterministic contract policy.
+
 ## Design and Evidence
 
 The evolving architecture and experimental decisions are documented in
