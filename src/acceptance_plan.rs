@@ -296,7 +296,7 @@ fn repair_messages(
     }
     Ok(vec![
         LlmMessage::system(
-            "You are repairing only the protocol shape of an acceptance-plan proposal. Preserve every supported requirement and its meaning. Remove unsupported fields. Return exactly one JSON object matching the supplied schema. The first response character must be `{` and the last must be `}`. Do not use Markdown or code fences.",
+            "You are repairing only the protocol shape of an acceptance-plan proposal. Preserve every supported requirement and its meaning. Copy every already-valid field unchanged. Make only the changes named by deterministic feedback; never omit a field that feedback did not reject. The root keys must be exactly `schema_version` and `items`, with schema_version exactly `acceptance_plan.v1`. Every item must have exactly `id`, `requirement`, `kind`, `source_excerpt`, and `suggested_evidence`; kind must be artifact, behavior, or constraint. Remove unsupported fields. Return exactly one JSON object. The first response character must be `{` and the last must be `}`. Do not use Markdown or code fences.",
         ),
         LlmMessage::user(format!(
             "Task guidance:\n{guidance}\n\nPrevious proposal:\n{}\n\nDeterministic validation feedback:\n{feedback}\n\nReturn at most {max_items} canonical items. Every source_excerpt must remain an exact substring of the task guidance.",
@@ -380,7 +380,7 @@ fn valid_id(id: &str) -> bool {
 fn planning_messages(guidance: &str, max_items: usize) -> Vec<LlmMessage> {
     vec![
         LlmMessage::system(
-            "You are an isolated acceptance-planning advisor. Decompose public task guidance into a small checklist of externally observable required outcomes. Preserve interactions between requirements when those interactions need separate evidence. Do not solve the task, use tools, invent requirements, or claim anything is complete. Each source_excerpt must be copied verbatim from the task guidance. Return exactly one JSON object matching the supplied schema. The first response character must be `{` and the last must be `}`. Do not use Markdown or code fences.",
+            "You are an isolated acceptance-planning advisor. Decompose public task guidance into a small checklist of externally observable required outcomes. Preserve interactions between requirements when those interactions need separate evidence. Do not solve the task, use tools, invent requirements, or claim anything is complete. Each source_excerpt must be copied verbatim from the task guidance. The root keys must be exactly `schema_version` and `items`, with schema_version exactly `acceptance_plan.v1`. Every item must have exactly `id`, `requirement`, `kind`, `source_excerpt`, and `suggested_evidence`; kind must be artifact, behavior, or constraint. Do not use the aliases `checklist`, `description`, or `type`. Return exactly one JSON object. The first response character must be `{` and the last must be `}`. Do not use Markdown or code fences.",
         ),
         LlmMessage::user(format!(
             "Task guidance:\n{guidance}\n\nReturn at most {max_items} required acceptance items. Use stable concise IDs. Classify each item as artifact, behavior, or constraint. suggested_evidence describes a deterministic observation that could verify the requirement; it is a proposal, not authority."
