@@ -73,7 +73,7 @@ struct RunArgs {
     #[arg(long)]
     num_predict: Option<usize>,
 
-    /// Max reasoning-only tokens in one LLM call before hard-stop. Defaults to max(expected output, 25% of num_predict); 0 disables.
+    /// Max reasoning-only tokens in one LLM call before an action-only handoff. Defaults to max(expected output, 25% of num_predict); 0 disables.
     #[arg(long)]
     max_thinking_only_tokens: Option<usize>,
 

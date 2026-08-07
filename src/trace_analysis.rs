@@ -65,6 +65,9 @@ pub struct TraceAnalysis {
     pub progress_status_events: usize,
     pub progress_state_counts: BTreeMap<String, usize>,
     pub runner_activity_evidence_events: usize,
+    /// Reasoning-only calls interrupted at their protective cap and handed
+    /// off to a subsequent action-only turn.
+    pub thinking_only_action_transitions: usize,
     pub gpu_utilization_sample_events: usize,
     pub max_gpu_utilization_percent: Option<f64>,
     pub observed_output_tokens: usize,
@@ -350,6 +353,9 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
             }
             events::LLM_THINKING_ONLY_STREAM_HARD_FAILED => {
                 set_hard_stop(&mut analysis, HardStopReason::ThinkingOnlyStream, kind);
+            }
+            events::LLM_THINKING_ONLY_STREAM_ACTION_TRANSITIONED => {
+                analysis.thinking_only_action_transitions += 1;
             }
             events::LLM_NO_CONTENT_STREAM_HARD_FAILED => {
                 set_hard_stop(&mut analysis, HardStopReason::NoContentStream, kind);

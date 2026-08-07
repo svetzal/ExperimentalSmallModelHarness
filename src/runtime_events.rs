@@ -306,6 +306,13 @@ pub const AGENT_INSPECTION_LOOP_HARD_FAILED: &str = "agent.inspection_loop.hard_
 /// assistant content or a completed tool call.
 pub const LLM_THINKING_ONLY_STREAM_HARD_FAILED: &str = "llm.thinking_only_stream.hard_failed";
 
+/// A reasoning-only call reached its protective cap and was interrupted so
+/// the next turn can receive a concrete action-only instruction. This is not
+/// itself a hard stop; repeated failure to act is governed by the runtime's
+/// hidden-only no-action escalation.
+pub const LLM_THINKING_ONLY_STREAM_ACTION_TRANSITIONED: &str =
+    "llm.thinking_only_stream.action_transitioned";
+
 /// Provider metrics reported runaway output without assistant content,
 /// surfaced reasoning, or a completed tool call.
 pub const LLM_NO_CONTENT_STREAM_HARD_FAILED: &str = "llm.no_content_stream.hard_failed";

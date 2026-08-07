@@ -1833,7 +1833,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         && call_thinking_estimated_tokens > max_thinking_only_tokens
                     {
                         trace.event(
-                            "llm.thinking_only_stream.hard_failed",
+                            crate::runtime_events::LLM_THINKING_ONLY_STREAM_ACTION_TRANSITIONED,
                             serde_json::json!({
                                 "turn": turn,
                                 "llm_call_depth": depth,
@@ -1846,11 +1846,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                                 "tool_call_count": accumulated_tool_calls.len(),
                                 "call_tool_call_progress_frame_count": call_tool_call_progress_frame_count,
                                 "latest_preview": limit_preview(&thinking, 240),
+                                "next_policy": "action_only_turn",
                             }),
                         )?;
-                        anyhow::bail!(
-                            "thinking-only stream exceeded {max_thinking_only_tokens} estimated tokens without assistant content or tool calls"
-                        );
+                        break;
                     }
                     if validation_repair_active
                         && repair_exit_thinking_tokens > 0
@@ -4414,14 +4413,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_response_hard_stops_thinking_only_stream_runaway() {
+    async fn stream_response_transitions_thinking_only_stream_to_action_turn() {
         let temp = tempfile::tempdir().unwrap();
         let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
         let gateway = ScriptedGateway::new(vec![vec![StreamChunk::Thinking(
             "I am planning concrete edits but not emitting a tool call.".to_string(),
         )]]);
 
-        let error = stream_response(StreamResponseRequest {
+        let result = stream_response(StreamResponseRequest {
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -4450,12 +4449,14 @@ mod tests {
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
         })
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("thinking-only stream exceeded"));
+        assert!(result.response.is_empty());
+        assert!(result.thinking_chars > 0);
         let content = std::fs::read_to_string(trace.path()).unwrap();
         assert!(content.contains("\"kind\":\"llm.stream.thinking\""));
-        assert!(content.contains("\"kind\":\"llm.thinking_only_stream.hard_failed\""));
+        assert!(content.contains("\"kind\":\"llm.thinking_only_stream.action_transitioned\""));
+        assert!(content.contains("\"next_policy\":\"action_only_turn\""));
         assert!(content.contains("\"max_thinking_only_tokens\":1"));
         assert!(content.contains("\"content_chars\":0"));
         assert!(content.contains("\"tool_call_count\":0"));
