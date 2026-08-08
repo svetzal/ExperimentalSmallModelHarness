@@ -597,6 +597,7 @@ impl ToolScope {
 
     fn note_validation_probe_result(
         &self,
+        probe_id: Option<&str>,
         command: &str,
         output: &std::process::Output,
         stdout: &CapturedOutput,
@@ -628,7 +629,7 @@ impl ToolScope {
         };
         let previous_repair = runtime.validation_repair.is_some();
         let event = RuntimeEvent::ValidationProbe {
-            probe_id: None,
+            probe_id: probe_id.map(str::to_string),
             command: command.to_string(),
             command_family: command_family.clone(),
             status: output.status.code(),
@@ -652,6 +653,7 @@ impl ToolScope {
             self.trace.event(
                 "agent.stage.first_validation_probe",
                 json!({
+                    "probe_id": probe_id,
                     "command": command,
                     "command_family": &command_family,
                     "status": output.status.code(),
@@ -663,6 +665,7 @@ impl ToolScope {
         self.trace.event(
             "agent.validation_probe.observed",
             json!({
+                "probe_id": probe_id,
                 "command": command,
                 "command_family": &command_family,
                 "status": output.status.code(),
@@ -678,6 +681,7 @@ impl ToolScope {
             self.trace.event(
                 "agent.stage.first_post_validation_repair_action",
                 json!({
+                    "probe_id": probe_id,
                     "action": "validation_probe",
                     "command": command,
                     "command_family": &command_family,
@@ -962,8 +966,31 @@ impl ToolScope {
             .get(probe_id)
             .cloned()
             .with_context(|| format!("unknown declared probe id {probe_id:?}"))?;
+        if !probe.command.is_empty() {
+            let command_sha256 = format!("{:x}", Sha256::digest(probe.command.as_bytes()));
+            let mut result = ShellCommandTool {
+                scope: self.clone(),
+            }
+            .shell_declared_probe(probe_id, &probe.command)
+            .await?;
+            result["probe_id"] = json!(probe_id);
+            result["command"] = json!(format!("probe:{probe_id}"));
+            result["command_family"] = json!("declared_command_probe");
+            result["registered_command_sha256"] = json!(command_sha256);
+            if let Some(repair) = result
+                .get_mut("repair_required")
+                .and_then(Value::as_object_mut)
+            {
+                repair.insert("command".to_string(), json!(format!("probe:{probe_id}")));
+                repair.insert(
+                    "command_family".to_string(),
+                    json!("declared_command_probe"),
+                );
+            }
+            return Ok(result);
+        }
         let Some(FileAssertion::FileTextEquals { path, expected }) = probe.assertion else {
-            bail!("probe {probe_id:?} is not executable through the assertion effect");
+            bail!("probe {probe_id:?} has no executable effect");
         };
         let unresolved = self.resolve_existing_or_new(&path)?;
         let result =
@@ -1248,7 +1275,7 @@ impl LlmTool for ExecuteProbeTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "execute_probe".to_string(),
-                description: "Execute one declared non-shell probe by stable probe ID.".to_string(),
+                description: "Execute one adapter-owned validation probe by stable probe ID. The harness owns the registered implementation; do not recreate it with another tool.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": { "probe_id": { "type": "string" } },
@@ -2249,6 +2276,22 @@ impl LlmTool for ShellCommandTool {
 
 impl ShellCommandTool {
     async fn shell(&self, args: &HashMap<String, Value>) -> Result<Value> {
+        self.shell_effect(args, None).await
+    }
+
+    async fn shell_declared_probe(&self, probe_id: &str, command: &str) -> Result<Value> {
+        self.shell_effect(
+            &HashMap::from([("command".to_string(), json!(command))]),
+            Some(probe_id),
+        )
+        .await
+    }
+
+    async fn shell_effect(
+        &self,
+        args: &HashMap<String, Value>,
+        declared_probe_id: Option<&str>,
+    ) -> Result<Value> {
         let command = required_str(args, "command")?;
         validate_shell_command(command, &self.scope.root)?;
         let cwd = self
@@ -2260,7 +2303,8 @@ impl ShellCommandTool {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
-        let validation_probe = self.scope.profile().recognizes_probe(command);
+        let validation_probe =
+            declared_probe_id.is_some() || self.scope.profile().recognizes_probe(command);
         let policy_before_command = self.scope.policy_snapshot();
         if policy_before_command.validation_required_after_write
             && !validation_probe
@@ -2349,8 +2393,13 @@ impl ShellCommandTool {
             };
         let shell_mutation_sensed = !shell_mutation_paths.is_empty();
         let repair_required = if validation_probe {
-            self.scope
-                .note_validation_probe_result(command, &output, &stdout, &stderr)?
+            self.scope.note_validation_probe_result(
+                declared_probe_id,
+                command,
+                &output,
+                &stdout,
+                &stderr,
+            )?
         } else {
             None
         };
@@ -4331,6 +4380,74 @@ bytes[0..5] \"cafe\\n\""
         assert!(trace.contains("\"probe_id\":\"synchronized\""));
         assert!(trace.contains("\"phase\":\"ready\""));
         assert!(trace.contains("\"workers\":2"));
+    }
+
+    #[tokio::test]
+    async fn command_probe_executes_registered_effect_by_id_without_returning_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let command = r#"printf 'exact registered bytes\n' > effect.txt; printf 'HARNESS_PROBE_EVENT\t{"phase":"passed"}\n'"#;
+        scope
+            .configure_probes(vec![Probe::command("registered-effect", command)])
+            .unwrap();
+
+        let result = scope.execute_probe("registered-effect").await.unwrap();
+        let serialized = serde_json::to_string(&result).unwrap();
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("effect.txt")).unwrap(),
+            "exact registered bytes\n"
+        );
+        assert_eq!(result["probe_id"], "registered-effect");
+        assert_eq!(result["command"], "probe:registered-effect");
+        assert_eq!(result["success"], true);
+        assert!(!serialized.contains(command));
+        assert!(trace.contains("\"probe_id\":\"registered-effect\""));
+        assert!(trace.contains("\"phase\":\"passed\""));
+    }
+
+    #[tokio::test]
+    async fn failed_command_probe_enters_repair_and_fresh_rerun_can_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let command = "test -f repaired.txt";
+        scope
+            .configure_probes(vec![Probe::command("repairable", command)])
+            .unwrap();
+
+        let failed = scope.execute_probe("repairable").await.unwrap();
+        assert_eq!(failed["success"], false);
+        assert!(scope.policy_snapshot().validation_repair.is_some());
+
+        std::fs::write(temp.path().join("repaired.txt"), "ready\n").unwrap();
+        let passed = scope.execute_probe("repairable").await.unwrap();
+        assert_eq!(passed["success"], true);
+        assert!(scope.policy_snapshot().validation_repair.is_none());
+        assert_eq!(scope.policy_snapshot().total_shell_probes, 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_declared_probe_kills_descendant_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let tool = ShellCommandTool { scope };
+        let command = "(sleep 2; printf 'late\\n' > late-probe.txt) & wait";
+        let args = HashMap::from([
+            ("command".to_string(), json!(command)),
+            ("timeout_secs".to_string(), json!(1)),
+        ]);
+
+        let error = tool
+            .shell_effect(&args, Some("timeout-probe"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed out after 1s"));
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!temp.path().join("late-probe.txt").exists());
     }
 
     #[tokio::test]

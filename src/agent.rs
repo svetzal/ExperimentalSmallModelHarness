@@ -424,8 +424,8 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
 
     let mut final_summary = String::new();
     let mut final_response_only_next_turn = false;
-    let mut requested_validation_ledger = RequestedValidationLedger::new_for_profile(
-        requested_validation_commands.clone(),
+    let mut requested_validation_ledger = RequestedValidationLedger::new_for_probes(
+        &resolved_contract.probes,
         resolved_contract.profile.clone(),
     );
     scope.observe_runtime(crate::runtime::RuntimeEvent::RunStarted);
@@ -1039,6 +1039,7 @@ struct RequestedValidationLedger {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct RequestedValidationEntry {
+    probe_id: Option<String>,
     command: String,
     status: RequestedValidationStatus,
     observed_command: Option<String>,
@@ -1071,6 +1072,7 @@ impl RequestedValidationLedger {
         Self::new_for_profile(commands, crate::profile::ProfileRef::default())
     }
 
+    #[cfg(test)]
     fn new_for_profile(commands: Vec<String>, profile: crate::profile::ProfileRef) -> Self {
         Self {
             profile,
@@ -1078,7 +1080,30 @@ impl RequestedValidationLedger {
             entries: commands
                 .into_iter()
                 .map(|command| RequestedValidationEntry {
+                    probe_id: None,
                     command,
+                    status: RequestedValidationStatus::Pending,
+                    observed_command: None,
+                    status_code: None,
+                    generation: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn new_for_probes(
+        probes: &[crate::contract::Probe],
+        profile: crate::profile::ProfileRef,
+    ) -> Self {
+        Self {
+            profile,
+            generation: 0,
+            entries: probes
+                .iter()
+                .filter(|probe| !probe.command.is_empty())
+                .map(|probe| RequestedValidationEntry {
+                    probe_id: Some(probe.id.clone()),
+                    command: probe.command.clone(),
                     status: RequestedValidationStatus::Pending,
                     observed_command: None,
                     status_code: None,
@@ -1143,8 +1168,13 @@ impl RequestedValidationLedger {
             .get("status")
             .and_then(serde_json::Value::as_i64)
             .and_then(|status| i32::try_from(status).ok());
+        let observed_probe_id = value.get("probe_id").and_then(serde_json::Value::as_str);
         let matched_index = self.entries.iter().position(|entry| {
-            validation_matches_requested_command(&command, std::slice::from_ref(&entry.command))
+            observed_probe_id.is_some_and(|probe_id| entry.probe_id.as_deref() == Some(probe_id))
+                || validation_matches_requested_command(
+                    &command,
+                    std::slice::from_ref(&entry.command),
+                )
         });
         let Some(index) = matched_index else {
             return Some(RequestedValidationObservation {
@@ -1202,10 +1232,13 @@ impl RequestedValidationLedger {
                     && entry.generation == Some(self.generation)
             })
             .map(|entry| SuccessfulValidationSnapshot {
-                command: entry
-                    .observed_command
-                    .clone()
-                    .unwrap_or_else(|| entry.command.clone()),
+                command: entry.observed_command.clone().unwrap_or_else(|| {
+                    entry
+                        .probe_id
+                        .as_ref()
+                        .map(|probe_id| format!("probe:{probe_id}"))
+                        .unwrap_or_else(|| entry.command.clone())
+                }),
                 command_family: crate::profile::profile_by_ref(&self.profile)
                     .expect("ledger profile was validated at contract resolution")
                     .validation_command_family(&entry.command),
@@ -1329,7 +1362,12 @@ fn done_rejected_prompt(ledger: &RequestedValidationLedger) -> String {
                 RequestedValidationStatus::Failed => "failed",
                 RequestedValidationStatus::Stale => "stale",
             };
-            format!("- {} ({status})", entry.command)
+            let target = entry
+                .probe_id
+                .as_ref()
+                .map(|probe_id| format!("probe `{probe_id}`"))
+                .unwrap_or_else(|| entry.command.clone());
+            format!("- {target} ({status})")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1357,8 +1395,8 @@ fn worker_message_with_declared_probes(base: &str, probes: &[crate::contract::Pr
                 )
             } else {
                 format!(
-                    "Probe `{}` is an adapter-owned command. Run this exact command after the latest relevant mutation:\n```sh\n{}\n```",
-                    probe.id, probe.command
+                    "Probe `{}` is an adapter-owned command capability. Execute it by probe ID after the latest relevant mutation; its implementation is intentionally not part of your context.",
+                    probe.id
                 )
             }
         })
@@ -3856,7 +3894,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_command_probe_is_delivered_exactly_and_authoritatively() {
+    fn declared_command_probe_is_delivered_by_id_without_implementation() {
         let command = "python3 verify_boundary.py --signal SIGINT";
         let message = worker_message_with_declared_probes(
             "Complete the task.",
@@ -3865,7 +3903,8 @@ mod tests {
 
         assert!(message.contains("Authoritative validation contract:"));
         assert!(message.contains("Probe `boundary-sigint`"));
-        assert!(message.contains(&format!("```sh\n{command}\n```")));
+        assert!(message.contains("Execute it by probe ID"));
+        assert!(!message.contains(command));
         assert!(message.contains("Do not replace a declared probe"));
     }
 
@@ -6187,6 +6226,64 @@ mod tests {
         let analysis = crate::trace_analysis::analyze_trace(&summary.trace_file).unwrap();
         assert!(analysis.validation_probe_reached.is_some());
         assert!(analysis.validation_probe_passed.is_some());
+    }
+
+    #[tokio::test]
+    async fn fixture_keeps_registered_command_probe_bytes_out_of_provider_requests() {
+        let fixture = AgentFixture::new("unused legacy task");
+        let private_command = "test -f output.txt # PRIVATE_REGISTERED_COMMAND_BYTES";
+        std::fs::write(
+            fixture.experiment.join("contract.json"),
+            serde_json::to_string_pretty(&json!({
+                "profile": {
+                    "id": "terminal_work",
+                    "version": "terminal_work_profile.v1"
+                },
+                "guidance": "Create output.txt, then execute the declared probe by ID.",
+                "read_scope": ["."],
+                "write_scope": ["."],
+                "probes": [{
+                    "id": "output-present",
+                    "command": private_command
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "write_file",
+                HashMap::from([
+                    ("path".to_string(), json!("output.txt")),
+                    ("content".to_string(), json!("ready\n")),
+                ]),
+            )],
+            vec![tool_call_chunk(
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("output-present"))]),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run_contract(&gateway, 3).await;
+        let trace = std::fs::read_to_string(&summary.trace_file).unwrap();
+        let provider_requests = trace_payloads(
+            &trace,
+            crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+        );
+
+        assert_eq!(summary.final_summary, "DONE");
+        assert!(provider_requests.len() >= 3);
+        assert!(provider_requests.iter().all(|request| {
+            !serde_json::to_string(request)
+                .unwrap()
+                .contains("PRIVATE_REGISTERED_COMMAND_BYTES")
+        }));
+        assert!(provider_requests.iter().any(|request| {
+            serde_json::to_string(request)
+                .unwrap()
+                .contains("execute_probe")
+        }));
     }
 
     #[tokio::test]

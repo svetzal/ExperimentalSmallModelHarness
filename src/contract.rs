@@ -71,9 +71,8 @@ pub enum Scope {
     Rules(Vec<String>),
 }
 
-/// One validation probe: a stable descriptive ID and the command the
-/// executor actually runs. Matching for the requested-validation ledger
-/// stays on the normalized command string; `id` is descriptive only.
+/// One validation probe: a stable model-facing ID and an executor-owned effect.
+/// Command implementations remain harness-side and are invoked by ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Probe {
     pub id: String,

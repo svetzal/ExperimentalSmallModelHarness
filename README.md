@@ -136,11 +136,19 @@ context assembly is now foundational.
 ### Declared probe delivery
 
 Adapter-owned probes in an explicit run contract are part of the initial worker
-packet and terminal authority. Command probes are rendered with their stable ID
-and exact command; artifact assertions are rendered by stable ID without
-exposing their expected content. The worker is told not to substitute a
-synthetic approximation. After a relevant mutation, every declared probe must
-pass in the current mutation generation before `DONE` is accepted.
+packet and terminal authority. Both command probes and artifact assertions are
+rendered by stable ID. Their executor-owned command bytes or expected content
+stay outside model-facing provider requests. The worker invokes either kind
+through `execute_probe`; the returned evidence identifies the probe and command
+digest without exposing its registered implementation. The worker is told not
+to substitute a synthetic approximation. After a relevant mutation, every
+declared probe must pass in the current mutation generation before `DONE` is
+accepted.
+
+Command probes use the same scoped shell executor, finite timeout, process-group
+cleanup, mutation sensing, repair policy, and lifecycle-phase tracing as direct
+shell validation. This makes the stable ID a capability boundary rather than a
+prompt alias for a long command.
 
 Probe delivery is trace-visible as `agent.contract.probes.delivered`, including
 the delivered IDs, probe kinds, and resulting worker-message size. Empty probe
