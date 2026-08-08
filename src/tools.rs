@@ -603,7 +603,12 @@ impl ToolScope {
         stdout: &CapturedOutput,
         stderr: &CapturedOutput,
     ) -> Result<Option<ValidationRepairSnapshot>> {
-        let command_family = self.profile().command_family(command);
+        let reported_command = probe_id
+            .map(|probe_id| format!("probe:{probe_id}"))
+            .unwrap_or_else(|| command.to_string());
+        let command_family = probe_id
+            .map(|_| "declared_command_probe".to_string())
+            .unwrap_or_else(|| self.profile().command_family(command));
         let failure_text = failure_summary(&stderr.content, &stdout.content);
         let failure_details = self
             .profile()
@@ -630,7 +635,7 @@ impl ToolScope {
         let previous_repair = runtime.validation_repair.is_some();
         let event = RuntimeEvent::ValidationProbe {
             probe_id: probe_id.map(str::to_string),
-            command: command.to_string(),
+            command: reported_command.clone(),
             command_family: command_family.clone(),
             status: output.status.code(),
             success,
@@ -654,7 +659,7 @@ impl ToolScope {
                 "agent.stage.first_validation_probe",
                 json!({
                     "probe_id": probe_id,
-                    "command": command,
+                    "command": &reported_command,
                     "command_family": &command_family,
                     "status": output.status.code(),
                     "success": success,
@@ -666,7 +671,7 @@ impl ToolScope {
             "agent.validation_probe.observed",
             json!({
                 "probe_id": probe_id,
-                "command": command,
+                "command": &reported_command,
                 "command_family": &command_family,
                 "status": output.status.code(),
                 "success": success,
@@ -683,7 +688,7 @@ impl ToolScope {
                 json!({
                     "probe_id": probe_id,
                     "action": "validation_probe",
-                    "command": command,
+                    "command": &reported_command,
                     "command_family": &command_family,
                     "status": output.status.code(),
                     "success": success,
@@ -698,7 +703,7 @@ impl ToolScope {
                 self.trace.event(
                     "agent.validation.repair_resolved",
                     json!({
-                        "command": command,
+                        "command": &reported_command,
                         "command_family": command_family,
                     }),
                 )?;
@@ -712,7 +717,7 @@ impl ToolScope {
             self.trace.event(
                 "agent.validation.repair_write_allowance.granted",
                 json!({
-                    "command": command,
+                    "command": &reported_command,
                     "command_family": snapshot.command_family,
                     "status": snapshot.status,
                     "allowance": crate::runtime::FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE,
@@ -4457,7 +4462,14 @@ bytes[0..5] \"cafe\\n\""
 
         let failed = scope.execute_probe("repairable").await.unwrap();
         assert_eq!(failed["success"], false);
-        assert!(scope.policy_snapshot().validation_repair.is_some());
+        assert_eq!(failed["repair_required"]["command"], "probe:repairable");
+        assert_eq!(
+            failed["repair_required"]["command_family"],
+            "declared_command_probe"
+        );
+        let repair = scope.policy_snapshot().validation_repair.unwrap();
+        assert_eq!(repair.command, "probe:repairable");
+        assert_eq!(repair.command_family, "declared_command_probe");
 
         std::fs::write(temp.path().join("repaired.txt"), "ready\n").unwrap();
         let passed = scope.execute_probe("repairable").await.unwrap();

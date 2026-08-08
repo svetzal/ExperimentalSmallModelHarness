@@ -150,6 +150,11 @@ the active model-facing tool set even when the selected domain profile does not
 include it by default. This keeps probe reachability tied to the contract while
 leaving probe-free runs and their tool surfaces unchanged.
 
+Declared command identity remains stable throughout repair handling. Runtime
+repair state and every model-facing repair or escalation prompt use
+`probe:<id>` and `declared_command_probe`; the registered command bytes remain
+executor-owned even after repeated failures.
+
 Command probes use the same scoped shell executor, finite timeout, process-group
 cleanup, mutation sensing, repair policy, and lifecycle-phase tracing as direct
 shell validation. This makes the stable ID a capability boundary rather than a
@@ -195,7 +200,9 @@ procedure are documented in [`TRACE_SCHEMA.md`](TRACE_SCHEMA.md). Every worker
 provider call has a compact context ledger plus an exact ordered request
 snapshot. `analyze-trace` reports snapshot count and whether coverage is
 complete, allowing legacy or truncated traces to be identified before drawing
-context-sensitive conclusions.
+context-sensitive conclusions. Harness hard stops take precedence over earlier
+incidental validation success in both analyzer outcomes and transcript status
+cards.
 
 Experiments are intentionally run from separate, scoped workspaces. Generated
 agents should see their work tree and task-relevant guidance, not experiment

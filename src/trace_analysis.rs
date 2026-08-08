@@ -297,6 +297,9 @@ pub enum RunOutcome {
     /// The run finished but no validation probe is recorded as having
     /// succeeded.
     Finished,
+    /// A general harness hard stop not represented by a more specific outcome
+    /// variant terminated the run.
+    HardStopped,
     /// The trace ended without a terminal `run.finished`/`run.failed` event.
     Unfinished,
     /// No classifiable status could be determined.
@@ -687,6 +690,9 @@ fn classify_outcome(
         .any(|probe| probe.success == Some(false) && probe.status == Some(127));
     if environment_invalid {
         return RunOutcome::EnvironmentInvalidValidation;
+    }
+    if analysis.hard_stop.is_some() {
+        return RunOutcome::HardStopped;
     }
     if analysis.status == "finished" {
         let repair_then_pass = analysis
@@ -1193,6 +1199,26 @@ mod tests {
         assert_eq!(analysis.status, "finished");
         assert_eq!(analysis.validation_commands.len(), 1);
         assert_eq!(analysis.validation_commands[0].status, Some(127));
+    }
+
+    #[test]
+    fn hard_stop_precedes_incidental_validation_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-hard-stopped.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-08-08T00:00:00Z","kind":"run.started","payload":{}}
+{"timestamp":"2026-08-08T00:00:01Z","kind":"agent.validation_probe.observed","payload":{"command":"python3 --version","status":0,"success":true}}
+{"timestamp":"2026-08-08T00:00:02Z","kind":"agent.validation.repair_hard_failed","payload":{}}
+{"timestamp":"2026-08-08T00:00:03Z","kind":"run.finished","payload":{"final_summary":"repair stopped"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert_eq!(analysis.outcome, RunOutcome::HardStopped);
+        assert_eq!(analysis.harness_completion, HarnessCompletion::HardStopped);
     }
 
     #[test]

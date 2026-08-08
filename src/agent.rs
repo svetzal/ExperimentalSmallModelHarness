@@ -6293,6 +6293,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_keeps_failed_command_probe_bytes_out_of_repair_escalation() {
+        let fixture = AgentFixture::new("unused legacy task");
+        let private_command = "test -f never-created.txt # PRIVATE_REPAIR_COMMAND_BYTES";
+        std::fs::write(
+            fixture.experiment.join("contract.json"),
+            serde_json::to_string_pretty(&json!({
+                "profile": {
+                    "id": "terminal_work",
+                    "version": "terminal_work_profile.v1"
+                },
+                "guidance": "Execute the declared probe by ID.",
+                "read_scope": ["./**"],
+                "write_scope": ["./**"],
+                "probes": [{
+                    "id": "repair-confidential",
+                    "command": private_command
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("repair-confidential"))]),
+            )],
+            vec![],
+            vec![],
+        ]);
+
+        let summary = fixture.run_contract(&gateway, 3).await;
+        let trace = std::fs::read_to_string(&summary.trace_file).unwrap();
+        let provider_requests = trace_payloads(
+            &trace,
+            crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+        );
+
+        assert!(summary.final_summary.contains("validation-repair"));
+        assert!(provider_requests.iter().all(|request| {
+            !serde_json::to_string(request)
+                .unwrap()
+                .contains("PRIVATE_REPAIR_COMMAND_BYTES")
+        }));
+        assert!(provider_requests.iter().any(|request| {
+            serde_json::to_string(request)
+                .unwrap()
+                .contains("probe:repair-confidential")
+        }));
+    }
+
+    #[tokio::test]
     async fn fixture_assembles_required_selected_and_excluded_initial_context() {
         let fixture = AgentFixture::new("Create a release note with the required format.");
         std::fs::write(

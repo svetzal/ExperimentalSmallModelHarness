@@ -353,13 +353,19 @@ fn parse_session(path: &Path) -> Result<Option<Session>> {
                 }
             }
             kind if is_harness_event(kind) => {
-                let (title, summary) = harness_summary(kind, &record.payload);
+                let (mut title, summary) = harness_summary(kind, &record.payload);
+                let severity = if kind == "run.finished" && hard_stop.is_some() {
+                    title = "Harness stopped".to_string();
+                    "danger"
+                } else {
+                    severity_for(kind, &record.payload)
+                };
                 let card = EventCard {
                     kind: kind.to_string(),
                     at,
                     title,
                     summary,
-                    severity: severity_for(kind, &record.payload),
+                    severity,
                     payload: record.payload.clone(),
                 };
                 if kind == "run.finished" {
@@ -746,6 +752,7 @@ mod tests {
             json!({"timestamp":"2026-01-01T00:00:03Z","kind":"tool.list_tree","payload":{"entry_count":0}}),
             json!({"timestamp":"2026-01-01T00:00:04Z","kind":"llm.context_assembly.ledger","payload":{"turn":1,"llm_call_depth":1,"utilization":0.2}}),
             json!({"timestamp":"2026-01-01T00:00:04Z","kind":"llm.provider_request.assembled","payload":{"turn":1,"llm_call_depth":1,"messages":[{"role":"system","content":"system"},{"role":"user","content":"task"},{"role":"tool","content":"empty"}],"tools":[],"completion":{}}}),
+            json!({"timestamp":"2026-01-01T00:00:04Z","kind":"agent.validation.repair_hard_failed","payload":{}}),
             json!({"timestamp":"2026-01-01T00:00:05Z","kind":"run.finished","payload":{"final_summary":"DONE"}}),
         ];
         std::fs::write(
@@ -781,6 +788,8 @@ mod tests {
         assert!(html.contains("\\/script>"));
         assert!(html.contains("\"continuity\":\"retained\""));
         assert!(html.contains("\"continuity\":\"new\""));
+        assert!(html.contains("\"title\":\"Harness stopped\""));
+        assert!(html.contains("\"severity\":\"danger\""));
         assert!(!html.contains("<script src="));
         assert!(!html.contains("<link"));
     }
