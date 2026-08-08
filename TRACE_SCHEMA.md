@@ -98,3 +98,41 @@ Tool-effect events remain independently useful because they record bounded
 results, exit status, fingerprints, and validation classifications. When a
 tool result is retained for another model call, the next exact request snapshot
 is the authority for the precise representation the model received.
+
+## Rendering transcripts
+
+The Harness binary can render trace files or recursively discovered trace
+directories without invoking a model or requiring Python:
+
+```sh
+adaptive-agent-harness render-transcript traces/ \
+  --output transcript.html \
+  --title "Agent Session Transcript"
+```
+
+The output is one portable HTML file with embedded data, CSS, and JavaScript.
+It keeps model calls concise by default and progressively reveals exact
+messages, tool schemas, completion settings, reasoning, raw tool effects, and
+harness-policy payloads.
+
+Optional independent evidence uses this generic shape:
+
+```json
+{
+  "schema_version": "transcript_evidence.v1",
+  "sessions": [
+    {
+      "label": "session-label",
+      "reward": "1",
+      "passed": 6,
+      "failed": 0,
+      "output": "External verifier output"
+    }
+  ]
+}
+```
+
+Each session entry requires either `label` or `trace`. `trace` matches the
+canonical trace path recorded by the renderer; `label` matches the displayed
+session label. Evidence is display-only and never changes the harness trace or
+its analyzer classification.

@@ -13,6 +13,7 @@ use crate::baseline::{load_matrix_baseline, summarize_matrix};
 use crate::contract::{Budgets, ContractSource, resolve_contract};
 use crate::retry::{SequentialRunConfig, run_sequential};
 use crate::trace_analysis::analyze_trace;
+use crate::transcript::{RenderTranscriptConfig, render_transcript};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -178,6 +179,25 @@ enum Command {
         traces: Vec<PathBuf>,
     },
 
+    /// Render one or more harness traces as a self-contained HTML transcript.
+    RenderTranscript {
+        /// Trace JSONL files or directories to discover recursively.
+        #[arg(required = true)]
+        traces: Vec<PathBuf>,
+
+        /// Destination HTML file.
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Report title embedded in the single-file transcript.
+        #[arg(long, default_value = "Agent Transcript")]
+        title: String,
+
+        /// Optional generic transcript_evidence.v1 JSON file.
+        #[arg(long)]
+        evidence: Option<PathBuf>,
+    },
+
     /// Summarize the preserved 30-cell demo matrix baseline into canonical
     /// counts (harness completion, independent validation, hard-stops,
     /// environment corrections), replacing matrix-specific classification.
@@ -323,6 +343,20 @@ pub async fn run() -> Result<()> {
                 .map(analyze_trace)
                 .collect::<Result<Vec<_>>>()?;
             println!("{}", serde_json::to_string_pretty(&summaries)?);
+        }
+        Command::RenderTranscript {
+            traces,
+            output,
+            title,
+            evidence,
+        } => {
+            let summary = render_transcript(RenderTranscriptConfig {
+                inputs: traces,
+                output,
+                title,
+                evidence_file: evidence,
+            })?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Command::SummarizeMatrix => {
             let baseline = load_matrix_baseline();

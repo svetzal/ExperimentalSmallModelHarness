@@ -14,3 +14,4 @@ pub mod semantic_advisory;
 pub mod tools;
 pub mod trace;
 pub mod trace_analysis;
+pub mod transcript;

@@ -22,6 +22,7 @@ interfaces may change as experiments reveal better boundaries.
 - Mutation-aware validation freshness
 - Structured JSONL traces with exact provider-bound requests and deterministic
   trace analysis
+- Native self-contained HTML transcript generation
 - Bounded repair and retained-artifact retry policies
 - Throughput-aware patience for slow local models
 - Domain profiles that keep task-specific policy out of the runtime core
@@ -54,6 +55,7 @@ The main commands are:
 - `run-sequential` — execute bounded natural attempts against one retained
   artifact
 - `analyze-trace` — summarize one or more JSONL traces
+- `render-transcript` — render traces as a self-contained causal HTML report
 - `resolve-contract` — validate and resolve a run contract without invoking a
   model
 - `summarize-matrix` — reproduce the preserved benchmark baseline
@@ -145,6 +147,27 @@ lists leave the worker message unchanged and emit no delivery event. Probe
 expectations remain adapter-owned: model-authored semantic advisories may
 propose candidate evidence, but they do not gain terminal authority without
 deterministic contract policy.
+
+### Session transcripts
+
+Generate an interactive, single-file transcript from any trace files or
+directories:
+
+```sh
+cargo run -- render-transcript traces/ \
+  --output transcript.html \
+  --title "Agent Session Transcript"
+```
+
+The report presents exact provider input, streamed reasoning and assistant
+text, tool effects, harness decisions, and context measurements as one causal
+timeline. It recursively discovers harness JSONL traces while ignoring other
+JSONL files that do not contain a `run.started` event.
+
+Independent verification is optional and harness-neutral. Supply a
+`transcript_evidence.v1` JSON file with `--evidence`; entries match sessions by
+canonical trace path or transcript label. The complete schema and fidelity
+rules are documented in [`TRACE_SCHEMA.md`](TRACE_SCHEMA.md).
 
 ## Design and Evidence
 
