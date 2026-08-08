@@ -145,6 +145,11 @@ to substitute a synthetic approximation. After a relevant mutation, every
 declared probe must pass in the current mutation generation before `DONE` is
 accepted.
 
+When a resolved contract declares probes, the harness adds `execute_probe` to
+the active model-facing tool set even when the selected domain profile does not
+include it by default. This keeps probe reachability tied to the contract while
+leaving probe-free runs and their tool surfaces unchanged.
+
 Command probes use the same scoped shell executor, finite timeout, process-group
 cleanup, mutation sensing, repair policy, and lifecycle-phase tracing as direct
 shell validation. This makes the stable ID a capability boundary rather than a

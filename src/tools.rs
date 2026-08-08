@@ -943,6 +943,14 @@ impl ToolScope {
         Ok(())
     }
 
+    fn has_configured_probes(&self) -> bool {
+        !self
+            .probes
+            .lock()
+            .expect("probe map mutex poisoned")
+            .is_empty()
+    }
+
     fn reject_symlink_escape_before_effect(&self, target: &Path) -> Result<()> {
         let existing = if target.exists() {
             target
@@ -1217,9 +1225,12 @@ pub fn coding_tools(scope: &ToolScope) -> Vec<Box<dyn LlmTool>> {
 }
 
 pub fn tools_for_profile(scope: &ToolScope, profile: &dyn DomainProfile) -> Vec<Box<dyn LlmTool>> {
-    profile
-        .tool_capabilities()
-        .iter()
+    let mut capabilities = profile.tool_capabilities().to_vec();
+    if scope.has_configured_probes() && !capabilities.contains(&ToolCapability::ExecuteProbe) {
+        capabilities.push(ToolCapability::ExecuteProbe);
+    }
+    capabilities
+        .into_iter()
         .map(|capability| match capability {
             ToolCapability::ListTree => Box::new(ListTreeTool {
                 scope: scope.clone(),
@@ -3156,6 +3167,34 @@ mod tests {
             ]
         );
         assert!(!names.iter().any(|name| name == "shell_command"));
+    }
+
+    #[test]
+    fn declared_probe_adds_execute_probe_to_terminal_profile_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = Arc::new(TraceRecorder::create(&temp.path().join("traces")).unwrap());
+        let scope = ToolScope::new_profiled(
+            temp.path().to_path_buf(),
+            trace,
+            crate::profile::terminal::TerminalWorkProfile.profile_ref(),
+            vec!["./**".into()],
+            vec!["./**".into()],
+        )
+        .unwrap();
+        scope
+            .configure_probes(vec![Probe::command(
+                "workspace-check",
+                "test -f output.txt",
+            )])
+            .unwrap();
+        let profile = crate::profile::profile_by_ref(&scope.profile).unwrap();
+        let names = tools_for_profile(&scope, profile)
+            .iter()
+            .map(|tool| tool.descriptor().function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "shell_command"));
+        assert!(names.iter().any(|name| name == "execute_probe"));
     }
 
     #[tokio::test]

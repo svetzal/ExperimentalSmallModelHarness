@@ -6240,8 +6240,8 @@ mod tests {
                     "version": "terminal_work_profile.v1"
                 },
                 "guidance": "Create output.txt, then execute the declared probe by ID.",
-                "read_scope": ["."],
-                "write_scope": ["."],
+                "read_scope": ["./**"],
+                "write_scope": ["./**"],
                 "probes": [{
                     "id": "output-present",
                     "command": private_command
@@ -6279,11 +6279,17 @@ mod tests {
                 .unwrap()
                 .contains("PRIVATE_REGISTERED_COMMAND_BYTES")
         }));
-        assert!(provider_requests.iter().any(|request| {
-            serde_json::to_string(request)
+        assert!(
+            provider_requests[0]["tools"]
+                .as_array()
                 .unwrap()
-                .contains("execute_probe")
-        }));
+                .iter()
+                .any(|tool| tool["function"]["name"] == "execute_probe")
+        );
+        assert!(trace.contains("\"kind\":\"tool.execute_probe\""));
+        assert!(trace.contains("\"probe_id\":\"output-present\""));
+        assert!(trace.contains("\"command\":\"probe:output-present\""));
+        assert!(trace.contains("\"success\":true"));
     }
 
     #[tokio::test]
