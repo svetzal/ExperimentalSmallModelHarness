@@ -3,7 +3,8 @@
 An experimental adaptive agent runtime for studying how smaller local language
 models inspect, edit, validate, and repair scoped artifacts.
 
-The harness is built in Rust on top of Mojentic. It emphasizes deterministic
+The harness is built in Rust on top of
+[Mojentic](https://github.com/svetzal/mojentic-ru). It emphasizes deterministic
 validation, strict workspace boundaries, traceable runtime decisions, and
 evidence-backed experimentation. Space Invaders in Bevy is the recurring coding
 benchmark, while additional artifact profiles are used to test whether the
