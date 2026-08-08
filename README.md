@@ -20,7 +20,8 @@ interfaces may change as experiments reveal better boundaries.
 - Typed run contracts for scope, guidance, probes, budgets, and terminal rules
 - Scoped filesystem and tool execution
 - Mutation-aware validation freshness
-- Structured JSONL traces and deterministic trace analysis
+- Structured JSONL traces with exact provider-bound requests and deterministic
+  trace analysis
 - Bounded repair and retained-artifact retry policies
 - Throughput-aware patience for slow local models
 - Domain profiles that keep task-specific policy out of the runtime core
@@ -151,6 +152,13 @@ The evolving architecture and experimental decisions are documented in
 [`GENERALIZATION_PLAN.md`](GENERALIZATION_PLAN.md). The repository preserves
 deterministic fixtures and a canonical matrix baseline so architectural changes
 can be checked against earlier behavior.
+
+The worker trace format and the required context-first performance-review
+procedure are documented in [`TRACE_SCHEMA.md`](TRACE_SCHEMA.md). Every worker
+provider call has a compact context ledger plus an exact ordered request
+snapshot. `analyze-trace` reports snapshot count and whether coverage is
+complete, allowing legacy or truncated traces to be identified before drawing
+context-sensitive conclusions.
 
 Experiments are intentionally run from separate, scoped workspaces. Generated
 agents should see their work tree and task-relevant guidance, not experiment

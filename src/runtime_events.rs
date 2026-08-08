@@ -328,6 +328,13 @@ pub const LLM_THINKING_ONLY_STREAM_ACTION_TRANSITIONED: &str =
 /// surfaced reasoning, or a completed tool call.
 pub const LLM_NO_CONTENT_STREAM_HARD_FAILED: &str = "llm.no_content_stream.hard_failed";
 
+/// Emitted immediately before each worker provider call. This is the canonical
+/// record of the exact request assembled by the harness: ordered messages,
+/// active tool descriptors, model, and completion configuration. The context
+/// ledger remains the compact measurement surface; this snapshot is the
+/// fidelity surface used to reconstruct what the model actually received.
+pub const LLM_PROVIDER_REQUEST_ASSEMBLED: &str = "llm.provider_request.assembled";
+
 /// Additive, documented-only event: **not currently emitted by the
 /// runtime**. Reserved for an explicit operator-initiated stop (as opposed
 /// to a runtime-detected hard-stop). Payload fields: `reason` (optional

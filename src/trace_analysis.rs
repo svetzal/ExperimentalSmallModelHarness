@@ -49,6 +49,11 @@ pub struct TraceAnalysis {
     pub status: String,
     pub runtime_seconds: Option<f64>,
     pub llm_call_count: usize,
+    /// Exact provider-bound request snapshots available for forensic review.
+    pub provider_request_snapshot_count: usize,
+    /// True when every context-ledger call has a corresponding exact request
+    /// snapshot. False for legacy or partially written traces.
+    pub provider_request_trace_complete: bool,
     pub max_llm_call_estimated_tokens: usize,
     pub max_llm_call_utilization: Option<f64>,
     pub max_pressure_band: String,
@@ -562,6 +567,9 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
             }
             "llm.context_assembly.ledger" => apply_context_ledger(&mut analysis, payload),
             "llm.context_assembly.appended" => apply_context_append(&mut analysis, payload),
+            events::LLM_PROVIDER_REQUEST_ASSEMBLED => {
+                analysis.provider_request_snapshot_count += 1;
+            }
             "llm.stream.progress" => {
                 analysis.stream_progress_events += 1;
             }
@@ -587,6 +595,8 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
     analysis.runtime_seconds = first_timestamp
         .zip(last_timestamp)
         .map(|(first, last)| (last - first).num_milliseconds() as f64 / 1000.0);
+    analysis.provider_request_trace_complete = analysis.llm_call_count > 0
+        && analysis.provider_request_snapshot_count == analysis.llm_call_count;
     analysis.outcome = classify_outcome(
         &analysis,
         saw_action_boundary_hard_failed,
@@ -926,9 +936,11 @@ mod tests {
             &trace,
             r#"{"timestamp":"2026-06-11T00:00:00Z","kind":"run.started","payload":{"model":"qwen","goal_file":"/tmp/task.md","max_tool_iterations":50,"context_window_tokens":1000,"packet_type":"narrow-patch","expected_output_tokens":2048,"assembly_policy":"append_summarized_tool_transcript"}}
 {"timestamp":"2026-06-11T00:00:01Z","kind":"llm.context_assembly.ledger","payload":{"estimated_tokens":100,"utilization":0.10,"pressure_band":"green","delta_chars_from_previous_call":null,"assembly_policy":"append_summarized_tool_transcript"}}
+{"timestamp":"2026-06-11T00:00:01Z","kind":"llm.provider_request.assembled","payload":{"schema_version":"provider_request.v1","turn":1,"llm_call_depth":0,"messages":[]}}
 {"timestamp":"2026-06-11T00:00:02Z","kind":"llm.context_assembly.appended","payload":{"component":"tool_result","message_chars":400}}
 {"timestamp":"2026-06-11T00:00:03Z","kind":"tool.payload.measured","payload":{"kind":"tool.read_file","result_estimated_tokens":100,"total_tool_result_estimated_tokens":100,"max_tool_result_estimated_tokens":100,"max_tool_result_kind":"tool.read_file"}}
 {"timestamp":"2026-06-11T00:00:04Z","kind":"llm.context_assembly.ledger","payload":{"estimated_tokens":250,"utilization":0.25,"pressure_band":"orange","delta_chars_from_previous_call":600,"assembly_policy":"append_summarized_tool_transcript"}}
+{"timestamp":"2026-06-11T00:00:04Z","kind":"llm.provider_request.assembled","payload":{"schema_version":"provider_request.v1","turn":1,"llm_call_depth":1,"messages":[]}}
 {"timestamp":"2026-06-11T00:00:04Z","kind":"llm.stream.progress","payload":{"frame_index":1}}
 {"timestamp":"2026-06-11T00:00:04Z","kind":"llm.progress.status","payload":{"progress_state":"ProgressUnknown","runner_activity_evidence":true,"runner_activity":{"gpu_utilization_percent":38.5}}}
 {"timestamp":"2026-06-11T00:00:04Z","kind":"llm.stream.metrics","payload":{"eval_count":200,"tokens_per_second":4.5,"packet_type":"narrow-patch","expected_output_tokens":2048}}
@@ -943,6 +955,8 @@ mod tests {
         assert_eq!(analysis.status, "finished");
         assert_eq!(analysis.model.as_deref(), Some("qwen"));
         assert_eq!(analysis.llm_call_count, 2);
+        assert_eq!(analysis.provider_request_snapshot_count, 2);
+        assert!(analysis.provider_request_trace_complete);
         assert_eq!(analysis.max_llm_call_estimated_tokens, 250);
         assert_eq!(analysis.max_pressure_band, "orange");
         assert_eq!(analysis.appended_message_count, 1);

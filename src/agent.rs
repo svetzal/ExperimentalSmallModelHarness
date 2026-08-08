@@ -6,7 +6,7 @@ use crate::trace::TraceRecorder;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use mojentic::MojenticError;
-use mojentic::llm::gateway::{StreamChunk, StreamMetrics};
+use mojentic::llm::gateway::{ResponseFormat, StreamChunk, StreamMetrics};
 use mojentic::llm::gateways::OllamaGateway;
 use mojentic::llm::models::{LlmMessage, LlmToolCall, MessageRole};
 use mojentic::llm::tools::{LlmTool, ToolRunCtx};
@@ -1701,6 +1701,15 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             stalled_candidate_checks,
             automatic_interrupt: false,
         })?;
+        trace_provider_request(ProviderRequestTraceInput {
+            trace,
+            model,
+            turn,
+            llm_call_depth: depth,
+            messages: &current_messages,
+            tools: active_tools,
+            completion_config: &completion_config,
+        })?;
         let mut stream = gateway.complete_stream(
             model,
             &current_messages,
@@ -2511,6 +2520,63 @@ struct ContextAssemblyInput<'a> {
     context_window_tokens: Option<usize>,
     previous_call_total_chars: Option<usize>,
     transcript_policy: TranscriptPolicy,
+}
+
+struct ProviderRequestTraceInput<'a> {
+    trace: &'a TraceRecorder,
+    model: &'a str,
+    turn: usize,
+    llm_call_depth: usize,
+    messages: &'a [LlmMessage],
+    tools: &'a [Box<dyn LlmTool>],
+    completion_config: &'a CompletionConfig,
+}
+
+fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
+    let ProviderRequestTraceInput {
+        trace,
+        model,
+        turn,
+        llm_call_depth,
+        messages,
+        tools,
+        completion_config,
+    } = input;
+    let tool_descriptors = tools
+        .iter()
+        .map(|tool| tool.descriptor())
+        .collect::<Vec<_>>();
+    let response_format = match &completion_config.response_format {
+        None => serde_json::Value::Null,
+        Some(ResponseFormat::Text) => serde_json::json!({ "type": "text" }),
+        Some(ResponseFormat::JsonObject { schema }) => serde_json::json!({
+            "type": "json_object",
+            "schema": schema,
+        }),
+    };
+
+    trace.event(
+        crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+        serde_json::json!({
+            "schema_version": "provider_request.v1",
+            "turn": turn,
+            "llm_call_depth": llm_call_depth,
+            "model": model,
+            "messages": messages,
+            "tools": tool_descriptors,
+            "completion": {
+                "temperature": completion_config.temperature,
+                "num_ctx": completion_config.num_ctx,
+                "max_tokens": completion_config.max_tokens,
+                "num_predict": completion_config.num_predict,
+                "top_p": completion_config.top_p,
+                "top_k": completion_config.top_k,
+                "response_format": response_format,
+                "reasoning_effort": completion_config.reasoning_effort,
+                "max_tool_iterations": completion_config.max_tool_iterations,
+            },
+        }),
+    )
 }
 
 fn context_assembly_ledger(input: ContextAssemblyInput<'_>) -> ContextAssemblyLedger {
@@ -4956,7 +5022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_response_emits_per_llm_call_context_ledger() {
+    async fn stream_response_traces_exact_provider_request_beside_context_ledger() {
         let temp = tempfile::tempdir().unwrap();
         let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
         let gateway = FakeToolGateway;
@@ -5008,6 +5074,34 @@ mod tests {
                 .matches("\"kind\":\"llm.context_assembly.ledger\"")
                 .count(),
             2
+        );
+        let provider_requests = trace_payloads(
+            &content,
+            crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+        );
+        assert_eq!(provider_requests.len(), 2);
+        assert_eq!(
+            provider_requests[0]["schema_version"],
+            "provider_request.v1"
+        );
+        assert_eq!(provider_requests[0]["turn"], 1);
+        assert_eq!(provider_requests[0]["llm_call_depth"], 0);
+        assert_eq!(provider_requests[0]["model"], "fake-model");
+        assert_eq!(
+            provider_requests[0]["messages"],
+            serde_json::to_value(&messages).unwrap()
+        );
+        assert_eq!(provider_requests[0]["tools"][0]["type"], "function");
+        let temperature = provider_requests[0]["completion"]["temperature"]
+            .as_f64()
+            .unwrap();
+        assert!((temperature - 0.2).abs() < 1e-6);
+        assert_eq!(provider_requests[1]["llm_call_depth"], 1);
+        assert_eq!(provider_requests[1]["messages"][2]["role"], "assistant");
+        assert_eq!(provider_requests[1]["messages"][3]["role"], "tool");
+        assert_eq!(
+            provider_requests[1]["messages"][3]["content"],
+            "{\"echo\":\"hello\"}"
         );
         assert!(content.contains("\"kind\":\"llm.context_assembly.appended\""));
         assert!(content.contains("\"component\":\"tool_result\""));
