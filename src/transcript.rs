@@ -559,7 +559,7 @@ fn label_for_trace(path: &Path) -> String {
                 && bytes.first() == Some(&b'r')
                 && bytes.get(1).is_some_and(u8::is_ascii_digit)
                 && bytes.get(2).is_some_and(u8::is_ascii_digit)
-                && component.contains("-adaptive-")
+                && bytes.get(3) == Some(&b'-')
         })
         .map(str::to_string)
         .or_else(|| {
@@ -792,6 +792,15 @@ mod tests {
         assert!(html.contains("\"severity\":\"danger\""));
         assert!(!html.contains("<script src="));
         assert!(!html.contains("<link"));
+    }
+
+    #[test]
+    fn trace_label_accepts_generic_replicate_arm_names() {
+        let path = Path::new(
+            "/benchmark/runs/cell/r02-repair-2k/job/trial/agent/traces/run.jsonl",
+        );
+
+        assert_eq!(label_for_trace(path), "r02-repair-2k");
     }
 
     #[test]

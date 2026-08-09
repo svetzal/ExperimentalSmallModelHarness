@@ -185,8 +185,9 @@ JSONL files that do not contain a `run.started` event.
 
 Independent verification is optional and harness-neutral. Supply a
 `transcript_evidence.v1` JSON file with `--evidence`; entries match sessions by
-canonical trace path or transcript label. The complete schema and fidelity
-rules are documented in [`TRACE_SCHEMA.md`](TRACE_SCHEMA.md).
+canonical trace path or transcript label. Replicate directories shaped like
+`rNN-<arm>` supply stable labels for arbitrary arm names. The complete schema
+and fidelity rules are documented in [`TRACE_SCHEMA.md`](TRACE_SCHEMA.md).
 
 ## Design and Evidence
 
