@@ -1703,6 +1703,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         requested_validation_pending_after_write,
         requested_validation_ledger,
     } = request;
+    let mut validation_repair_active = validation_repair_active;
     trace.event(
         "agent.stream.started",
         serde_json::json!({
@@ -1848,6 +1849,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             messages: &current_messages,
             tools: active_tools,
             completion_config: &completion_config,
+            max_thinking_only_tokens,
+            repair_exit_thinking_tokens,
+            validation_repair_active,
         })?;
         let mut stream = gateway.complete_stream(
             model,
@@ -2376,6 +2380,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     }),
                 )?;
             }
+            if call.name == "execute_probe" && tool_result_requires_repair(&tool_result) {
+                validation_repair_active = true;
+            }
             let successful_validation = successful_validation_from_tool_result(
                 &tool_result,
                 requested_validation_commands,
@@ -2730,6 +2737,9 @@ struct ProviderRequestTraceInput<'a> {
     messages: &'a [LlmMessage],
     tools: &'a [Box<dyn LlmTool>],
     completion_config: &'a CompletionConfig,
+    max_thinking_only_tokens: usize,
+    repair_exit_thinking_tokens: usize,
+    validation_repair_active: bool,
 }
 
 fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
@@ -2741,6 +2751,9 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
         messages,
         tools,
         completion_config,
+        max_thinking_only_tokens,
+        repair_exit_thinking_tokens,
+        validation_repair_active,
     } = input;
     let tool_descriptors = tools
         .iter()
@@ -2754,6 +2767,12 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
             "schema": schema,
         }),
     };
+    let (effective_thinking_only_cap_tokens, effective_thinking_only_cap_source) =
+        effective_thinking_only_cap(
+            max_thinking_only_tokens,
+            repair_exit_thinking_tokens,
+            validation_repair_active,
+        );
 
     trace.event(
         crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
@@ -2775,8 +2794,32 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
                 "reasoning_effort": completion_config.reasoning_effort,
                 "max_tool_iterations": completion_config.max_tool_iterations,
             },
+            "harness_limits": {
+                "max_thinking_only_tokens": max_thinking_only_tokens,
+                "repair_exit_thinking_tokens": repair_exit_thinking_tokens,
+                "validation_repair_active": validation_repair_active,
+                "effective_thinking_only_cap_tokens": effective_thinking_only_cap_tokens,
+                "effective_thinking_only_cap_source": effective_thinking_only_cap_source,
+            },
         }),
     )
+}
+
+fn effective_thinking_only_cap(
+    max_thinking_only_tokens: usize,
+    repair_exit_thinking_tokens: usize,
+    validation_repair_active: bool,
+) -> (Option<usize>, &'static str) {
+    let ordinary = (max_thinking_only_tokens > 0).then_some(max_thinking_only_tokens);
+    let repair = (validation_repair_active && repair_exit_thinking_tokens > 0)
+        .then_some(repair_exit_thinking_tokens);
+    match (ordinary, repair) {
+        (None, None) => (None, "disabled"),
+        (Some(cap), None) => (Some(cap), "ordinary"),
+        (None, Some(cap)) => (Some(cap), "validation_repair"),
+        (Some(ordinary), Some(repair)) if repair <= ordinary => (Some(repair), "validation_repair"),
+        (Some(ordinary), Some(_)) => (Some(ordinary), "ordinary"),
+    }
 }
 
 fn context_assembly_ledger(input: ContextAssemblyInput<'_>) -> ContextAssemblyLedger {
@@ -4976,6 +5019,22 @@ mod tests {
         let content = std::fs::read_to_string(trace.path()).unwrap();
         assert!(content.contains("\"kind\":\"agent.validation.repair_exit_interrupted\""));
         assert!(content.contains("\"repair_exit_thinking_tokens\":1"));
+        let provider_requests = trace_payloads(
+            &content,
+            crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+        );
+        assert_eq!(
+            provider_requests[0]["harness_limits"]["effective_thinking_only_cap_tokens"],
+            json!(1)
+        );
+        assert_eq!(
+            provider_requests[0]["harness_limits"]["effective_thinking_only_cap_source"],
+            json!("validation_repair")
+        );
+        assert_eq!(
+            provider_requests[0]["harness_limits"]["validation_repair_active"],
+            json!(true)
+        );
         assert!(!content.contains("\"kind\":\"llm.thinking_only_stream.hard_failed\""));
     }
 
@@ -6518,6 +6577,11 @@ mod tests {
                 .unwrap()
                 .contains("probe:repair-confidential")
         }));
+        assert_eq!(
+            provider_requests[1]["harness_limits"]["validation_repair_active"],
+            json!(true),
+            "the next in-flight request must adopt repair policy immediately"
+        );
     }
 
     #[tokio::test]

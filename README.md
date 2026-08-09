@@ -170,6 +170,13 @@ the failure evidence, and limits the next tool surface to `write_file`,
 `text-only` mode preserves the legacy continuation behavior so the two policies
 can be compared on one pinned binary.
 
+Every `llm.provider_request.assembled` snapshot records the harness-side
+thinking limits that govern that request. The `harness_limits` object includes
+the ordinary and repair caps, whether validation repair is active, and the
+effective cap and source. A failed declared probe activates repair limits
+immediately for any following request in the same tool turn as well as for a
+constrained handoff.
+
 Probe delivery is trace-visible as `agent.contract.probes.delivered`, including
 the delivered IDs, probe kinds, and resulting worker-message size. Empty probe
 lists leave the worker message unchanged and emit no delivery event. Probe
