@@ -455,6 +455,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
 
     let mut final_summary = String::new();
     let mut final_response_only_next_turn = false;
+    let mut authoritative_constrained_repair_active = false;
     let mut requested_validation_ledger = RequestedValidationLedger::new_for_probes(
         &resolved_contract.probes,
         resolved_contract.profile.clone(),
@@ -470,6 +471,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         let requested_validation_ledger_before_turn = requested_validation_ledger.clone();
         let constrained_repair_turn = config.repair_handoff_policy
             == RepairHandoffPolicy::Constrained
+            && authoritative_constrained_repair_active
             && policy_before_turn.validation_repair.is_some();
         let active_tools = if final_response_only_next_turn {
             &no_tools
@@ -549,6 +551,11 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         let repair_no_content_interrupted = turn_result.repair_no_content_interrupted;
         let action_boundary_interrupted = turn_result.action_boundary_interrupted;
         let repair_depth_hard_stop = turn_result.repair_depth_hard_stop;
+        let authoritative_constrained_handoff =
+            turn_result.authoritative_constrained_handoff_required;
+        if policy_before_turn.validation_repair.is_none() {
+            authoritative_constrained_repair_active = false;
+        }
         let thinking_chars_this_turn = turn_result.thinking_chars;
         let response = turn_result.response;
         requested_validation_ledger = turn_result.requested_validation_ledger;
@@ -728,10 +735,34 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             messages.push(LlmMessage::user(action_boundary_interrupt_prompt(decision)));
             continue;
         }
+        if authoritative_constrained_handoff {
+            authoritative_constrained_repair_active = true;
+            if !response.trim().is_empty() {
+                messages.push(LlmMessage::assistant(response.clone()));
+            }
+            let removed_user_messages = prune_superseded_agent_loop_guidance(&mut messages);
+            trace.event(
+                "agent.validation.constrained_handoff_context_pruned",
+                serde_json::json!({
+                    "turn": turn,
+                    "removed_user_messages": removed_user_messages,
+                    "retained_initial_context": true,
+                }),
+            )?;
+            let repair = policy
+                .validation_repair
+                .as_ref()
+                .expect("authoritative failed probe requires active repair");
+            messages.push(LlmMessage::user(validation_repair_prompt_for_profile(
+                repair, profile,
+            )));
+            final_summary = format!(
+                "turn {turn} entered constrained validation repair after authoritative failure"
+            );
+            continue;
+        }
         if response.trim().is_empty() {
-            if config.repair_handoff_policy == RepairHandoffPolicy::Constrained
-                && let Some(repair) = &policy.validation_repair
-            {
+            if constrained_repair_turn && let Some(repair) = &policy.validation_repair {
                 trace.event(
                     "agent.validation.repair_prompted",
                     serde_json::json!({
@@ -1571,6 +1602,7 @@ struct StreamResponseResult {
     repair_no_content_interrupted: bool,
     action_boundary_interrupted: Option<ActionBoundaryInterrupt>,
     repair_depth_hard_stop: Option<RepairDepthDecision>,
+    authoritative_constrained_handoff_required: bool,
     requested_validation_ledger: RequestedValidationLedger,
 }
 
@@ -1750,6 +1782,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 repair_no_content_interrupted,
                 action_boundary_interrupted,
                 repair_depth_hard_stop: Some(decision),
+                authoritative_constrained_handoff_required: false,
                 requested_validation_ledger,
             });
         }
@@ -2245,6 +2278,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 repair_no_content_interrupted,
                 action_boundary_interrupted,
                 repair_depth_hard_stop: None,
+                authoritative_constrained_handoff_required: false,
                 requested_validation_ledger,
             });
         }
@@ -2327,6 +2361,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 )?;
             }
             if repair_handoff_policy == RepairHandoffPolicy::Constrained
+                && call.name == "execute_probe"
                 && tool_result_requires_repair(&tool_result)
             {
                 constrained_repair_handoff_required = true;
@@ -2401,6 +2436,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 repair_no_content_interrupted,
                 action_boundary_interrupted,
                 repair_depth_hard_stop: None,
+                authoritative_constrained_handoff_required: true,
                 requested_validation_ledger,
             });
         }
@@ -2414,6 +2450,22 @@ fn tool_result_requires_repair(result: &ToolCallRunResult) -> bool {
         .ok()
         .and_then(|value| value.get("repair_required").cloned())
         .is_some_and(|repair| !repair.is_null())
+}
+
+fn prune_superseded_agent_loop_guidance(messages: &mut Vec<LlmMessage>) -> usize {
+    let mut initial_user_retained = false;
+    let before = messages.len();
+    messages.retain(|message| {
+        if message.role != MessageRole::User {
+            return true;
+        }
+        if !initial_user_retained {
+            initial_user_retained = true;
+            return true;
+        }
+        false
+    });
+    before - messages.len()
 }
 
 fn repair_depth_decision(
@@ -6491,6 +6543,13 @@ mod tests {
         )
         .unwrap();
         let gateway = ScriptedGateway::new(vec![
+            vec![StreamChunk::Content(
+                "I will continue from the current state.".to_string(),
+            )],
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("test -f never-created.txt"))]),
+            )],
             vec![tool_call_chunk(
                 "execute_probe",
                 HashMap::from([("probe_id".to_string(), json!("repair-handoff"))]),
@@ -6502,7 +6561,7 @@ mod tests {
         ]);
 
         let summary = fixture
-            .run_contract_with_policy(&gateway, 2, RepairHandoffPolicy::Constrained)
+            .run_contract_with_policy(&gateway, 4, RepairHandoffPolicy::Constrained)
             .await;
         let trace = std::fs::read_to_string(&summary.trace_file).unwrap();
         let provider_requests = trace_payloads(
@@ -6510,13 +6569,26 @@ mod tests {
             crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
         );
 
-        assert_eq!(provider_requests.len(), 2, "{provider_requests:?}");
-        let repair_request = &provider_requests[1];
+        assert_eq!(provider_requests.len(), 4, "{provider_requests:?}");
+        let pre_handoff_request = serde_json::to_string(&provider_requests[2]).unwrap();
+        assert!(
+            pre_handoff_request.contains("Continue from the current experiment state"),
+            "{pre_handoff_request}"
+        );
+        assert!(
+            provider_requests[2]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "read_file")
+        );
+        let repair_request = &provider_requests[3];
         let repair_request_text = serde_json::to_string(repair_request).unwrap();
         assert!(repair_request_text.contains("Validation repair action contract is active"));
         assert!(repair_request_text.contains("probe:repair-handoff"));
         assert!(!repair_request_text.contains("PRIVATE_HANDOFF_COMMAND_BYTES"));
         assert!(!repair_request_text.contains("You used tools but produced no final text"));
+        assert!(!repair_request_text.contains("Continue from the current experiment state"));
         assert!(!repair_request_text.contains("Do not edit again yet"));
         let tool_names = repair_request["tools"]
             .as_array()
@@ -6530,6 +6602,13 @@ mod tests {
         );
         assert!(trace.contains("\"kind\":\"agent.validation.constrained_handoff_required\""));
         assert!(trace.contains("\"kind\":\"agent.validation.constrained_handoff_started\""));
+        assert!(trace.contains("\"kind\":\"agent.validation.constrained_handoff_context_pruned\""));
+        assert_eq!(
+            trace
+                .matches("\"kind\":\"agent.validation.constrained_handoff_required\"")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

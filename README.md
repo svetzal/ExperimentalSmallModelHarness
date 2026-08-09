@@ -161,12 +161,14 @@ shell validation. This makes the stable ID a capability boundary rather than a
 prompt alias for a long command.
 
 The optional `--repair-handoff-policy constrained` mode gives an authoritative
-failed probe immediate control of the next provider request. It ends the
-in-flight tool turn, places the validation-repair action contract after the
-failure evidence, and limits the next tool surface to `write_file`, `edit_file`,
-`shell_command`, and `execute_probe`. The default `text-only` mode preserves the
-legacy continuation behavior so the two policies can be compared on one pinned
-binary.
+failed declared probe invoked through `execute_probe` immediate control of the
+next provider request. It ends the in-flight tool turn, removes superseded
+agent-loop user guidance, places the validation-repair action contract after
+the failure evidence, and limits the next tool surface to `write_file`,
+`edit_file`, `shell_command`, and `execute_probe`. Model-authored
+`shell_command` failures do not activate this authority. The default
+`text-only` mode preserves the legacy continuation behavior so the two policies
+can be compared on one pinned binary.
 
 Probe delivery is trace-visible as `agent.contract.probes.delivered`, including
 the delivered IDs, probe kinds, and resulting worker-message size. Empty probe
