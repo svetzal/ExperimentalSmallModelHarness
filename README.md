@@ -160,6 +160,14 @@ cleanup, mutation sensing, repair policy, and lifecycle-phase tracing as direct
 shell validation. This makes the stable ID a capability boundary rather than a
 prompt alias for a long command.
 
+The optional `--repair-handoff-policy constrained` mode gives an authoritative
+failed probe immediate control of the next provider request. It ends the
+in-flight tool turn, places the validation-repair action contract after the
+failure evidence, and limits the next tool surface to `write_file`, `edit_file`,
+`shell_command`, and `execute_probe`. The default `text-only` mode preserves the
+legacy continuation behavior so the two policies can be compared on one pinned
+binary.
+
 Probe delivery is trace-visible as `agent.contract.probes.delivered`, including
 the delivered IDs, probe kinds, and resulting worker-message size. Empty probe
 lists leave the worker message unchanged and emit no delivery event. Probe

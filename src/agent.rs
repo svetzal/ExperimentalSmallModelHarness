@@ -61,6 +61,7 @@ pub struct AgentRunConfig {
     pub num_predict: Option<usize>,
     pub max_thinking_only_tokens: usize,
     pub repair_exit_thinking_tokens: usize,
+    pub repair_handoff_policy: RepairHandoffPolicy,
     pub action_boundary_interrupt_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
     /// Optional adapter-owned initial-context catalog. Required, selectable,
@@ -86,6 +87,7 @@ pub struct AgentRunSummary {
     pub num_predict: Option<usize>,
     pub max_thinking_only_tokens: usize,
     pub repair_exit_thinking_tokens: usize,
+    pub repair_handoff_policy: RepairHandoffPolicy,
     pub action_boundary_interrupt_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
     pub initial_context_catalog_file: Option<PathBuf>,
@@ -95,6 +97,24 @@ pub struct AgentRunSummary {
     pub excluded_initial_context_ids: Vec<String>,
     pub final_summary: String,
     pub harness_source_state: crate::provenance::HarnessSourceState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairHandoffPolicy {
+    #[default]
+    TextOnly,
+    Constrained,
+}
+
+impl RepairHandoffPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text-only" | "text" | "legacy" => Some(Self::TextOnly),
+            "constrained" | "action-shaped" => Some(Self::Constrained),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +300,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "num_predict": config.num_predict,
             "max_thinking_only_tokens": config.max_thinking_only_tokens,
             "repair_exit_thinking_tokens": config.repair_exit_thinking_tokens,
+            "repair_handoff_policy": config.repair_handoff_policy,
             "action_boundary_interrupt_tokens": config.action_boundary_interrupt_tokens,
             "assembly_policy": config.transcript_policy.as_str(),
             "transcript_policy": config.transcript_policy,
@@ -377,6 +398,16 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     scope.configure_probes(resolved_contract.probes.clone())?;
     let system_prompt = profile.system_guidance();
     let tools = tools_for_profile(&scope, profile);
+    let repair_tools = tools
+        .iter()
+        .filter(|tool| {
+            matches!(
+                tool.descriptor().function.name.as_str(),
+                "edit_file" | "write_file" | "shell_command" | "execute_probe"
+            )
+        })
+        .map(|tool| tool.clone_box())
+        .collect::<Vec<_>>();
     let worker_message = worker_message_with_declared_probes(
         &initial_context.worker_message,
         &resolved_contract.probes,
@@ -437,8 +468,13 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         let runtime_before_turn = scope.runtime_state_snapshot();
         let policy_before_turn = scope.policy_snapshot();
         let requested_validation_ledger_before_turn = requested_validation_ledger.clone();
+        let constrained_repair_turn = config.repair_handoff_policy
+            == RepairHandoffPolicy::Constrained
+            && policy_before_turn.validation_repair.is_some();
         let active_tools = if final_response_only_next_turn {
             &no_tools
+        } else if constrained_repair_turn {
+            &repair_tools
         } else {
             &tools
         };
@@ -458,6 +494,12 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 "turn": turn,
                 "max_iterations": config.max_iterations,
                 "final_response_only": final_response_only_next_turn,
+                "repair_handoff_policy": config.repair_handoff_policy,
+                "constrained_repair_turn": constrained_repair_turn,
+                "active_tool_names": active_tools
+                    .iter()
+                    .map(|tool| tool.descriptor().function.name)
+                    .collect::<Vec<_>>(),
             }),
         )?;
         let turn_result = match stream_response(StreamResponseRequest {
@@ -471,6 +513,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             expected_output_tokens: config.expected_output_tokens,
             max_thinking_only_tokens: config.max_thinking_only_tokens,
             repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
+            repair_handoff_policy: config.repair_handoff_policy,
             action_boundary_interrupt_tokens: config.action_boundary_interrupt_tokens,
             validation_repair_active: policy_before_turn.validation_repair.is_some(),
             transcript_policy: config.transcript_policy,
@@ -686,6 +729,27 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             continue;
         }
         if response.trim().is_empty() {
+            if config.repair_handoff_policy == RepairHandoffPolicy::Constrained
+                && let Some(repair) = &policy.validation_repair
+            {
+                trace.event(
+                    "agent.validation.repair_prompted",
+                    serde_json::json!({
+                        "turn": turn,
+                        "tool_calls_this_turn": tool_calls_this_turn,
+                        "policy": policy,
+                        "handoff_policy": config.repair_handoff_policy,
+                        "priority": "authoritative_failed_probe",
+                    }),
+                )?;
+                final_summary = format!(
+                    "turn {turn} entered constrained validation repair after authoritative failure"
+                );
+                messages.push(LlmMessage::user(validation_repair_prompt_for_profile(
+                    repair, profile,
+                )));
+                continue;
+            }
             if policy.validation_required_after_write {
                 trace.event(
                     "agent.validation.required_after_edit",
@@ -976,6 +1040,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         num_predict: config.num_predict,
         max_thinking_only_tokens: config.max_thinking_only_tokens,
         repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
+        repair_handoff_policy: config.repair_handoff_policy,
         action_boundary_interrupt_tokens: config.action_boundary_interrupt_tokens,
         transcript_policy: config.transcript_policy,
         initial_context_catalog_file: config.initial_context_catalog_file,
@@ -1483,6 +1548,7 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     expected_output_tokens: usize,
     max_thinking_only_tokens: usize,
     repair_exit_thinking_tokens: usize,
+    repair_handoff_policy: RepairHandoffPolicy,
     action_boundary_interrupt_tokens: usize,
     validation_repair_active: bool,
     transcript_policy: TranscriptPolicy,
@@ -1591,6 +1657,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         expected_output_tokens,
         max_thinking_only_tokens,
         repair_exit_thinking_tokens,
+        repair_handoff_policy,
         action_boundary_interrupt_tokens,
         validation_repair_active,
         transcript_policy,
@@ -1625,6 +1692,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         expected_output_tokens.saturating_mul(NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER);
     let mut inspection_loop_tracker = InspectionLoopTracker::default();
     let mut final_response_only_after_validation: Option<SuccessfulValidationSnapshot> = None;
+    let mut constrained_repair_handoff_required = false;
     let mut requested_validation_pending_after_write = requested_validation_pending_after_write;
     let mut requested_validation_ledger = requested_validation_ledger;
     let profile = crate::profile::profile_by_ref(&requested_validation_ledger.profile)?;
@@ -2258,6 +2326,21 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     }),
                 )?;
             }
+            if repair_handoff_policy == RepairHandoffPolicy::Constrained
+                && tool_result_requires_repair(&tool_result)
+            {
+                constrained_repair_handoff_required = true;
+                trace.event(
+                    "agent.validation.constrained_handoff_required",
+                    serde_json::json!({
+                        "turn": turn,
+                        "llm_call_depth": depth,
+                        "tool_call_id": &call.id,
+                        "tool_name": &call.name,
+                        "next_policy": "end_in_flight_turn_and_prompt_repair",
+                    }),
+                )?;
+            }
             let successful_validation = successful_validation_from_tool_result(
                 &tool_result,
                 requested_validation_commands,
@@ -2301,9 +2384,36 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             transcript_policy,
             context_window_tokens,
         )?;
+        if constrained_repair_handoff_required {
+            trace.event(
+                "agent.validation.constrained_handoff_started",
+                serde_json::json!({
+                    "turn": turn,
+                    "llm_call_depth": depth,
+                    "response_chars": response.len(),
+                    "tool_call_count": accumulated_tool_calls.len(),
+                }),
+            )?;
+            return Ok(StreamResponseResult {
+                response,
+                messages: current_messages,
+                thinking_chars,
+                repair_no_content_interrupted,
+                action_boundary_interrupted,
+                repair_depth_hard_stop: None,
+                requested_validation_ledger,
+            });
+        }
     }
 
     unreachable!("tool iteration loop always returns or errors before exhaustion")
+}
+
+fn tool_result_requires_repair(result: &ToolCallRunResult) -> bool {
+    serde_json::from_str::<serde_json::Value>(&result.content)
+        .ok()
+        .and_then(|value| value.get("repair_required").cloned())
+        .is_some_and(|repair| !repair.is_null())
 }
 
 fn repair_depth_decision(
@@ -4467,6 +4577,7 @@ mod tests {
             expected_output_tokens: 1,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
@@ -4540,6 +4651,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
@@ -4589,6 +4701,7 @@ mod tests {
             expected_output_tokens: 1,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
@@ -4633,6 +4746,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: 1,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
@@ -4685,6 +4799,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 1,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
@@ -4740,6 +4855,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 1,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
@@ -4786,6 +4902,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 1,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
@@ -4834,6 +4951,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
@@ -4890,6 +5008,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
@@ -4945,6 +5064,7 @@ mod tests {
             expected_output_tokens: 4_096,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
@@ -5003,6 +5123,7 @@ mod tests {
             expected_output_tokens: 1,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
@@ -5084,6 +5205,7 @@ mod tests {
             expected_output_tokens: 2_048,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
@@ -5173,6 +5295,7 @@ mod tests {
             expected_output_tokens: 2_048,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
@@ -5225,6 +5348,7 @@ mod tests {
             expected_output_tokens: 2_048,
             max_thinking_only_tokens: usize::MAX,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
@@ -5601,6 +5725,7 @@ mod tests {
             num_predict: None,
             max_thinking_only_tokens: 4_096,
             repair_exit_thinking_tokens: 16_384,
+            repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             initial_context_catalog_file: None,
@@ -6344,6 +6469,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn constrained_handoff_owns_the_first_request_after_failed_declared_probe() {
+        let fixture = AgentFixture::new("unused legacy task");
+        let private_command = "test -f never-created.txt # PRIVATE_HANDOFF_COMMAND_BYTES";
+        std::fs::write(
+            fixture.experiment.join("contract.json"),
+            serde_json::to_string_pretty(&json!({
+                "profile": {
+                    "id": "terminal_work",
+                    "version": "terminal_work_profile.v1"
+                },
+                "guidance": "Execute the declared probe by ID and repair its failure.",
+                "read_scope": ["./**"],
+                "write_scope": ["./**"],
+                "probes": [{
+                    "id": "repair-handoff",
+                    "command": private_command
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("repair-handoff"))]),
+            )],
+            vec![StreamChunk::Content(
+                "FAIL deterministic fixture ends after observing the constrained request"
+                    .to_string(),
+            )],
+        ]);
+
+        let summary = fixture
+            .run_contract_with_policy(&gateway, 2, RepairHandoffPolicy::Constrained)
+            .await;
+        let trace = std::fs::read_to_string(&summary.trace_file).unwrap();
+        let provider_requests = trace_payloads(
+            &trace,
+            crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+        );
+
+        assert_eq!(provider_requests.len(), 2, "{provider_requests:?}");
+        let repair_request = &provider_requests[1];
+        let repair_request_text = serde_json::to_string(repair_request).unwrap();
+        assert!(repair_request_text.contains("Validation repair action contract is active"));
+        assert!(repair_request_text.contains("probe:repair-handoff"));
+        assert!(!repair_request_text.contains("PRIVATE_HANDOFF_COMMAND_BYTES"));
+        assert!(!repair_request_text.contains("You used tools but produced no final text"));
+        assert!(!repair_request_text.contains("Do not edit again yet"));
+        let tool_names = repair_request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_names,
+            vec!["write_file", "edit_file", "shell_command", "execute_probe"]
+        );
+        assert!(trace.contains("\"kind\":\"agent.validation.constrained_handoff_required\""));
+        assert!(trace.contains("\"kind\":\"agent.validation.constrained_handoff_started\""));
+    }
+
+    #[tokio::test]
     async fn fixture_assembles_required_selected_and_excluded_initial_context() {
         let fixture = AgentFixture::new("Create a release note with the required format.");
         std::fs::write(
@@ -6577,6 +6766,7 @@ mod tests {
                     num_predict: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
+                    repair_handoff_policy: RepairHandoffPolicy::TextOnly,
                     action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
@@ -6594,6 +6784,16 @@ mod tests {
             gateway: &ScriptedGateway,
             max_iterations: usize,
         ) -> AgentRunSummary {
+            self.run_contract_with_policy(gateway, max_iterations, RepairHandoffPolicy::TextOnly)
+                .await
+        }
+
+        async fn run_contract_with_policy(
+            &self,
+            gateway: &ScriptedGateway,
+            max_iterations: usize,
+            repair_handoff_policy: RepairHandoffPolicy,
+        ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
@@ -6609,6 +6809,7 @@ mod tests {
                     num_predict: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
+                    repair_handoff_policy,
                     action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
@@ -6641,6 +6842,7 @@ mod tests {
                     num_predict: None,
                     max_thinking_only_tokens: usize::MAX,
                     repair_exit_thinking_tokens: 16_384,
+                    repair_handoff_policy: RepairHandoffPolicy::TextOnly,
                     action_boundary_interrupt_tokens: 1,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
@@ -6669,6 +6871,7 @@ mod tests {
                     num_predict: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
+                    repair_handoff_policy: RepairHandoffPolicy::TextOnly,
                     action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: Some(PathBuf::from("context-catalog.json")),

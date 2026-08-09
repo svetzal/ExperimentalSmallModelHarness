@@ -6,7 +6,7 @@ use crate::acceptance_plan::{
     AcceptancePlan, DEFAULT_MAX_PLAN_ITEMS, DEFAULT_MAX_PLAN_OUTPUT_TOKENS, plan_acceptance,
 };
 use crate::agent::{
-    AgentRunConfig, TranscriptPolicy, default_expected_output_tokens,
+    AgentRunConfig, RepairHandoffPolicy, TranscriptPolicy, default_expected_output_tokens,
     default_max_thinking_only_tokens, default_repair_exit_thinking_tokens, run_agent,
 };
 use crate::baseline::{load_matrix_baseline, summarize_matrix};
@@ -82,6 +82,11 @@ struct RunArgs {
     #[arg(long)]
     repair_exit_thinking_tokens: Option<usize>,
 
+    /// Post-failure handoff policy: text-only preserves the legacy continuation;
+    /// constrained ends the failed-probe turn and exposes only repair-action tools.
+    #[arg(long, default_value = "text-only")]
+    repair_handoff_policy: String,
+
     /// Pre-validation hidden action-intent reasoning tokens before interrupting and forcing an action. 0 disables.
     #[arg(long, default_value_t = 0)]
     action_boundary_interrupt_tokens: usize,
@@ -119,6 +124,13 @@ impl RunArgs {
         let repair_exit_thinking_tokens = self
             .repair_exit_thinking_tokens
             .unwrap_or_else(default_repair_exit_thinking_tokens);
+        let repair_handoff_policy = RepairHandoffPolicy::parse(&self.repair_handoff_policy)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid repair handoff policy {:?}; expected text-only or constrained",
+                    self.repair_handoff_policy
+                )
+            })?;
         Ok(AgentRunConfig {
             experiment_dir: self.experiment,
             trace_dir: self.trace_dir,
@@ -133,6 +145,7 @@ impl RunArgs {
             num_predict: self.num_predict,
             max_thinking_only_tokens,
             repair_exit_thinking_tokens,
+            repair_handoff_policy,
             action_boundary_interrupt_tokens: self.action_boundary_interrupt_tokens,
             transcript_policy,
             initial_context_catalog_file: self.initial_context_catalog,
