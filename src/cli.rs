@@ -83,7 +83,8 @@ struct RunArgs {
     repair_exit_thinking_tokens: Option<usize>,
 
     /// Post-failure handoff policy: text-only preserves the legacy continuation;
-    /// constrained ends the failed-probe turn and exposes only repair-action tools.
+    /// constrained ends the failed-probe turn and exposes only repair-action tools;
+    /// constrained-action-only disables model reasoning after a capped repair attempt.
     #[arg(long, default_value = "text-only")]
     repair_handoff_policy: String,
 
@@ -127,7 +128,8 @@ impl RunArgs {
         let repair_handoff_policy = RepairHandoffPolicy::parse(&self.repair_handoff_policy)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "invalid repair handoff policy {:?}; expected text-only or constrained",
+                    "invalid repair handoff policy {:?}; expected text-only, constrained, or \
+                     constrained-action-only",
                     self.repair_handoff_policy
                 )
             })?;

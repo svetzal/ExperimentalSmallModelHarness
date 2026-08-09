@@ -170,6 +170,15 @@ the failure evidence, and limits the next tool surface to `write_file`,
 `text-only` mode preserves the legacy continuation behavior so the two policies
 can be compared on one pinned binary.
 
+The `constrained-action-only` variant keeps that first bounded repair request.
+If the request reaches its repair thinking cap without an action, the following
+request uses Ollama's native `think=false` control, retains the authoritative
+failure packet and restricted repair tools, and explicitly states that the
+interrupted hidden reasoning was not retained. Its provider snapshot records
+`reasoning_effort: disabled`, `thinking_disabled: true`, and the effective cap
+source `provider_disabled`. The ordinary `constrained` variant still retries
+with thinking enabled.
+
 Every `llm.provider_request.assembled` snapshot records the harness-side
 thinking limits that govern that request. The `harness_limits` object includes
 the ordinary and repair caps, whether validation repair is active, and the

@@ -796,9 +796,7 @@ mod tests {
 
     #[test]
     fn trace_label_accepts_generic_replicate_arm_names() {
-        let path = Path::new(
-            "/benchmark/runs/cell/r02-repair-2k/job/trial/agent/traces/run.jsonl",
-        );
+        let path = Path::new("/benchmark/runs/cell/r02-repair-2k/job/trial/agent/traces/run.jsonl");
 
         assert_eq!(label_for_trace(path), "r02-repair-2k");
     }

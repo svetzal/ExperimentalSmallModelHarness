@@ -6,7 +6,7 @@ use crate::trace::TraceRecorder;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use mojentic::MojenticError;
-use mojentic::llm::gateway::{ResponseFormat, StreamChunk, StreamMetrics};
+use mojentic::llm::gateway::{ReasoningEffort, ResponseFormat, StreamChunk, StreamMetrics};
 use mojentic::llm::gateways::OllamaGateway;
 use mojentic::llm::models::{LlmMessage, LlmToolCall, MessageRole};
 use mojentic::llm::tools::{LlmTool, ToolRunCtx};
@@ -105,6 +105,7 @@ pub enum RepairHandoffPolicy {
     #[default]
     TextOnly,
     Constrained,
+    ConstrainedActionOnly,
 }
 
 impl RepairHandoffPolicy {
@@ -112,8 +113,17 @@ impl RepairHandoffPolicy {
         match value {
             "text-only" | "text" | "legacy" => Some(Self::TextOnly),
             "constrained" | "action-shaped" => Some(Self::Constrained),
+            "constrained-action-only" | "action-only" => Some(Self::ConstrainedActionOnly),
             _ => None,
         }
+    }
+
+    fn is_constrained(self) -> bool {
+        matches!(self, Self::Constrained | Self::ConstrainedActionOnly)
+    }
+
+    fn uses_action_only_retry(self) -> bool {
+        self == Self::ConstrainedActionOnly
     }
 }
 
@@ -456,6 +466,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     let mut final_summary = String::new();
     let mut final_response_only_next_turn = false;
     let mut authoritative_constrained_repair_active = false;
+    let mut repair_action_only_next_turn = false;
     let mut requested_validation_ledger = RequestedValidationLedger::new_for_probes(
         &resolved_contract.probes,
         resolved_contract.profile.clone(),
@@ -469,10 +480,26 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         let runtime_before_turn = scope.runtime_state_snapshot();
         let policy_before_turn = scope.policy_snapshot();
         let requested_validation_ledger_before_turn = requested_validation_ledger.clone();
-        let constrained_repair_turn = config.repair_handoff_policy
-            == RepairHandoffPolicy::Constrained
+        let constrained_repair_turn = config.repair_handoff_policy.is_constrained()
             && authoritative_constrained_repair_active
             && policy_before_turn.validation_repair.is_some();
+        let repair_action_only_turn = constrained_repair_turn && repair_action_only_next_turn;
+        let mut turn_completion_config = completion_config.clone();
+        if repair_action_only_turn {
+            turn_completion_config.reasoning_effort = Some(ReasoningEffort::Disabled);
+            trace.event(
+                "agent.validation.repair_action_only_started",
+                serde_json::json!({
+                    "turn": turn,
+                    "reasoning_effort": ReasoningEffort::Disabled,
+                    "prior_hidden_reasoning_retained": false,
+                    "active_tool_names": repair_tools
+                        .iter()
+                        .map(|tool| tool.descriptor().function.name)
+                        .collect::<Vec<_>>(),
+                }),
+            )?;
+        }
         let active_tools = if final_response_only_next_turn {
             &no_tools
         } else if constrained_repair_turn {
@@ -498,6 +525,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 "final_response_only": final_response_only_next_turn,
                 "repair_handoff_policy": config.repair_handoff_policy,
                 "constrained_repair_turn": constrained_repair_turn,
+                "repair_action_only_turn": repair_action_only_turn,
                 "active_tool_names": active_tools
                     .iter()
                     .map(|tool| tool.descriptor().function.name)
@@ -509,7 +537,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             model: &config.model,
             messages: &messages,
             tools: active_tools,
-            completion_config: completion_config.clone(),
+            completion_config: turn_completion_config,
             context_window_tokens: config.context_window_tokens,
             packet_type: &config.packet_type,
             expected_output_tokens: config.expected_output_tokens,
@@ -547,6 +575,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 return Err(error);
             }
         };
+        repair_action_only_next_turn = false;
         final_response_only_next_turn = false;
         let repair_no_content_interrupted = turn_result.repair_no_content_interrupted;
         let action_boundary_interrupted = turn_result.action_boundary_interrupted;
@@ -776,9 +805,29 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 final_summary = format!(
                     "turn {turn} entered constrained validation repair after authoritative failure"
                 );
-                messages.push(LlmMessage::user(validation_repair_prompt_for_profile(
-                    repair, profile,
-                )));
+                if config.repair_handoff_policy.uses_action_only_retry()
+                    && repair_no_content_interrupted
+                {
+                    repair_action_only_next_turn = true;
+                    trace.event(
+                        "agent.validation.repair_action_only_scheduled",
+                        serde_json::json!({
+                            "turn": turn,
+                            "next_turn": turn + 1,
+                            "prior_thinking_chars": thinking_chars_this_turn,
+                            "prior_hidden_reasoning_retained": false,
+                            "next_reasoning_effort": ReasoningEffort::Disabled,
+                            "reason": "bounded_repair_diagnosis_ended_without_action",
+                        }),
+                    )?;
+                    messages.push(LlmMessage::user(validation_repair_action_only_prompt(
+                        repair, profile,
+                    )));
+                } else {
+                    messages.push(LlmMessage::user(validation_repair_prompt_for_profile(
+                        repair, profile,
+                    )));
+                }
                 continue;
             }
             if policy.validation_required_after_write {
@@ -2364,7 +2413,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     }),
                 )?;
             }
-            if repair_handoff_policy == RepairHandoffPolicy::Constrained
+            if repair_handoff_policy.is_constrained()
                 && call.name == "execute_probe"
                 && tool_result_requires_repair(&tool_result)
             {
@@ -2767,11 +2816,13 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
             "schema": schema,
         }),
     };
+    let thinking_disabled = completion_config.reasoning_effort == Some(ReasoningEffort::Disabled);
     let (effective_thinking_only_cap_tokens, effective_thinking_only_cap_source) =
         effective_thinking_only_cap(
             max_thinking_only_tokens,
             repair_exit_thinking_tokens,
             validation_repair_active,
+            thinking_disabled,
         );
 
     trace.event(
@@ -2798,6 +2849,7 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
                 "max_thinking_only_tokens": max_thinking_only_tokens,
                 "repair_exit_thinking_tokens": repair_exit_thinking_tokens,
                 "validation_repair_active": validation_repair_active,
+                "thinking_disabled": thinking_disabled,
                 "effective_thinking_only_cap_tokens": effective_thinking_only_cap_tokens,
                 "effective_thinking_only_cap_source": effective_thinking_only_cap_source,
             },
@@ -2809,7 +2861,11 @@ fn effective_thinking_only_cap(
     max_thinking_only_tokens: usize,
     repair_exit_thinking_tokens: usize,
     validation_repair_active: bool,
+    thinking_disabled: bool,
 ) -> (Option<usize>, &'static str) {
+    if thinking_disabled {
+        return (None, "provider_disabled");
+    }
     let ordinary = (max_thinking_only_tokens > 0).then_some(max_thinking_only_tokens);
     let repair = (validation_repair_active && repair_exit_thinking_tokens > 0)
         .then_some(repair_exit_thinking_tokens);
@@ -3997,6 +4053,25 @@ fn validation_repair_prompt_for_profile(
         failure_details = failure_details,
         command_count = repair.repeated_command_family_count,
         summary_count = repair.repeated_failure_summary_count,
+        repair_ladder_suffix = profile.repair_ladder_suffix(),
+    )
+}
+
+fn validation_repair_action_only_prompt(
+    repair: &ValidationRepairSnapshot,
+    profile: &dyn crate::profile::DomainProfile,
+) -> String {
+    let failure_details = repair_detail_text(repair);
+    format!(
+        "Action-only validation repair is active. The bounded diagnosis request ended without an action, and its hidden reasoning is not retained in this request.\n\
+         Failing command: {command}\n\
+         Failure text: {failure_text}\n\
+         Failure details:\n{failure_details}\n\
+         Do not restart analysis or emit a repair plan. Take exactly one action now: apply one focused source edit with edit_file, run one deterministic diagnostic probe that narrows these exact details, or reply FAIL with a concrete blocker.\n\
+         {repair_ladder_suffix}",
+        command = repair.command,
+        failure_text = repair.failure_text,
+        failure_details = failure_details,
         repair_ladder_suffix = profile.repair_ladder_suffix(),
     )
 }
@@ -6676,6 +6751,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn constrained_action_only_disables_reasoning_after_bounded_repair_no_action() {
+        let fixture = AgentFixture::new("unused legacy task");
+        std::fs::write(
+            fixture.experiment.join("contract.json"),
+            serde_json::to_string_pretty(&json!({
+                "profile": {
+                    "id": "terminal_work",
+                    "version": "terminal_work_profile.v1"
+                },
+                "guidance": "Execute the declared probe and repair its failure.",
+                "read_scope": ["./**"],
+                "write_scope": ["./**"],
+                "probes": [{
+                    "id": "action-only-repair",
+                    "command": "test -f never-created.txt"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("action-only-repair"))]),
+            )],
+            vec![StreamChunk::Thinking(
+                "diagnosis exceeded the deliberately tiny fixture cap".to_string(),
+            )],
+            vec![StreamChunk::Content(
+                "FAIL deterministic fixture observed the action-only request".to_string(),
+            )],
+        ]);
+
+        let summary = fixture
+            .run_contract_with_repair_config(
+                &gateway,
+                3,
+                RepairHandoffPolicy::ConstrainedActionOnly,
+                1,
+            )
+            .await;
+        let trace = std::fs::read_to_string(&summary.trace_file).unwrap();
+        let provider_requests = trace_payloads(
+            &trace,
+            crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+        );
+
+        assert_eq!(gateway.reasoning_efforts().len(), 3);
+        assert_eq!(gateway.reasoning_efforts()[0], None);
+        assert_eq!(gateway.reasoning_efforts()[1], None);
+        assert_eq!(
+            gateway.reasoning_efforts()[2],
+            Some(ReasoningEffort::Disabled)
+        );
+        assert_eq!(provider_requests.len(), 3);
+        assert_eq!(
+            provider_requests[2]["completion"]["reasoning_effort"],
+            json!("disabled")
+        );
+        assert_eq!(
+            provider_requests[2]["harness_limits"]["effective_thinking_only_cap_source"],
+            json!("provider_disabled")
+        );
+        let action_only_request = serde_json::to_string(&provider_requests[2]).unwrap();
+        assert!(action_only_request.contains("hidden reasoning is not retained"));
+        assert!(action_only_request.contains("Do not restart analysis"));
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_action_only_scheduled\""));
+        assert!(trace.contains("\"kind\":\"agent.validation.repair_action_only_started\""));
+    }
+
+    #[tokio::test]
     async fn fixture_assembles_required_selected_and_excluded_initial_context() {
         let fixture = AgentFixture::new("Create a release note with the required format.");
         std::fs::write(
@@ -6937,6 +7083,22 @@ mod tests {
             max_iterations: usize,
             repair_handoff_policy: RepairHandoffPolicy,
         ) -> AgentRunSummary {
+            self.run_contract_with_repair_config(
+                gateway,
+                max_iterations,
+                repair_handoff_policy,
+                16_384,
+            )
+            .await
+        }
+
+        async fn run_contract_with_repair_config(
+            &self,
+            gateway: &ScriptedGateway,
+            max_iterations: usize,
+            repair_handoff_policy: RepairHandoffPolicy,
+            repair_exit_thinking_tokens: usize,
+        ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
@@ -6951,7 +7113,7 @@ mod tests {
                     expected_output_tokens: 2_048,
                     num_predict: None,
                     max_thinking_only_tokens: 2_048,
-                    repair_exit_thinking_tokens: 16_384,
+                    repair_exit_thinking_tokens,
                     repair_handoff_policy,
                     action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
@@ -7085,6 +7247,7 @@ mod tests {
         json_messages: StdMutex<Vec<Vec<LlmMessage>>>,
         tool_counts: StdMutex<Vec<usize>>,
         stream_messages: StdMutex<Vec<Vec<LlmMessage>>>,
+        reasoning_efforts: StdMutex<Vec<Option<ReasoningEffort>>>,
     }
 
     impl ScriptedGateway {
@@ -7095,6 +7258,7 @@ mod tests {
                 json_messages: StdMutex::new(Vec::new()),
                 tool_counts: StdMutex::new(Vec::new()),
                 stream_messages: StdMutex::new(Vec::new()),
+                reasoning_efforts: StdMutex::new(Vec::new()),
             }
         }
 
@@ -7105,6 +7269,7 @@ mod tests {
                 json_messages: StdMutex::new(Vec::new()),
                 tool_counts: StdMutex::new(Vec::new()),
                 stream_messages: StdMutex::new(Vec::new()),
+                reasoning_efforts: StdMutex::new(Vec::new()),
             }
         }
 
@@ -7126,6 +7291,13 @@ mod tests {
             self.json_messages
                 .lock()
                 .expect("scripted gateway JSON-message mutex poisoned")
+                .clone()
+        }
+
+        fn reasoning_efforts(&self) -> Vec<Option<ReasoningEffort>> {
+            self.reasoning_efforts
+                .lock()
+                .expect("scripted gateway reasoning-effort mutex poisoned")
                 .clone()
         }
     }
@@ -7178,7 +7350,7 @@ mod tests {
             _model: &'a str,
             _messages: &'a [LlmMessage],
             tools: Option<&'a [Box<dyn LlmTool>]>,
-            _config: &'a CompletionConfig,
+            config: &'a CompletionConfig,
         ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
         {
             self.stream_messages
@@ -7189,6 +7361,10 @@ mod tests {
                 .lock()
                 .expect("scripted gateway tool-count mutex poisoned")
                 .push(tools.map(|tools| tools.len()).unwrap_or(0));
+            self.reasoning_efforts
+                .lock()
+                .expect("scripted gateway reasoning-effort mutex poisoned")
+                .push(config.reasoning_effort);
             let chunks = self
                 .streams
                 .lock()

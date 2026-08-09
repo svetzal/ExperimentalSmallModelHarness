@@ -1227,7 +1227,7 @@ dependencies = [
 [[package]]
 name = "mojentic"
 version = "1.5.0"
-source = "git+https://github.com/svetzal/mojentic-ru.git?rev=d7ec3db5230ebb0adb471b60d12a190b631da7b1#d7ec3db5230ebb0adb471b60d12a190b631da7b1"
+source = "git+https://github.com/svetzal/mojentic-ru.git?rev=6874a3d40d5be5e95dc9561bbabfb3c10fc0abb9#6874a3d40d5be5e95dc9561bbabfb3c10fc0abb9"
 dependencies = [
  "anyhow",
  "async-stream",
