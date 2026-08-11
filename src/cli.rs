@@ -82,9 +82,10 @@ struct RunArgs {
     #[arg(long)]
     repair_exit_thinking_tokens: Option<usize>,
 
-    /// Post-failure handoff policy: text-only preserves the legacy continuation;
+    /// Action handoff policy: text-only preserves the legacy continuation;
     /// constrained ends the failed-probe turn and exposes only repair-action tools;
-    /// constrained-action-only disables model reasoning after a capped repair attempt.
+    /// constrained-action-only disables model reasoning after a capped repair attempt
+    /// or the first pre-source hidden-only no-action turn.
     #[arg(long, default_value = "text-only")]
     repair_handoff_policy: String,
 

@@ -590,6 +590,7 @@ fn is_harness_event(kind: &str) -> bool {
         || kind.starts_with("agent.stage")
         || kind.starts_with("agent.terminal")
         || kind.starts_with("agent.action_boundary")
+        || kind.starts_with("agent.pre_source_action_only")
         || kind.starts_with("agent.turn.empty")
         || kind.starts_with("agent.turn.hidden")
         || kind.starts_with("agent.contract.probes")
@@ -677,6 +678,28 @@ fn harness_summary(kind: &str, payload: &Value) -> (String, String) {
         "llm.thinking_only_stream.action_transitioned" => (
             "Thinking cap transitioned to action".to_string(),
             "The next call was constrained toward a concrete action.".to_string(),
+        ),
+        "agent.pre_source_action_only.scheduled" => (
+            "Pre-source action-only handoff scheduled".to_string(),
+            "The next outer turn will disable reasoning and expose action tools only.".to_string(),
+        ),
+        "agent.pre_source_action_only.started" => (
+            "Pre-source action-only handoff started".to_string(),
+            "Native reasoning is disabled; read and list tools are withheld.".to_string(),
+        ),
+        "agent.pre_source_action_only.completed" => (
+            "Pre-source action-only handoff completed".to_string(),
+            format!(
+                "Source mutation: {}; validation probe: {}",
+                payload
+                    .get("source_mutated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                payload
+                    .get("validation_probed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            ),
         ),
         "run.finished" => (
             "Harness finished".to_string(),

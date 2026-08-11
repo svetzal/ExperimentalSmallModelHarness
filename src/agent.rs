@@ -467,6 +467,8 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     let mut final_response_only_next_turn = false;
     let mut authoritative_constrained_repair_active = false;
     let mut repair_action_only_next_turn = false;
+    let mut pre_source_action_only_next_turn = false;
+    let mut pre_source_action_only_used = false;
     let mut requested_validation_ledger = RequestedValidationLedger::new_for_probes(
         &resolved_contract.probes,
         resolved_contract.profile.clone(),
@@ -484,9 +486,12 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             && authoritative_constrained_repair_active
             && policy_before_turn.validation_repair.is_some();
         let repair_action_only_turn = constrained_repair_turn && repair_action_only_next_turn;
+        let pre_source_action_only_turn = pre_source_action_only_next_turn;
         let mut turn_completion_config = completion_config.clone();
-        if repair_action_only_turn {
+        if repair_action_only_turn || pre_source_action_only_turn {
             turn_completion_config.reasoning_effort = Some(ReasoningEffort::Disabled);
+        }
+        if repair_action_only_turn {
             trace.event(
                 "agent.validation.repair_action_only_started",
                 serde_json::json!({
@@ -500,9 +505,24 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 }),
             )?;
         }
+        if pre_source_action_only_turn {
+            trace.event(
+                "agent.pre_source_action_only.started",
+                serde_json::json!({
+                    "turn": turn,
+                    "reasoning_effort": ReasoningEffort::Disabled,
+                    "prior_hidden_reasoning_retained": false,
+                    "retained_task_and_tool_context": true,
+                    "active_tool_names": repair_tools
+                        .iter()
+                        .map(|tool| tool.descriptor().function.name)
+                        .collect::<Vec<_>>(),
+                }),
+            )?;
+        }
         let active_tools = if final_response_only_next_turn {
             &no_tools
-        } else if constrained_repair_turn {
+        } else if constrained_repair_turn || pre_source_action_only_turn {
             &repair_tools
         } else {
             &tools
@@ -526,6 +546,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 "repair_handoff_policy": config.repair_handoff_policy,
                 "constrained_repair_turn": constrained_repair_turn,
                 "repair_action_only_turn": repair_action_only_turn,
+                "pre_source_action_only_turn": pre_source_action_only_turn,
                 "active_tool_names": active_tools
                     .iter()
                     .map(|tool| tool.descriptor().function.name)
@@ -576,6 +597,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             }
         };
         repair_action_only_next_turn = false;
+        pre_source_action_only_next_turn = false;
         final_response_only_next_turn = false;
         let repair_no_content_interrupted = turn_result.repair_no_content_interrupted;
         let action_boundary_interrupted = turn_result.action_boundary_interrupted;
@@ -622,6 +644,19 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         let wrote_this_turn =
             policy.total_write_operations > policy_before_turn.total_write_operations;
         let probed_this_turn = policy.total_shell_probes > policy_before_turn.total_shell_probes;
+        if pre_source_action_only_turn {
+            trace.event(
+                "agent.pre_source_action_only.completed",
+                serde_json::json!({
+                    "turn": turn,
+                    "assistant_content": !response.trim().is_empty(),
+                    "tool_calls_this_turn": tool_calls_this_turn,
+                    "source_mutated": wrote_this_turn,
+                    "validation_probed": probed_this_turn,
+                    "thinking_chars_this_turn": thinking_chars_this_turn,
+                }),
+            )?;
+        }
         let runtime_after_effects = scope.runtime_state_snapshot();
         let terminalize_after_validation = (!runtime_before_turn.terminal_readiness
             && runtime_after_effects.terminal_readiness
@@ -863,6 +898,11 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 continue;
             }
             if thinking_chars_this_turn > 0 && !wrote_this_turn && !probed_this_turn {
+                let schedule_pre_source_action_only =
+                    config.repair_handoff_policy.uses_action_only_retry()
+                        && !pre_source_action_only_used
+                        && policy.total_write_operations == 0
+                        && consecutive_hidden_only_no_action_turns == 1;
                 let escalation_required = consecutive_hidden_only_no_action_turns
                     >= HIDDEN_ONLY_NO_ACTION_ESCALATION_TURNS;
                 trace.event(
@@ -884,9 +924,32 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                         "probed_this_turn": probed_this_turn,
                         "consecutive_hidden_only_no_action_turns": consecutive_hidden_only_no_action_turns,
                         "escalation_required": escalation_required,
+                        "pre_source_action_only_eligible": schedule_pre_source_action_only,
                         "policy": policy,
                     }),
                 )?;
+                if schedule_pre_source_action_only {
+                    pre_source_action_only_used = true;
+                    pre_source_action_only_next_turn = true;
+                    final_summary =
+                        format!("turn {turn} scheduled a pre-source native action-only handoff");
+                    trace.event(
+                        "agent.pre_source_action_only.scheduled",
+                        serde_json::json!({
+                            "turn": turn,
+                            "next_turn": turn + 1,
+                            "prior_thinking_chars": thinking_chars_this_turn,
+                            "prior_hidden_reasoning_retained": false,
+                            "retained_task_and_tool_context": true,
+                            "next_reasoning_effort": ReasoningEffort::Disabled,
+                            "reason": "first_pre_source_hidden_only_no_action_turn",
+                        }),
+                    )?;
+                    messages.push(LlmMessage::user(pre_source_action_only_prompt(
+                        tool_calls_this_turn,
+                    )));
+                    continue;
+                }
                 if escalation_required {
                     final_summary = hidden_only_no_action_hard_failure_summary(
                         turn,
@@ -3967,6 +4030,19 @@ fn hidden_only_no_action_prompt(
     )
 }
 
+fn pre_source_action_only_prompt(tool_calls_this_turn: usize) -> String {
+    format!(
+        "Pre-source action-only handoff is active. The previous turn produced hidden reasoning \
+         but no successful source mutation or validation probe. Tool calls in that turn: \
+         {tool_calls_this_turn}. Prior hidden reasoning was not retained, but the authoritative \
+         task packet and summarized tool results remain available.\n\
+         Take exactly one concrete next step now: write or edit the source change supported by \
+         the retained evidence, run one deterministic validation or diagnostic command, or reply \
+         FAIL with a concrete blocker. Read and list tools are intentionally unavailable. Do not \
+         restate the plan or attempt broad reinspection."
+    )
+}
+
 fn action_boundary_interrupt_prompt(decision: &ActionBoundaryNoActionDecision) -> String {
     action_boundary_interrupt_prompt_text(
         &decision.interrupt,
@@ -6069,6 +6145,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn constrained_action_only_converts_first_pre_source_hidden_only_turn() {
+        let fixture = AgentFixture::new("Inspect, then implement.");
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk("list_tree", HashMap::new())],
+            vec![StreamChunk::Thinking(
+                "I should write src/lib.rs now, but I am still planning.".to_string(),
+            )],
+            vec![tool_call_chunk(
+                "write_file",
+                HashMap::from([
+                    ("path".to_string(), json!("src/lib.rs")),
+                    (
+                        "content".to_string(),
+                        json!("pub fn answer() -> u32 { 42 }\n"),
+                    ),
+                ]),
+            )],
+            vec![StreamChunk::Content(
+                "FAIL fixture stops after the source action".to_string(),
+            )],
+        ]);
+
+        let summary = fixture.run_with_pre_source_action_only(&gateway, 2).await;
+
+        assert!(fixture.workspace.join("src/lib.rs").is_file());
+        assert_eq!(
+            gateway.reasoning_efforts(),
+            vec![
+                None,
+                None,
+                Some(ReasoningEffort::Disabled),
+                Some(ReasoningEffort::Disabled),
+            ]
+        );
+        assert_eq!(gateway.tool_counts(), vec![5, 5, 3, 3]);
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        let provider_requests = trace_payloads(
+            &trace,
+            crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+        );
+        let action_request = &provider_requests[2];
+        let action_request_text = serde_json::to_string(action_request).unwrap();
+        assert_eq!(
+            action_request["completion"]["reasoning_effort"],
+            json!("disabled")
+        );
+        assert!(action_request_text.contains("Pre-source action-only handoff is active"));
+        assert!(action_request_text.contains("Inspect, then implement."));
+        let action_tool_names = action_request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            action_tool_names,
+            vec!["write_file", "edit_file", "shell_command"]
+        );
+        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.scheduled\""));
+        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.started\""));
+        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.completed\""));
+        assert!(trace.contains("\"source_mutated\":true"));
+        assert!(trace.contains("\"thinking_chars_this_turn\":0"));
+    }
+
+    #[tokio::test]
     async fn fixture_hard_stops_repeated_action_boundary_no_action() {
         let fixture = AgentFixture::new("Inspect, then implement.");
         let boundary_thinking = vec![
@@ -7149,6 +7291,39 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
                     action_boundary_interrupt_tokens: 1,
+                    transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                    initial_context_catalog_file: None,
+                    semantic_advisor_model: None,
+                },
+                gateway,
+                self.workspace.clone(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn run_with_pre_source_action_only(
+            &self,
+            gateway: &ScriptedGateway,
+            max_iterations: usize,
+        ) -> AgentRunSummary {
+            run_agent_with_gateway(
+                AgentRunConfig {
+                    experiment_dir: self.experiment.clone(),
+                    trace_dir: None,
+                    goal_file: PathBuf::from("task.md"),
+                    contract_file: None,
+                    model: "fake-model".to_string(),
+                    max_iterations,
+                    max_tool_iterations: 10,
+                    context_window_tokens: Some(131_072),
+                    packet_type: "narrow-patch".to_string(),
+                    expected_output_tokens: 2_048,
+                    num_predict: None,
+                    max_thinking_only_tokens: 2_048,
+                    repair_exit_thinking_tokens: 16_384,
+                    repair_handoff_policy: RepairHandoffPolicy::ConstrainedActionOnly,
+                    action_boundary_interrupt_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,

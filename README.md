@@ -174,10 +174,14 @@ The `constrained-action-only` variant keeps that first bounded repair request.
 If the request reaches its repair thinking cap without an action, the following
 request uses Ollama's native `think=false` control, retains the authoritative
 failure packet and restricted repair tools, and explicitly states that the
-interrupted hidden reasoning was not retained. Its provider snapshot records
-`reasoning_effort: disabled`, `thinking_disabled: true`, and the effective cap
-source `provider_disabled`. The ordinary `constrained` variant still retries
-with thinking enabled.
+interrupted hidden reasoning was not retained. The same opt-in policy schedules
+one native action-only outer turn after the first pre-source hidden-only
+no-action turn. Every request in that turn retains the task and summarized tool
+context while exposing only write, edit, shell, and any declared-probe tools;
+it cannot continue broad read/list inspection. Its provider snapshot records `reasoning_effort:
+disabled`, `thinking_disabled: true`, and the effective cap source
+`provider_disabled`. The ordinary `constrained` variant still retries with
+thinking enabled.
 
 Every `llm.provider_request.assembled` snapshot records the harness-side
 thinking limits that govern that request. The `harness_limits` object includes
