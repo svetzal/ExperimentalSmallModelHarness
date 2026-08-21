@@ -13,6 +13,11 @@ separates two complementary views of every model call:
 Neither event replaces the other. The ledger supports bounded statistical
 analysis; the exact snapshot supports causal and forensic review.
 
+Provider responses have a separate fidelity surface. A final non-empty tool
+batch emits one aggregate `llm.stream.tool_calls_completed` event followed by
+one `llm.response.tool_call.normalized` event per response call. Stream progress
+frames do not create executable tool calls.
+
 ## Provider-bound request snapshots
 
 Immediately before each worker provider call, the harness emits:
@@ -47,6 +52,42 @@ immediately before `complete_stream`. A rejected call therefore has a ledger
 but no provider-request snapshot. A provider call that was actually attempted
 must have both.
 
+## Provider response tool calls
+
+Every call in a final provider tool batch receives a normalized record:
+
+```json
+{
+  "kind": "llm.response.tool_call.normalized",
+  "payload": {
+    "schema_version": "response_tool_call.v1",
+    "turn": 1,
+    "llm_call_depth": 2,
+    "response_index": 0,
+    "response_tool_call_count": 3,
+    "tool_call_id": "call-0",
+    "tool_name": "read_file",
+    "argument_keys": ["path"],
+    "arguments_json": "{\"path\":\"src/lib.rs\"}",
+    "arguments_preview": "{\"path\":\"src/lib.rs\"}",
+    "arguments_complete": true,
+    "arguments_json_chars": 21,
+    "arguments_sha256": "..."
+  }
+}
+```
+
+Canonical argument JSON is retained in full through 4,096 characters. Larger
+arguments retain their keys, bounded preview, exact character count, and full
+SHA-256 while `arguments_json` is null. This keeps ordinary read paths exact
+without duplicating an arbitrarily large whole-file write into the trace.
+
+These are response records, not tool-effect records. A hard stop can leave
+later response calls unexecuted; their normalized records still show what the
+gateway returned. `analyze-trace` compares the aggregate final batch counts
+with per-call records and reports `response_tool_call_trace_complete` as false
+for a partial response trace.
+
 ## Call chronology
 
 The normal causal order is:
@@ -55,10 +96,11 @@ The normal causal order is:
 2. progress projection and initial progress status
 3. `llm.provider_request.assembled`
 4. streamed reasoning, content, tool-call progress, and provider metrics
-5. `llm.context_assembly.response`
-6. assistant tool request and tool-result retention events
-7. deterministic tool, validation, and harness-policy events
-8. the next context ledger and provider-request snapshot
+5. final tool-batch aggregate and normalized per-call response records
+6. `llm.context_assembly.response`
+7. assistant tool request and tool-result retention events
+8. deterministic tool, validation, and harness-policy events
+9. the next context ledger and provider-request snapshot
 
 Turn is the outer harness iteration. LLM call depth is the zero-based provider
 call within that turn. Tool results normally increase depth without advancing
@@ -85,6 +127,11 @@ Before attributing a failure to model capability:
 analysis only when every context-ledger call has a corresponding snapshot.
 Legacy traces remain analyzable, but missing prompt text must not be inferred
 from component sizes or policy-event summaries.
+
+For response batching claims, also require
+`response_tool_call_trace_complete=true`. Compare
+`reported_response_tool_call_count`, `normalized_response_tool_call_count`, and
+`max_response_tool_call_batch_size` before interpreting executed tool effects.
 
 ## Data handling
 

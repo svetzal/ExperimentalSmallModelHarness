@@ -12,6 +12,7 @@ use mojentic::llm::models::{LlmMessage, LlmToolCall, MessageRole};
 use mojentic::llm::tools::{LlmTool, ToolRunCtx};
 use mojentic::llm::{CompletionConfig, LlmGateway};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,6 +44,7 @@ const DEFAULT_REPAIR_EXIT_THINKING_TOKENS: usize = 16_384;
 const ACTION_BOUNDARY_INTENT_HIT_LIMIT: usize = 2;
 const ACTION_BOUNDARY_INTENT_BUFFER_CHARS: usize = 4_096;
 const ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS: usize = 512;
+const RESPONSE_TOOL_CALL_ARGUMENT_MAX_CHARS: usize = 4_096;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -2103,7 +2105,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     latest_progress_state = ModelProgressState::GeneratingToolCall;
                     no_content_segment_eval_count = 0;
                     trace.event(
-                        "llm.stream.tool_calls_completed",
+                        crate::runtime_events::LLM_STREAM_TOOL_CALLS_COMPLETED,
                         serde_json::json!({
                             "turn": turn,
                             "llm_call_depth": depth,
@@ -2111,6 +2113,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                             "tool_call_names": tool_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
                         }),
                     )?;
+                    trace_response_tool_calls(trace, turn, depth, &tool_calls)?;
                     accumulated_tool_calls = tool_calls;
                 }
                 Ok(StreamChunk::Thinking(thinking)) => {
@@ -3920,6 +3923,48 @@ fn successful_validation_from_tool_result(
 
 fn limit_preview(content: &str, max_chars: usize) -> String {
     content.chars().take(max_chars).collect()
+}
+
+fn trace_response_tool_calls(
+    trace: &TraceRecorder,
+    turn: usize,
+    llm_call_depth: usize,
+    tool_calls: &[LlmToolCall],
+) -> Result<()> {
+    for (response_index, call) in tool_calls.iter().enumerate() {
+        let canonical_arguments = call
+            .arguments
+            .iter()
+            .collect::<BTreeMap<&String, &serde_json::Value>>();
+        let arguments_json = serde_json::to_string(&canonical_arguments)?;
+        let arguments_complete =
+            arguments_json.chars().count() <= RESPONSE_TOOL_CALL_ARGUMENT_MAX_CHARS;
+        trace.event(
+            crate::runtime_events::LLM_RESPONSE_TOOL_CALL_NORMALIZED,
+            serde_json::json!({
+                "schema_version": "response_tool_call.v1",
+                "turn": turn,
+                "llm_call_depth": llm_call_depth,
+                "response_index": response_index,
+                "response_tool_call_count": tool_calls.len(),
+                "tool_call_id": &call.id,
+                "tool_name": &call.name,
+                "argument_keys": canonical_arguments.keys().copied().collect::<Vec<_>>(),
+                "arguments_json": arguments_complete.then_some(arguments_json.as_str()),
+                "arguments_preview": limit_preview(
+                    &arguments_json,
+                    RESPONSE_TOOL_CALL_ARGUMENT_MAX_CHARS,
+                ),
+                "arguments_complete": arguments_complete,
+                "arguments_json_chars": arguments_json.chars().count(),
+                "arguments_sha256": format!(
+                    "{:x}",
+                    Sha256::digest(arguments_json.as_bytes())
+                ),
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 fn context_snapshot(
@@ -6217,6 +6262,125 @@ mod tests {
         assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.completed\""));
         assert!(trace.contains("\"source_mutated\":true"));
         assert!(trace.contains("\"thinking_chars_this_turn\":0"));
+    }
+
+    #[tokio::test]
+    async fn progress_frame_counts_do_not_inflate_final_tool_call_batch() {
+        let fixture = AgentFixture::new("Inspect one file, then finish.");
+        std::fs::write(fixture.workspace.join("one.txt"), "one\n").unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![
+                StreamChunk::Progress(stream_progress(1, 0, 1, 1)),
+                StreamChunk::Progress(stream_progress(2, 0, 1, 535)),
+                tool_call_chunk(
+                    "read_file",
+                    HashMap::from([("path".to_string(), json!("one.txt"))]),
+                ),
+            ],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 2).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        let normalized = trace_payloads(&trace, "llm.response.tool_call.normalized");
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0]["response_index"], json!(0));
+        assert_eq!(normalized[0]["response_tool_call_count"], json!(1));
+        assert_eq!(normalized[0]["tool_name"], json!("read_file"));
+        assert_eq!(
+            normalized[0]["arguments_json"],
+            json!(r#"{"path":"one.txt"}"#)
+        );
+        assert_eq!(trace_payloads(&trace, "tool.read_file").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn normalized_response_trace_preserves_each_batched_call_identity() {
+        let fixture = AgentFixture::new("Inspect the scoped files, then finish.");
+        for name in ["one.txt", "two.txt", "three.txt"] {
+            std::fs::write(fixture.workspace.join(name), format!("{name}\n")).unwrap();
+        }
+        let calls = ["one.txt", "two.txt", "three.txt"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| LlmToolCall {
+                id: Some(format!("call-{index}")),
+                name: "read_file".to_string(),
+                arguments: HashMap::from([("path".to_string(), json!(path))]),
+            })
+            .collect::<Vec<_>>();
+        let gateway = ScriptedGateway::new(vec![
+            vec![StreamChunk::ToolCalls(calls)],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 2).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        let normalized = trace_payloads(&trace, "llm.response.tool_call.normalized");
+        assert_eq!(normalized.len(), 3);
+        for (index, path) in ["one.txt", "two.txt", "three.txt"].into_iter().enumerate() {
+            assert_eq!(normalized[index]["response_index"], json!(index));
+            assert_eq!(normalized[index]["response_tool_call_count"], json!(3));
+            assert_eq!(
+                normalized[index]["tool_call_id"],
+                json!(format!("call-{index}"))
+            );
+            assert_eq!(
+                normalized[index]["arguments_json"],
+                json!(format!(r#"{{"path":"{path}"}}"#))
+            );
+            assert_eq!(normalized[index]["arguments_complete"], json!(true));
+            assert_eq!(
+                normalized[index]["arguments_sha256"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                64
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn normalized_response_trace_bounds_large_arguments_with_full_hash() {
+        let fixture = AgentFixture::new("Write the requested artifact, then finish.");
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "write_file",
+                HashMap::from([
+                    ("path".to_string(), json!("artifact.txt")),
+                    (
+                        "content".to_string(),
+                        json!("x".repeat(RESPONSE_TOOL_CALL_ARGUMENT_MAX_CHARS + 1_000)),
+                    ),
+                ]),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run(&gateway, 2).await;
+
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        let normalized = trace_payloads(&trace, "llm.response.tool_call.normalized");
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0]["arguments_complete"], json!(false));
+        assert_eq!(normalized[0]["arguments_json"], Value::Null);
+        assert_eq!(
+            normalized[0]["arguments_preview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            RESPONSE_TOOL_CALL_ARGUMENT_MAX_CHARS
+        );
+        assert_eq!(
+            normalized[0]["arguments_sha256"].as_str().unwrap().len(),
+            64
+        );
+        assert!(fixture.workspace.join("artifact.txt").is_file());
     }
 
     #[tokio::test]

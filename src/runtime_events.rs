@@ -335,6 +335,17 @@ pub const LLM_NO_CONTENT_STREAM_HARD_FAILED: &str = "llm.no_content_stream.hard_
 /// fidelity surface used to reconstruct what the model actually received.
 pub const LLM_PROVIDER_REQUEST_ASSEMBLED: &str = "llm.provider_request.assembled";
 
+/// Emitted once for every tool call in the final provider response batch.
+/// The payload preserves response index, call identity, tool name, bounded
+/// canonical arguments, and a full-argument hash. This is response evidence,
+/// not a tool effect; calls may remain unexecuted if policy stops the batch.
+pub const LLM_RESPONSE_TOOL_CALL_NORMALIZED: &str = "llm.response.tool_call.normalized";
+
+/// Emitted once when a provider response finishes with a non-empty tool-call
+/// batch. Its aggregate count can be compared with normalized per-call events
+/// to detect incomplete response evidence.
+pub const LLM_STREAM_TOOL_CALLS_COMPLETED: &str = "llm.stream.tool_calls_completed";
+
 /// Additive, documented-only event: **not currently emitted by the
 /// runtime**. Reserved for an explicit operator-initiated stop (as opposed
 /// to a runtime-detected hard-stop). Payload fields: `reason` (optional

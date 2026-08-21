@@ -54,6 +54,19 @@ pub struct TraceAnalysis {
     /// True when every context-ledger call has a corresponding exact request
     /// snapshot. False for legacy or partially written traces.
     pub provider_request_trace_complete: bool,
+    /// Number of final non-empty provider response tool-call batches.
+    pub response_tool_call_batch_count: usize,
+    /// Aggregate call count reported by final provider response batches.
+    pub reported_response_tool_call_count: usize,
+    /// Per-call normalized response records retained in the trace.
+    pub normalized_response_tool_call_count: usize,
+    /// Largest final tool-call batch reported by one provider response.
+    pub max_response_tool_call_batch_size: usize,
+    /// Normalized calls whose canonical arguments exceeded the trace bound.
+    pub truncated_response_tool_call_argument_count: usize,
+    /// Whether aggregate and normalized call counts agree. `None` means the
+    /// trace contains no non-empty final response batch to assess.
+    pub response_tool_call_trace_complete: Option<bool>,
     pub max_llm_call_estimated_tokens: usize,
     pub max_llm_call_utilization: Option<f64>,
     pub max_pressure_band: String,
@@ -573,6 +586,24 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
             events::LLM_PROVIDER_REQUEST_ASSEMBLED => {
                 analysis.provider_request_snapshot_count += 1;
             }
+            events::LLM_STREAM_TOOL_CALLS_COMPLETED => {
+                let count = payload["tool_call_count"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or_default();
+                analysis.response_tool_call_batch_count += 1;
+                analysis.reported_response_tool_call_count = analysis
+                    .reported_response_tool_call_count
+                    .saturating_add(count);
+                analysis.max_response_tool_call_batch_size =
+                    analysis.max_response_tool_call_batch_size.max(count);
+            }
+            events::LLM_RESPONSE_TOOL_CALL_NORMALIZED => {
+                analysis.normalized_response_tool_call_count += 1;
+                if payload["arguments_complete"].as_bool() == Some(false) {
+                    analysis.truncated_response_tool_call_argument_count += 1;
+                }
+            }
             "llm.stream.progress" => {
                 analysis.stream_progress_events += 1;
             }
@@ -600,6 +631,12 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
         .map(|(first, last)| (last - first).num_milliseconds() as f64 / 1000.0);
     analysis.provider_request_trace_complete = analysis.llm_call_count > 0
         && analysis.provider_request_snapshot_count == analysis.llm_call_count;
+    analysis.response_tool_call_trace_complete = (analysis.response_tool_call_batch_count > 0
+        || analysis.normalized_response_tool_call_count > 0)
+        .then_some(
+            analysis.reported_response_tool_call_count
+                == analysis.normalized_response_tool_call_count,
+        );
     analysis.outcome = classify_outcome(
         &analysis,
         saw_action_boundary_hard_failed,
@@ -986,6 +1023,32 @@ mod tests {
         assert_eq!(analysis.runtime_seconds, Some(6.0));
         assert_eq!(analysis.outcome, RunOutcome::Finished);
         assert!(analysis.harness_source_state.is_none());
+    }
+
+    #[test]
+    fn analyzes_normalized_response_tool_call_coverage_and_batch_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-response-tools.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-08-21T00:00:00Z","kind":"run.started","payload":{"model":"worker"}}
+{"timestamp":"2026-08-21T00:00:01Z","kind":"llm.stream.tool_calls_completed","payload":{"tool_call_count":3}}
+{"timestamp":"2026-08-21T00:00:01Z","kind":"llm.response.tool_call.normalized","payload":{"response_index":0,"arguments_complete":true}}
+{"timestamp":"2026-08-21T00:00:01Z","kind":"llm.response.tool_call.normalized","payload":{"response_index":1,"arguments_complete":false}}
+{"timestamp":"2026-08-21T00:00:01Z","kind":"llm.response.tool_call.normalized","payload":{"response_index":2,"arguments_complete":true}}
+{"timestamp":"2026-08-21T00:00:02Z","kind":"run.finished","payload":{"final_summary":"DONE"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert_eq!(analysis.response_tool_call_batch_count, 1);
+        assert_eq!(analysis.reported_response_tool_call_count, 3);
+        assert_eq!(analysis.normalized_response_tool_call_count, 3);
+        assert_eq!(analysis.max_response_tool_call_batch_size, 3);
+        assert_eq!(analysis.truncated_response_tool_call_argument_count, 1);
+        assert_eq!(analysis.response_tool_call_trace_complete, Some(true));
     }
 
     #[test]

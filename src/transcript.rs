@@ -91,6 +91,7 @@ struct ModelCall {
     assistant_reported_chars: usize,
     assistant_complete: bool,
     response: Value,
+    response_tool_calls: Vec<Value>,
     tools: Vec<ToolCard>,
     harness: Vec<EventCard>,
 }
@@ -290,6 +291,7 @@ fn parse_session(path: &Path) -> Result<Option<Session>> {
                     assistant_reported_chars: 0,
                     assistant_complete: true,
                     response: Value::Null,
+                    response_tool_calls: Vec::new(),
                     tools: Vec::new(),
                     harness: Vec::new(),
                 };
@@ -329,6 +331,16 @@ fn parse_session(path: &Path) -> Result<Option<Session>> {
             "llm.context_assembly.response" => {
                 if let Some(index) = current_call {
                     calls[index].response = record.payload.clone();
+                }
+            }
+            crate::runtime_events::LLM_RESPONSE_TOOL_CALL_NORMALIZED => {
+                if let Some(index) = current_call
+                    && value_usize(&record.payload, "turn") == calls[index].turn
+                    && value_usize(&record.payload, "llm_call_depth") == calls[index].depth
+                {
+                    calls[index]
+                        .response_tool_calls
+                        .push(record.payload.clone());
                 }
             }
             "agent.turn.finished" => {
@@ -791,6 +803,7 @@ mod tests {
             json!({"timestamp":"2026-01-01T00:00:01Z","kind":"llm.context_assembly.ledger","payload":{"turn":1,"llm_call_depth":0,"utilization":0.1}}),
             json!({"timestamp":"2026-01-01T00:00:01Z","kind":"llm.provider_request.assembled","payload":{"turn":1,"llm_call_depth":0,"messages":[{"role":"system","content":"system"},{"role":"user","content":"task"}],"tools":[],"completion":{}}}),
             json!({"timestamp":"2026-01-01T00:00:02Z","kind":"llm.stream.thinking","payload":{"preview":"inspect","chars":7}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","kind":"llm.response.tool_call.normalized","payload":{"schema_version":"response_tool_call.v1","turn":1,"llm_call_depth":0,"response_index":0,"response_tool_call_count":1,"tool_call_id":"call-0","tool_name":"read_file","arguments_json":"{\"path\":\"src/lib.rs\"}","arguments_complete":true}}),
             json!({"timestamp":"2026-01-01T00:00:03Z","kind":"tool.list_tree","payload":{"entry_count":0}}),
             json!({"timestamp":"2026-01-01T00:00:04Z","kind":"llm.context_assembly.ledger","payload":{"turn":1,"llm_call_depth":1,"utilization":0.2}}),
             json!({"timestamp":"2026-01-01T00:00:04Z","kind":"llm.provider_request.assembled","payload":{"turn":1,"llm_call_depth":1,"messages":[{"role":"system","content":"system"},{"role":"user","content":"task"},{"role":"tool","content":"empty"}],"tools":[],"completion":{}}}),
@@ -830,6 +843,8 @@ mod tests {
         assert!(html.contains("\\/script>"));
         assert!(html.contains("\"continuity\":\"retained\""));
         assert!(html.contains("\"continuity\":\"new\""));
+        assert!(html.contains("\"response_tool_calls\":[{"));
+        assert!(html.contains("src/lib.rs"));
         assert!(html.contains("\"title\":\"Harness stopped\""));
         assert!(html.contains("\"severity\":\"danger\""));
         assert!(!html.contains("<script src="));

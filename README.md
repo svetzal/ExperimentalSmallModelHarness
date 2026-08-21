@@ -219,8 +219,11 @@ cargo run -- render-transcript traces/ \
 
 The report presents exact provider input, streamed reasoning and assistant
 text, tool effects, harness decisions, and context measurements as one causal
-timeline. It recursively discovers harness JSONL traces while ignoring other
-JSONL files that do not contain a `run.started` event.
+timeline. Final response tool-call batches include each normalized call's
+response index, provider call ID, tool name, bounded canonical arguments, and
+full-argument hash, including calls policy stopped before execution. It
+recursively discovers harness JSONL traces while ignoring other JSONL files
+that do not contain a `run.started` event.
 
 Independent verification is optional and harness-neutral. Supply a
 `transcript_evidence.v1` JSON file with `--evidence`; entries match sessions by
@@ -243,6 +246,12 @@ complete, allowing legacy or truncated traces to be identified before drawing
 context-sensitive conclusions. Harness hard stops take precedence over earlier
 incidental validation success in both analyzer outcomes and transcript status
 cards.
+
+Response-side tool-call coverage is measured separately from request coverage.
+`analyze-trace` reports batch count, aggregate and normalized call counts,
+largest batch, bounded-argument truncations, and whether per-call response
+evidence is complete. Stream progress counts remain progress evidence only;
+they never create executable calls in the Harness.
 
 Experiments are intentionally run from separate, scoped workspaces. Generated
 agents should see their work tree and task-relevant guidance, not experiment
