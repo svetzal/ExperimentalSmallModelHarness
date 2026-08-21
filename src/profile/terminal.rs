@@ -57,12 +57,6 @@ impl DomainProfile for TerminalWorkProfile {
         "After a focused repair, rerun the failed check before making another edit."
     }
 
-    fn recognizes_probe(&self, command: &str) -> bool {
-        !command.trim().is_empty()
-            && !self.is_inspection_shell_command(command)
-            && !self.is_known_shell_mutation_command(command)
-    }
-
     fn command_family(&self, command: &str) -> String {
         command
             .split_whitespace()
@@ -81,14 +75,6 @@ impl DomainProfile for TerminalWorkProfile {
 
     fn is_ignored_dir(&self, dir_name: &str) -> bool {
         crate::profile::coding::is_ignored_dir(dir_name)
-    }
-
-    fn is_inspection_shell_command(&self, command: &str) -> bool {
-        crate::profile::coding::is_inspection_shell_command(command)
-    }
-
-    fn is_known_shell_mutation_command(&self, command: &str) -> bool {
-        crate::profile::coding::is_known_shell_mutation_command(command)
     }
 
     fn failure_details(&self, stderr: &str, stdout: &str) -> Vec<String> {
@@ -151,15 +137,6 @@ mod tests {
                 .tool_capabilities()
                 .contains(&ToolCapability::ExecuteProbe)
         );
-    }
-
-    #[test]
-    fn generic_checks_are_probes_but_inspections_and_mutations_are_not() {
-        let profile = TerminalWorkProfile;
-        assert!(profile.recognizes_probe("./verify-result"));
-        assert!(profile.recognizes_probe("curl -fsS http://localhost:8080/health"));
-        assert!(!profile.recognizes_probe("cat output.txt"));
-        assert!(!profile.recognizes_probe("printf value > output.txt"));
     }
 
     #[test]

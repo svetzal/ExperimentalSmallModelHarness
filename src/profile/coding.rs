@@ -56,10 +56,6 @@ impl DomainProfile for CodingProfile {
         REPAIR_LADDER_SUFFIX
     }
 
-    fn recognizes_probe(&self, command: &str) -> bool {
-        is_validation_probe(command)
-    }
-
     fn command_family(&self, command: &str) -> String {
         command_family(command)
     }
@@ -74,14 +70,6 @@ impl DomainProfile for CodingProfile {
 
     fn is_ignored_dir(&self, dir_name: &str) -> bool {
         is_ignored_dir(dir_name)
-    }
-
-    fn is_inspection_shell_command(&self, command: &str) -> bool {
-        is_inspection_shell_command(command)
-    }
-
-    fn is_known_shell_mutation_command(&self, command: &str) -> bool {
-        is_known_shell_mutation_command(command)
     }
 
     fn failure_details(&self, stderr: &str, stdout: &str) -> Vec<String> {
@@ -184,56 +172,8 @@ pub(crate) const REPAIR_LADDER_SUFFIX: &str = "If you edit, run the validation l
 pub(crate) const ACTION_INTENT_PHRASES: &[&str] = &["run cargo"];
 
 // ---------------------------------------------------------------------
-// Validation-probe recognition and command-family normalization. Moved
-// verbatim from `tools.rs` / `agent.rs`.
+// Command-family normalization retained for trace and repair bookkeeping.
 // ---------------------------------------------------------------------
-
-/// Moved from `tools.rs::is_validation_probe`.
-pub(crate) fn is_validation_probe(command: &str) -> bool {
-    let lowered = command_detection_text(command).to_ascii_lowercase();
-    let trimmed = lowered.trim();
-    if trimmed.starts_with("echo ")
-        || trimmed == "pwd"
-        || trimmed.starts_with("pwd ")
-        || trimmed.starts_with("ls ")
-        || trimmed == "ls"
-        || trimmed.starts_with("cat ")
-        || trimmed.starts_with("sed ")
-        || trimmed.starts_with("rg ")
-        || trimmed.starts_with("grep ")
-        || trimmed.starts_with("find ")
-        || trimmed.starts_with("head ")
-        || trimmed.starts_with("tail ")
-    {
-        return false;
-    }
-
-    [
-        "cargo build",
-        "cargo check",
-        "cargo test",
-        "cargo run",
-        "cargo clippy",
-        "cargo fmt",
-        "npm test",
-        "npm run",
-        "pnpm test",
-        "pnpm run",
-        "yarn test",
-        "yarn run",
-        "pytest",
-        "python -m pytest",
-        "go test",
-        "make test",
-        "make check",
-        "make build",
-        "mvn test",
-        "gradle test",
-        "./gradlew test",
-    ]
-    .iter()
-    .any(|needle| trimmed.contains(needle))
-}
 
 /// Moved from `tools.rs::command_family`.
 pub(crate) fn command_family(command: &str) -> String {
@@ -397,59 +337,6 @@ fn push_unique_detail(details: &mut Vec<String>, detail: &str) {
     if !trimmed.is_empty() && !details.iter().any(|existing| existing == trimmed) {
         details.push(trimmed.to_string());
     }
-}
-
-// ---------------------------------------------------------------------
-// Shell-mutation / inspection classification. Moved verbatim from
-// `tools.rs` / `agent.rs`.
-// ---------------------------------------------------------------------
-
-/// Moved from `tools.rs::is_known_shell_mutation_command`.
-pub(crate) fn is_known_shell_mutation_command(command: &str) -> bool {
-    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lowered = normalized.to_ascii_lowercase();
-    if lowered.contains("sed -i")
-        || lowered.contains("perl -i")
-        || has_in_place_flag(&lowered, "perl")
-        || lowered.contains("ruby -i")
-        || has_in_place_flag(&lowered, "ruby")
-        || lowered.contains("python -i")
-    {
-        return true;
-    }
-
-    let redirection_mutation = [" > ", " 1> ", " >> ", " 1>> "]
-        .iter()
-        .any(|needle| lowered.contains(needle));
-    let file_write_call = (lowered.contains("python ") || lowered.contains("python3 "))
-        && (lowered.contains(".write(")
-            || lowered.contains("write_text(")
-            || lowered.contains("open(")
-                && (lowered.contains(", 'w'") || lowered.contains(", \"w\"")));
-
-    redirection_mutation || file_write_call
-}
-
-fn has_in_place_flag(command: &str, program: &str) -> bool {
-    let tokens = command.split_whitespace().collect::<Vec<_>>();
-    tokens.windows(2).any(|window| {
-        window[0] == program
-            && window[1].starts_with('-')
-            && window[1].chars().skip(1).any(|flag| flag == 'i')
-    })
-}
-
-/// Moved from `agent.rs::is_inspection_shell_command`.
-pub(crate) fn is_inspection_shell_command(command: &str) -> bool {
-    let trimmed = command.trim().to_ascii_lowercase();
-    if trimmed.is_empty() || trimmed.contains("cargo ") || trimmed.contains("npm ") {
-        return false;
-    }
-    [
-        "cat ", "sed ", "head ", "tail ", "rg ", "grep ", "find ", "ls ", "wc ", "pwd",
-    ]
-    .iter()
-    .any(|prefix| trimmed == prefix.trim() || trimmed.starts_with(prefix))
 }
 
 /// Moved from `agent.rs`/`tools.rs`: the two divergent copies of
@@ -756,18 +643,6 @@ mod tests {
         assert_eq!(system_prompt(), fixture("system.txt"));
         assert_eq!(run_prompt(SAMPLE_GOAL), run_prompt(SAMPLE_GOAL));
         assert_eq!(run_prompt(SAMPLE_GOAL), fixture("run.txt"));
-    }
-
-    #[test]
-    fn recognizes_cargo_and_pytest_probes() {
-        assert!(is_validation_probe("cargo check 2>&1 | tail -30"));
-        assert!(is_validation_probe("cargo run -- --simulate 600"));
-        assert!(is_validation_probe("pytest tests"));
-        assert!(!is_validation_probe("echo \"test\""));
-        assert!(!is_validation_probe("pwd && ls -la"));
-        assert!(!is_validation_probe(
-            "tee README.md << 'EOF'\n```sh\ncargo test\n```\nEOF"
-        ));
     }
 
     #[test]

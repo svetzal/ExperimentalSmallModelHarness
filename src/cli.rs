@@ -85,7 +85,8 @@ struct RunArgs {
     /// Action handoff policy: text-only preserves the legacy continuation;
     /// constrained ends the failed-probe turn and exposes only repair-action tools;
     /// constrained-action-only disables model reasoning after a capped repair attempt
-    /// or the first pre-source hidden-only no-action turn.
+    /// or the first pre-source hidden-only no-action turn, withholding arbitrary shell
+    /// during the native action-only request.
     #[arg(long, default_value = "text-only")]
     repair_handoff_policy: String,
 

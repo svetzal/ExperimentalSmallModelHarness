@@ -418,6 +418,16 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         })
         .map(|tool| tool.clone_box())
         .collect::<Vec<_>>();
+    let action_only_tools = tools
+        .iter()
+        .filter(|tool| {
+            matches!(
+                tool.descriptor().function.name.as_str(),
+                "edit_file" | "write_file" | "execute_probe"
+            )
+        })
+        .map(|tool| tool.clone_box())
+        .collect::<Vec<_>>();
     let worker_message = worker_message_with_declared_probes(
         &initial_context.worker_message,
         &resolved_contract.probes,
@@ -498,7 +508,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                     "turn": turn,
                     "reasoning_effort": ReasoningEffort::Disabled,
                     "prior_hidden_reasoning_retained": false,
-                    "active_tool_names": repair_tools
+                    "active_tool_names": action_only_tools
                         .iter()
                         .map(|tool| tool.descriptor().function.name)
                         .collect::<Vec<_>>(),
@@ -513,7 +523,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                     "reasoning_effort": ReasoningEffort::Disabled,
                     "prior_hidden_reasoning_retained": false,
                     "retained_task_and_tool_context": true,
-                    "active_tool_names": repair_tools
+                    "active_tool_names": action_only_tools
                         .iter()
                         .map(|tool| tool.descriptor().function.name)
                         .collect::<Vec<_>>(),
@@ -522,7 +532,9 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         }
         let active_tools = if final_response_only_next_turn {
             &no_tools
-        } else if constrained_repair_turn || pre_source_action_only_turn {
+        } else if repair_action_only_turn || pre_source_action_only_turn {
+            &action_only_tools
+        } else if constrained_repair_turn {
             &repair_tools
         } else {
             &tools
@@ -584,6 +596,19 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         {
             Ok(turn_result) => turn_result,
             Err(error) => {
+                if pre_source_action_only_turn {
+                    let policy = scope.policy_snapshot();
+                    let _ = trace.event(
+                        "agent.pre_source_action_only.aborted",
+                        serde_json::json!({
+                            "turn": turn,
+                            "reason": error.to_string(),
+                            "tool_calls_this_turn": policy.total_tool_calls.saturating_sub(policy_before_turn.total_tool_calls),
+                            "source_mutated": policy.total_write_operations > policy_before_turn.total_write_operations,
+                            "validation_probed": policy.total_shell_probes > policy_before_turn.total_shell_probes,
+                        }),
+                    );
+                }
                 let _ = trace_run_failed(
                     &trace,
                     "agent.stream",
@@ -2808,7 +2833,7 @@ impl InspectionLoopTracker {
             return None;
         }
 
-        let signature = inspection_signature(call, profile)?;
+        let signature = inspection_signature(call)?;
         let event = crate::runtime::RuntimeEvent::Inspection {
             signature: signature.clone(),
         };
@@ -3773,10 +3798,7 @@ fn push_bounded_buffer(buffer: &mut String, chunk: &str, max_chars: usize) {
     buffer.drain(..start);
 }
 
-fn inspection_signature(
-    call: &LlmToolCall,
-    profile: &dyn crate::profile::DomainProfile,
-) -> Option<String> {
+fn inspection_signature(call: &LlmToolCall) -> Option<String> {
     match call.name.as_str() {
         "read_file" => {
             let path = call.arguments.get("path")?.as_str()?.trim();
@@ -3793,12 +3815,6 @@ fn inspection_signature(
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "*".to_string());
             Some(format!("read_file:{path}:{line_start}-{line_end}"))
-        }
-        "shell_command" => {
-            let command = call.arguments.get("command")?.as_str()?;
-            profile
-                .is_inspection_shell_command(command)
-                .then(|| format!("shell_command:{}", normalize_shell_command(command)))
         }
         _ => None,
     }
@@ -3900,10 +3916,6 @@ fn successful_validation_from_tool_result(
         total_shell_probes: 0,
         total_write_operations: 0,
     })
-}
-
-fn normalize_shell_command(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn limit_preview(content: &str, max_chars: usize) -> String {
@@ -4037,8 +4049,8 @@ fn pre_source_action_only_prompt(tool_calls_this_turn: usize) -> String {
          {tool_calls_this_turn}. Prior hidden reasoning was not retained, but the authoritative \
          task packet and summarized tool results remain available.\n\
          Take exactly one concrete next step now: write or edit the source change supported by \
-         the retained evidence, run one deterministic validation or diagnostic command, or reply \
-         FAIL with a concrete blocker. Read and list tools are intentionally unavailable. Do not \
+         the retained evidence, invoke one available declared probe, or reply FAIL with a concrete \
+         blocker. Read, list, and arbitrary shell tools are intentionally unavailable. Do not \
          restate the plan or attempt broad reinspection."
     )
 }
@@ -6179,7 +6191,7 @@ mod tests {
                 Some(ReasoningEffort::Disabled),
             ]
         );
-        assert_eq!(gateway.tool_counts(), vec![5, 5, 3, 3]);
+        assert_eq!(gateway.tool_counts(), vec![5, 5, 2, 2]);
         let trace = std::fs::read_to_string(summary.trace_file).unwrap();
         let provider_requests = trace_payloads(
             &trace,
@@ -6199,15 +6211,40 @@ mod tests {
             .iter()
             .map(|tool| tool["function"]["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(
-            action_tool_names,
-            vec!["write_file", "edit_file", "shell_command"]
-        );
+        assert_eq!(action_tool_names, vec!["write_file", "edit_file"]);
         assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.scheduled\""));
         assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.started\""));
         assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.completed\""));
         assert!(trace.contains("\"source_mutated\":true"));
         assert!(trace.contains("\"thinking_chars_this_turn\":0"));
+    }
+
+    #[tokio::test]
+    async fn pre_source_action_only_closes_lifecycle_when_stream_fails() {
+        let fixture = AgentFixture::new("Implement the requested source change.");
+        let gateway = ScriptedGateway::new(vec![vec![StreamChunk::Thinking(
+            "I should write src/lib.rs now, but I am still planning.".to_string(),
+        )]])
+        .failing_on_stream_call(2);
+
+        let error = fixture
+            .try_run_with_pre_source_action_only(&gateway, 2)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("scripted stream failure"), "{error}");
+        let trace_path = std::fs::read_dir(fixture.experiment.join("traces"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+            .expect("one trace file");
+        let trace = std::fs::read_to_string(trace_path).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.scheduled\""));
+        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.started\""));
+        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.aborted\""));
+        assert!(!trace.contains("\"kind\":\"agent.pre_source_action_only.completed\""));
+        assert!(trace.contains("\"kind\":\"run.failed\""));
     }
 
     #[tokio::test]
@@ -6239,13 +6276,15 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_accepts_done_after_docs_only_write_following_validation() {
-        let fixture = AgentFixture::new("Validate, write a README, and finish.");
+        let fixture = AgentFixture::new(
+            "Validate, write a README, and finish.\n\n```sh\n./cargo test\n```\n",
+        );
         fixture.write_fake_cargo(0, "ok");
         let gateway = ScriptedGateway::new(vec![
             vec![StreamChunk::ToolCalls(vec![
                 tool_call(
-                    "shell_command",
-                    HashMap::from([("command".to_string(), json!("./cargo test"))]),
+                    "execute_probe",
+                    HashMap::from([("probe_id".to_string(), json!("cargo-test"))]),
                 ),
                 tool_call(
                     "write_file",
@@ -6270,7 +6309,9 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_records_edit_file_as_source_mutation() {
-        let fixture = AgentFixture::new("Edit existing source, validate, and finish.");
+        let fixture = AgentFixture::new(
+            "Edit existing source, validate, and finish.\n\n```sh\n./cargo test\n```\n",
+        );
         fixture.write_fake_cargo(0, "ok");
         std::fs::create_dir_all(fixture.workspace.join("src")).unwrap();
         std::fs::write(
@@ -6296,8 +6337,8 @@ mod tests {
                 ]),
             )],
             vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("cargo-test"))]),
             )],
             vec![StreamChunk::Content("DONE".to_string())],
         ]);
@@ -6317,7 +6358,9 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_terminalizes_after_successful_post_write_validation() {
-        let fixture = AgentFixture::new("Edit existing source, validate, and finish.");
+        let fixture = AgentFixture::new(
+            "Edit existing source, validate, and finish.\n\n```sh\n./cargo test\n```\n",
+        );
         fixture.write_fake_cargo(0, "ok");
         std::fs::create_dir_all(fixture.workspace.join("src")).unwrap();
         std::fs::write(
@@ -6343,8 +6386,8 @@ mod tests {
                 ]),
             )],
             vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("cargo-test"))]),
             )],
             vec![StreamChunk::Content("DONE".to_string())],
         ]);
@@ -6399,8 +6442,8 @@ mod tests {
                 HashMap::from([("command".to_string(), json!("./cargo build"))]),
             )],
             vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("./cargo test focused_summary"))]),
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("cargo-test-focused-summary"))]),
             )],
             vec![StreamChunk::Content("DONE".to_string())],
         ]);
@@ -6422,7 +6465,7 @@ mod tests {
         assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert_eq!(
             prompts[0]["validation"]["command"],
-            "./cargo test focused_summary"
+            "probe:cargo-test-focused-summary"
         );
         assert!(
             trace.contains("\"requested_validation_commands\":[\"./cargo test focused_summary\"]")
@@ -6459,13 +6502,13 @@ mod tests {
                 ]),
             )],
             vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("./cargo build"))]),
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("cargo-build"))]),
             )],
             vec![StreamChunk::Content("DONE".to_string())],
             vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("cargo-test"))]),
             )],
             vec![StreamChunk::Content("DONE".to_string())],
         ]);
@@ -6478,7 +6521,7 @@ mod tests {
         assert!(trace.contains("./cargo test"));
         let prompts = trace_payloads(&trace, "agent.validation.success_terminal_prompted");
         assert_eq!(prompts.len(), 1, "{prompts:?}");
-        assert_eq!(prompts[0]["validation"]["command"], "./cargo test");
+        assert_eq!(prompts[0]["validation"]["command"], "probe:cargo-test");
         let tool_counts = gateway.tool_counts();
         assert!(
             tool_counts.len() >= 5,
@@ -6491,12 +6534,13 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_hard_stops_repeated_validation_repair_no_action() {
-        let fixture = AgentFixture::new("Run validation and repair failures.");
+        let fixture =
+            AgentFixture::new("Run validation and repair failures.\n\n```sh\n./cargo test\n```\n");
         fixture.write_fake_cargo(1, "unit failed");
         let gateway = ScriptedGateway::new(vec![
             vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("cargo-test"))]),
             )],
             vec![StreamChunk::Content(
                 "I will repair the failing test.".to_string(),
@@ -6521,7 +6565,9 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_hard_stops_repeated_validation_repair_no_content_interrupts() {
-        let fixture = AgentFixture::new("Run validation and repair no-content failures.");
+        let fixture = AgentFixture::new(
+            "Run validation and repair no-content failures.\n\n```sh\n./cargo test\n```\n",
+        );
         fixture.write_fake_cargo(1, "compile failed");
         let first_interrupt_frames = (0..REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT)
             .map(|index| StreamChunk::Progress(stream_progress(index, 0, 0, 0)))
@@ -6531,8 +6577,8 @@ mod tests {
             .collect::<Vec<_>>();
         let gateway = ScriptedGateway::new(vec![
             vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("cargo-test"))]),
             )],
             vec![StreamChunk::Content(
                 "I will repair the failing validation.".to_string(),
@@ -6557,12 +6603,14 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_traces_stage_milestones() {
-        let fixture = AgentFixture::new("Run validation, repair source, and probe again.");
+        let fixture = AgentFixture::new(
+            "Run validation, repair source, and probe again.\n\n```sh\n./cargo test\n```\n",
+        );
         fixture.write_fake_cargo(1, "test failed");
         let gateway = ScriptedGateway::new(vec![
             vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("cargo-test"))]),
             )],
             vec![tool_call_chunk(
                 "write_file",
@@ -6575,8 +6623,8 @@ mod tests {
                 ]),
             )],
             vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("./cargo test"))]),
+                "execute_probe",
+                HashMap::from([("probe_id".to_string(), json!("cargo-test"))]),
             )],
         ]);
 
@@ -6591,7 +6639,7 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_records_pending_validation_when_max_iterations_exhausted() {
-        let fixture = AgentFixture::new("Edit source once and stop.");
+        let fixture = AgentFixture::new("Edit source once and stop.\n\n```sh\n./cargo test\n```\n");
         std::fs::create_dir_all(fixture.workspace.join("src")).unwrap();
         let gateway = ScriptedGateway::new(vec![
             vec![tool_call_chunk(
@@ -6616,6 +6664,41 @@ mod tests {
             trace.contains("\"kind\":\"agent.validation.required_after_edit_at_max_iterations\"")
         );
         assert!(trace.contains("\"kind\":\"run.finished\""));
+    }
+
+    #[tokio::test]
+    async fn empty_probe_contract_does_not_invent_validation_authority() {
+        let fixture = AgentFixture::new("unused legacy task");
+        std::fs::write(
+            fixture.experiment.join("contract.json"),
+            serde_json::to_string_pretty(&json!({
+                "guidance": "Write the requested source and finish.",
+                "probes": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "write_file",
+                HashMap::from([
+                    ("path".to_string(), json!("src/lib.rs")),
+                    (
+                        "content".to_string(),
+                        json!("pub fn answer() -> u32 { 42 }\n"),
+                    ),
+                ]),
+            )],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run_contract(&gateway, 2).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.stage.first_source_mutation\""));
+        assert!(!trace.contains("\"kind\":\"agent.validation.required_after_edit\""));
+        assert!(!trace.contains("\"kind\":\"agent.validation_probe.observed\""));
     }
 
     #[tokio::test]
@@ -7307,6 +7390,16 @@ mod tests {
             gateway: &ScriptedGateway,
             max_iterations: usize,
         ) -> AgentRunSummary {
+            self.try_run_with_pre_source_action_only(gateway, max_iterations)
+                .await
+                .unwrap()
+        }
+
+        async fn try_run_with_pre_source_action_only(
+            &self,
+            gateway: &ScriptedGateway,
+            max_iterations: usize,
+        ) -> Result<AgentRunSummary> {
             run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
@@ -7332,7 +7425,6 @@ mod tests {
                 self.workspace.clone(),
             )
             .await
-            .unwrap()
         }
 
         async fn run_with_initial_context(&self, gateway: &ScriptedGateway) -> AgentRunSummary {
@@ -7423,6 +7515,7 @@ mod tests {
         tool_counts: StdMutex<Vec<usize>>,
         stream_messages: StdMutex<Vec<Vec<LlmMessage>>>,
         reasoning_efforts: StdMutex<Vec<Option<ReasoningEffort>>>,
+        fail_stream_call: Option<usize>,
     }
 
     impl ScriptedGateway {
@@ -7434,6 +7527,7 @@ mod tests {
                 tool_counts: StdMutex::new(Vec::new()),
                 stream_messages: StdMutex::new(Vec::new()),
                 reasoning_efforts: StdMutex::new(Vec::new()),
+                fail_stream_call: None,
             }
         }
 
@@ -7445,7 +7539,13 @@ mod tests {
                 tool_counts: StdMutex::new(Vec::new()),
                 stream_messages: StdMutex::new(Vec::new()),
                 reasoning_efforts: StdMutex::new(Vec::new()),
+                fail_stream_call: None,
             }
+        }
+
+        fn failing_on_stream_call(mut self, call: usize) -> Self {
+            self.fail_stream_call = Some(call);
+            self
         }
 
         fn tool_counts(&self) -> Vec<usize> {
@@ -7528,10 +7628,14 @@ mod tests {
             config: &'a CompletionConfig,
         ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
         {
-            self.stream_messages
-                .lock()
-                .expect("scripted gateway message mutex poisoned")
-                .push(_messages.to_vec());
+            let call = {
+                let mut messages = self
+                    .stream_messages
+                    .lock()
+                    .expect("scripted gateway message mutex poisoned");
+                messages.push(_messages.to_vec());
+                messages.len()
+            };
             self.tool_counts
                 .lock()
                 .expect("scripted gateway tool-count mutex poisoned")
@@ -7540,6 +7644,13 @@ mod tests {
                 .lock()
                 .expect("scripted gateway reasoning-effort mutex poisoned")
                 .push(config.reasoning_effort);
+            if self.fail_stream_call == Some(call) {
+                return Box::pin(stream::once(async {
+                    Err(MojenticError::GatewayError(
+                        "scripted stream failure".to_string(),
+                    ))
+                }));
+            }
             let chunks = self
                 .streams
                 .lock()

@@ -685,7 +685,8 @@ fn harness_summary(kind: &str, payload: &Value) -> (String, String) {
         ),
         "agent.pre_source_action_only.started" => (
             "Pre-source action-only handoff started".to_string(),
-            "Native reasoning is disabled; read and list tools are withheld.".to_string(),
+            "Native reasoning is disabled; read, list, and arbitrary shell tools are withheld."
+                .to_string(),
         ),
         "agent.pre_source_action_only.completed" => (
             "Pre-source action-only handoff completed".to_string(),
@@ -699,6 +700,24 @@ fn harness_summary(kind: &str, payload: &Value) -> (String, String) {
                     .get("validation_probed")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
+            ),
+        ),
+        "agent.pre_source_action_only.aborted" => (
+            "Pre-source action-only aborted".to_string(),
+            format!(
+                "Reason: {}; source mutation: {}; validation probe: {}",
+                payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                payload
+                    .get("source_mutated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                payload
+                    .get("validation_probed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             ),
         ),
         "run.finished" => (

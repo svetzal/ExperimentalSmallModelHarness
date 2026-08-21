@@ -1,0 +1,6 @@
+{
+  "guidance": "A contract-declared command is authoritative without command-text inference.",
+  "probes": [
+    { "id": "echo-hello", "command": "echo hello" }
+  ]
+}

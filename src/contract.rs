@@ -421,7 +421,7 @@ fn describe_scope(
 /// Each failure mode returns an actionable, specific error.
 fn validate_explicit_contract(
     contract: &SuppliedExplicitContract,
-    profile: &dyn crate::profile::DomainProfile,
+    _profile: &dyn crate::profile::DomainProfile,
 ) -> Result<()> {
     let mut seen_ids = HashSet::new();
     for probe in &contract.probes {
@@ -445,13 +445,6 @@ fn validate_explicit_contract(
         if has_command && validation_command_masks_failure(&probe.command) {
             bail!(
                 "explicit contract: probe {:?} command {:?} masks failure (e.g. `|| true`, `; true`, `|| exit 0`)",
-                probe.id,
-                probe.command
-            );
-        }
-        if has_command && !profile.recognizes_probe(&probe.command) {
-            bail!(
-                "explicit contract: probe {:?} command {:?} will never be recognized as a validation probe by the executor",
                 probe.id,
                 probe.command
             );
@@ -759,16 +752,13 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_probe_command_is_rejected() {
+    fn arbitrary_declared_probe_command_is_accepted() {
         let json = r#"{
             "guidance": "g",
             "probes": [{"id": "a", "command": "echo hello"}]
         }"#;
-        let error = explicit(json).unwrap_err().to_string();
-        assert!(
-            error.contains("will never be recognized as a validation probe"),
-            "{error}"
-        );
+        let resolved = explicit(json).expect("the contract grants the probe authority");
+        assert_eq!(resolved.probes[0].command, "echo hello");
     }
 
     #[test]

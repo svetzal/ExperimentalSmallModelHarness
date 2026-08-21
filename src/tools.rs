@@ -943,7 +943,14 @@ impl ToolScope {
                 bail!("duplicate probe id during tool configuration");
             }
         }
-        self.configure_requested_probes(ids);
+        let validation_enforced = !ids.is_empty();
+        let mut runtime = self.runtime.lock().expect("runtime state mutex poisoned");
+        assert_eq!(
+            runtime.total_tool_calls, 0,
+            "requested probes must be configured before effects begin"
+        );
+        *runtime = RuntimeState::new_with_validation_authority(ids, validation_enforced);
+        drop(runtime);
         *self.probes.lock().expect("probe map mutex poisoned") = by_id;
         Ok(())
     }
@@ -2319,20 +2326,11 @@ impl ShellCommandTool {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
-        let validation_probe =
-            declared_probe_id.is_some() || self.scope.profile().recognizes_probe(command);
+        // Arbitrary model-authored shell is an opaque effect, not validation
+        // authority. Only an executor-owned, contract-declared probe may
+        // update validation state or clear pending evidence.
+        let validation_probe = declared_probe_id.is_some();
         let policy_before_command = self.scope.policy_snapshot();
-        if policy_before_command.validation_required_after_write
-            && !validation_probe
-            && self
-                .scope
-                .profile()
-                .is_known_shell_mutation_command(command)
-        {
-            bail!(
-                "shell command appears to mutate files while validation is required after source edits; run a validation probe before further cleanup, then use edit_file for any remaining source edits"
-            );
-        }
         let command_family = self.scope.profile().command_family(command);
         let before_mutation_snapshot = match self.scope.shell_mutation_snapshot() {
             Ok(snapshot) => Some(snapshot),
@@ -4290,10 +4288,8 @@ bytes[0..5] \"cafe\\n\""
         assert!(!snapshot.validation_required_after_write);
     }
 
-    // `is_validation_probe`/`command_family`/`failure_details` moved to
-    // `crate::profile::coding` in Slice 3, along with their unit tests
-    // (`recognizes_cargo_and_pytest_probes`, `normalizes_command_families`,
-    // `extracts_targeted_cargo_test_failure_details`).
+    // `command_family` and `failure_details` moved to
+    // `crate::profile::coding` in Slice 3, along with their unit tests.
 
     #[test]
     fn summarizes_generic_failure_text() {
@@ -4310,23 +4306,20 @@ bytes[0..5] \"cafe\\n\""
         let tool = ShellCommandTool {
             scope: scope.clone(),
         };
-        let mut args = HashMap::new();
-        args.insert(
-            "command".to_string(),
-            json!("cargo test --manifest-path missing/Cargo.toml"),
-        );
-
-        let result = tool.shell(&args).await.unwrap();
+        let result = tool
+            .shell_declared_probe(
+                "cargo-test",
+                "cargo test --manifest-path missing/Cargo.toml",
+            )
+            .await
+            .unwrap();
         let snapshot = scope.policy_snapshot();
         let repair = snapshot.validation_repair.unwrap();
 
         assert_eq!(result["validation_probe"], true);
         assert_eq!(result["success"], false);
-        assert_eq!(
-            repair.command,
-            "cargo test --manifest-path missing/Cargo.toml"
-        );
-        assert_eq!(repair.command_family, "cargo test");
+        assert_eq!(repair.command, "probe:cargo-test");
+        assert_eq!(repair.command_family, "declared_command_probe");
         assert_eq!(repair.repeated_command_family_count, 1);
         assert!(!repair.failure_text.is_empty());
     }
@@ -4346,10 +4339,10 @@ bytes[0..5] \"cafe\\n\""
         };
 
         let result = tool
-            .shell(&HashMap::from([(
-                "command".to_string(),
-                json!("cargo check --manifest-path missing/Cargo.toml"),
-            )]))
+            .shell_declared_probe(
+                "cargo-check",
+                "cargo check --manifest-path missing/Cargo.toml",
+            )
             .await
             .unwrap();
 
@@ -4385,17 +4378,17 @@ bytes[0..5] \"cafe\\n\""
         let tool = ShellCommandTool {
             scope: scope.clone(),
         };
-        tool.shell(&HashMap::from([(
-            "command".to_string(),
-            json!("cargo check --manifest-path missing/Cargo.toml"),
-        )]))
+        tool.shell_declared_probe(
+            "cargo-check",
+            "cargo check --manifest-path missing/Cargo.toml",
+        )
         .await
         .unwrap();
 
         let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
 
         assert!(trace.contains("\"kind\":\"agent.validation_probe.observed\""));
-        assert!(trace.contains("\"command_family\":\"cargo check\""));
+        assert!(trace.contains("\"command_family\":\"declared_command_probe\""));
         assert!(trace.contains("\"success\":false"));
         assert!(trace.contains("\"had_pending_source_writes\":true"));
         assert!(trace.contains("\"cleared_pending_source_writes\":false"));
@@ -4546,10 +4539,7 @@ bytes[0..5] \"cafe\\n\""
             scope: scope.clone(),
         };
         let result = tool
-            .shell(&HashMap::from([(
-                "command".to_string(),
-                json!("cargo check --help"),
-            )]))
+            .shell_declared_probe("cargo-check", "cargo check --help")
             .await
             .unwrap();
 
@@ -4576,10 +4566,10 @@ bytes[0..5] \"cafe\\n\""
             scope: scope.clone(),
         };
         shell
-            .shell(&HashMap::from([(
-                "command".to_string(),
-                json!("cargo clippy --manifest-path missing/Cargo.toml"),
-            )]))
+            .shell_declared_probe(
+                "cargo-clippy",
+                "cargo clippy --manifest-path missing/Cargo.toml",
+            )
             .await
             .unwrap();
 
@@ -4614,60 +4604,26 @@ bytes[0..5] \"cafe\\n\""
     }
 
     #[tokio::test]
-    async fn mutating_shell_command_is_rejected_while_validation_is_pending() {
+    async fn model_authored_test_named_shell_command_is_observation_only() {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
-        std::fs::create_dir_all(temp.path().join("src")).unwrap();
-        let file = temp.path().join("src/lib.rs");
-        std::fs::write(&file, "one\ntwo\n").unwrap();
-        scope
-            .note_write_intent(std::slice::from_ref(&scope.root.join("src/lib.rs")))
-            .unwrap();
         let tool = ShellCommandTool {
             scope: scope.clone(),
         };
 
-        let error = tool
+        let result = tool
             .shell(&HashMap::from([(
                 "command".to_string(),
-                json!("sed -i '1d' src/lib.rs"),
+                json!("printf 'pytest 8.0\\n' | grep pytest"),
             )]))
             .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("appears to mutate files"));
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
-        assert_eq!(scope.policy_snapshot().total_write_operations, 1);
-    }
-
-    #[tokio::test]
-    async fn perl_in_place_shell_command_is_rejected_while_validation_is_pending() {
-        let temp = tempfile::tempdir().unwrap();
-        let scope = scope(&temp);
-        std::fs::create_dir_all(temp.path().join("src")).unwrap();
-        let file = temp.path().join("src/lib.rs");
-        std::fs::write(&file, "pub fn value() -> i32 { 1 }\n").unwrap();
-        scope
-            .note_write_intent(std::slice::from_ref(&scope.root.join("src/lib.rs")))
             .unwrap();
-        let tool = ShellCommandTool {
-            scope: scope.clone(),
-        };
 
-        let error = tool
-            .shell(&HashMap::from([(
-                "command".to_string(),
-                json!("perl -pi -e 's/1/2/' src/lib.rs"),
-            )]))
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("appears to mutate files"));
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "pub fn value() -> i32 { 1 }\n"
-        );
-        assert_eq!(scope.policy_snapshot().total_write_operations, 1);
+        assert_eq!(result["success"], true);
+        assert_eq!(result["validation_probe"], false);
+        assert_eq!(scope.policy_snapshot().total_shell_probes, 0);
+        let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
+        assert!(!trace.contains("\"kind\":\"agent.validation_probe.observed\""));
     }
 
     #[tokio::test]
@@ -4693,10 +4649,7 @@ bytes[0..5] \"cafe\\n\""
         };
 
         let result = tool
-            .shell(&HashMap::from([(
-                "command".to_string(),
-                json!("cargo test"),
-            )]))
+            .shell_declared_probe("cargo-test", "cargo test")
             .await
             .unwrap();
 
@@ -4789,10 +4742,10 @@ bytes[0..5] \"cafe\\n\""
         let tool = ShellCommandTool {
             scope: scope.clone(),
         };
-        let mut args = HashMap::new();
-        args.insert("command".to_string(), json!("cargo fmt"));
-
-        let result = tool.shell(&args).await.unwrap();
+        let result = tool
+            .shell_declared_probe("cargo-fmt", "cargo fmt")
+            .await
+            .unwrap();
         let snapshot = scope.policy_snapshot();
 
         assert_eq!(result["validation_probe"], true);

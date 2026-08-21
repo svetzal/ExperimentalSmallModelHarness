@@ -70,9 +70,6 @@ pub trait DomainProfile: Send + Sync {
     /// prompt.
     fn repair_ladder_suffix(&self) -> &'static str;
 
-    /// Whether the executor recognizes `command` as a validation probe.
-    fn recognizes_probe(&self, command: &str) -> bool;
-
     /// Collapse a raw shell command into a stable "family" label (used for
     /// repeated-failure bookkeeping).
     fn command_family(&self, command: &str) -> String;
@@ -88,15 +85,6 @@ pub trait DomainProfile: Send + Sync {
     /// Whether `dir_name` is an ignored build/dependency/cache directory,
     /// excluded from shell-mutation fingerprinting and inspection.
     fn is_ignored_dir(&self, dir_name: &str) -> bool;
-
-    /// Whether `command` is a read-only inspection command (cat/grep/...)
-    /// exempt from action-boundary/mutation heuristics.
-    fn is_inspection_shell_command(&self, command: &str) -> bool;
-
-    /// Whether `command` is a known shell-level file-mutation command (sed
-    /// -i, redirection, in-place scripting flags, ...) that should trip
-    /// validation-required guards.
-    fn is_known_shell_mutation_command(&self, command: &str) -> bool;
 
     /// Extract structured failure-detail lines from probe stdout/stderr.
     fn failure_details(&self, stderr: &str, stdout: &str) -> Vec<String>;

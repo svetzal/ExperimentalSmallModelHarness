@@ -156,9 +156,12 @@ repair state and every model-facing repair or escalation prompt use
 executor-owned even after repeated failures.
 
 Command probes use the same scoped shell executor, finite timeout, process-group
-cleanup, mutation sensing, repair policy, and lifecycle-phase tracing as direct
-shell validation. This makes the stable ID a capability boundary rather than a
-prompt alias for a long command.
+cleanup, mutation sensing, repair policy, and lifecycle-phase tracing as other
+shell effects. Their declared stable ID, rather than inferred command text,
+grants validation authority. Model-authored `shell_command` calls are opaque
+observations: neither a familiar command name nor a zero exit status can clear
+pending evidence or trigger terminal readiness. A probe-free contract therefore
+does not invent a self-validation gate; independent evaluation remains separate.
 
 The optional `--repair-handoff-policy constrained` mode gives an authoritative
 failed declared probe invoked through `execute_probe` immediate control of the
@@ -177,11 +180,17 @@ failure packet and restricted repair tools, and explicitly states that the
 interrupted hidden reasoning was not retained. The same opt-in policy schedules
 one native action-only outer turn after the first pre-source hidden-only
 no-action turn. Every request in that turn retains the task and summarized tool
-context while exposing only write, edit, shell, and any declared-probe tools;
-it cannot continue broad read/list inspection. Its provider snapshot records `reasoning_effort:
-disabled`, `thinking_disabled: true`, and the effective cap source
-`provider_disabled`. The ordinary `constrained` variant still retries with
-thinking enabled.
+context while exposing only write, edit, and any declared-probe tools. Arbitrary
+shell, read, and list capabilities are unavailable, so the request must mutate,
+invoke declared evidence, or report `FAIL`. Its provider snapshot records
+`reasoning_effort: disabled`, `thinking_disabled: true`, and the effective cap
+source `provider_disabled`. The ordinary `constrained` variant still retries
+with thinking enabled.
+
+Pre-source action-only lifecycle traces close on both success and failure.
+`agent.pre_source_action_only.completed` records the observed action deltas;
+`agent.pre_source_action_only.aborted` records the stream error and the same
+mutation/probe state before `run.failed` is propagated.
 
 Every `llm.provider_request.assembled` snapshot records the harness-side
 thinking limits that govern that request. The `harness_limits` object includes

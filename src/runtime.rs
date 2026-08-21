@@ -190,6 +190,8 @@ pub struct RuntimeState {
     pub repeated_command_failures: BTreeMap<String, usize>,
     pub repeated_failure_summaries: BTreeMap<String, usize>,
     pub requested_probes: Vec<RequestedProbeState>,
+    /// Whether the run has executor-owned validation authority.
+    pub validation_enforced: bool,
     pub emitted_first_source_mutation: bool,
     pub emitted_first_validation_probe: bool,
     pub emitted_first_post_repair_action: bool,
@@ -220,6 +222,13 @@ impl Default for RuntimeState {
 
 impl RuntimeState {
     pub fn new(requested_probe_ids: Vec<String>) -> Self {
+        Self::new_with_validation_authority(requested_probe_ids, true)
+    }
+
+    pub fn new_with_validation_authority(
+        requested_probe_ids: Vec<String>,
+        validation_enforced: bool,
+    ) -> Self {
         let requested_probes = requested_probe_ids
             .into_iter()
             .map(|id| RequestedProbeState {
@@ -250,6 +259,7 @@ impl RuntimeState {
             repeated_command_failures: BTreeMap::new(),
             repeated_failure_summaries: BTreeMap::new(),
             requested_probes,
+            validation_enforced,
             emitted_first_source_mutation: false,
             emitted_first_validation_probe: false,
             emitted_first_post_repair_action: false,
@@ -549,7 +559,7 @@ impl RuntimeState {
     }
 
     pub fn validation_required(&self) -> bool {
-        !self.pending_evidence_paths.is_empty()
+        self.validation_enforced && !self.pending_evidence_paths.is_empty()
     }
 
     pub fn requested_probes_satisfied(&self) -> bool {

@@ -54,9 +54,6 @@ impl DomainProfile for TextTransformProfile {
         "After a focused edit, execute the failed assertion again by probe ID."
     }
 
-    fn recognizes_probe(&self, _command: &str) -> bool {
-        false
-    }
     fn command_family(&self, command: &str) -> String {
         command.to_string()
     }
@@ -68,12 +65,6 @@ impl DomainProfile for TextTransformProfile {
     }
     fn is_ignored_dir(&self, dir_name: &str) -> bool {
         dir_name == ".git"
-    }
-    fn is_inspection_shell_command(&self, _command: &str) -> bool {
-        false
-    }
-    fn is_known_shell_mutation_command(&self, _command: &str) -> bool {
-        false
     }
     fn failure_details(&self, _stderr: &str, _stdout: &str) -> Vec<String> {
         Vec::new()
