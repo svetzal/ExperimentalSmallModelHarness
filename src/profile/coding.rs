@@ -145,15 +145,15 @@ pub(crate) fn run_prompt(goal: &str) -> String {
 /// Moved from `agent.rs`: the two post-write validation-nudge wordings that
 /// used to be inlined at their call sites (one used when the turn produced
 /// no final text at all, one used when it produced final text).
-const POST_WRITE_VALIDATION_NUDGE_AFTER_EMPTY_TURN: &str = "You modified files after the most recent shell probe and did not provide final text. \
-     Do not edit again yet. Run the validation ladder now: cargo fmt --check, \
-     then cargo clippy, then focused tests, then broad tests. Use timeout_secs 1800 \
-     for cargo build or cargo test. Reply DONE only if validation passes.";
+const POST_WRITE_VALIDATION_NUDGE_AFTER_EMPTY_TURN: &str = "The workspace now has source changes without fresh deterministic feedback. \
+     Before another broad inspection or speculative edit, run one project-appropriate deterministic check using the available tools. \
+     If the environment cannot run a meaningful behavioral check, state the concrete blocker instead of treating a syntax-only check as proof of the requested outcome. \
+     An undeclared check provides repair feedback but does not create completion authority.\n";
 
-const POST_WRITE_VALIDATION_NUDGE_AFTER_FINAL_TEXT: &str = "You modified files after the most recent shell probe. Do not edit again yet. \
-     Run the validation ladder now: cargo fmt --check, then cargo clippy, \
-     then focused tests, then broad tests. Use timeout_secs 1800 for cargo build \
-     or cargo test. Reply DONE only if validation passes.";
+const POST_WRITE_VALIDATION_NUDGE_AFTER_FINAL_TEXT: &str = "The workspace now has source changes without fresh deterministic feedback. \
+     Before another broad inspection or speculative edit, run one project-appropriate deterministic check using the available tools. \
+     If the environment cannot run a meaningful behavioral check, state the concrete blocker instead of treating a syntax-only check as proof of the requested outcome. \
+     An undeclared check provides repair feedback but does not create completion authority.\n";
 
 pub(crate) fn post_write_validation_nudge(had_final_text: bool) -> &'static str {
     if had_final_text {
