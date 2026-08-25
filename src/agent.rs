@@ -240,6 +240,27 @@ pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
     run_agent_with_gateway(config, &gateway, tool_root).await
 }
 
+fn agent_completion_config(
+    max_tool_iterations: usize,
+    num_predict: Option<usize>,
+    context_window_tokens: Option<usize>,
+) -> Result<CompletionConfig> {
+    let num_predict = num_predict
+        .map(i32::try_from)
+        .transpose()
+        .context("num_predict exceeds i32 range")?;
+    let mut completion_config = CompletionConfig {
+        temperature: 0.2,
+        max_tool_iterations,
+        num_predict,
+        ..Default::default()
+    };
+    if let Some(context_window_tokens) = context_window_tokens {
+        completion_config.num_ctx = context_window_tokens;
+    }
+    Ok(completion_config)
+}
+
 async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     config: AgentRunConfig,
     gateway: &G,
@@ -466,24 +487,16 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         LlmMessage::system(system_prompt),
         LlmMessage::user(worker_message),
     ];
-    let num_predict = config
-        .num_predict
-        .map(i32::try_from)
-        .transpose()
-        .context("num_predict exceeds i32 range")?;
-    let completion_config = CompletionConfig {
-        temperature: 0.2,
-        max_tool_iterations: config.max_tool_iterations,
-        num_predict,
-        ..Default::default()
-    };
+    let completion_config = agent_completion_config(
+        config.max_tool_iterations,
+        config.num_predict,
+        config.context_window_tokens,
+    )?;
 
     let mut final_summary = String::new();
     let mut final_response_only_next_turn = false;
     let mut authoritative_constrained_repair_active = false;
     let mut repair_action_only_next_turn = false;
-    let mut pre_source_action_only_next_turn = false;
-    let mut pre_source_action_only_used = false;
     let mut requested_validation_ledger = RequestedValidationLedger::new_for_probes(
         &resolved_contract.probes,
         resolved_contract.profile.clone(),
@@ -501,9 +514,8 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             && authoritative_constrained_repair_active
             && policy_before_turn.validation_repair.is_some();
         let repair_action_only_turn = constrained_repair_turn && repair_action_only_next_turn;
-        let pre_source_action_only_turn = pre_source_action_only_next_turn;
         let mut turn_completion_config = completion_config.clone();
-        if repair_action_only_turn || pre_source_action_only_turn {
+        if repair_action_only_turn {
             turn_completion_config.reasoning_effort = Some(ReasoningEffort::Disabled);
         }
         if repair_action_only_turn {
@@ -520,24 +532,9 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 }),
             )?;
         }
-        if pre_source_action_only_turn {
-            trace.event(
-                "agent.pre_source_action_only.started",
-                serde_json::json!({
-                    "turn": turn,
-                    "reasoning_effort": ReasoningEffort::Disabled,
-                    "prior_hidden_reasoning_retained": false,
-                    "retained_task_and_tool_context": true,
-                    "active_tool_names": action_only_tools
-                        .iter()
-                        .map(|tool| tool.descriptor().function.name)
-                        .collect::<Vec<_>>(),
-                }),
-            )?;
-        }
         let active_tools = if final_response_only_next_turn {
             &no_tools
-        } else if repair_action_only_turn || pre_source_action_only_turn {
+        } else if repair_action_only_turn {
             &action_only_tools
         } else if constrained_repair_turn {
             &repair_tools
@@ -563,7 +560,6 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 "repair_handoff_policy": config.repair_handoff_policy,
                 "constrained_repair_turn": constrained_repair_turn,
                 "repair_action_only_turn": repair_action_only_turn,
-                "pre_source_action_only_turn": pre_source_action_only_turn,
                 "active_tool_names": active_tools
                     .iter()
                     .map(|tool| tool.descriptor().function.name)
@@ -601,19 +597,6 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         {
             Ok(turn_result) => turn_result,
             Err(error) => {
-                if pre_source_action_only_turn {
-                    let policy = scope.policy_snapshot();
-                    let _ = trace.event(
-                        "agent.pre_source_action_only.aborted",
-                        serde_json::json!({
-                            "turn": turn,
-                            "reason": error.to_string(),
-                            "tool_calls_this_turn": policy.total_tool_calls.saturating_sub(policy_before_turn.total_tool_calls),
-                            "source_mutated": policy.total_write_operations > policy_before_turn.total_write_operations,
-                            "validation_probed": policy.total_shell_probes > policy_before_turn.total_shell_probes,
-                        }),
-                    );
-                }
                 let _ = trace_run_failed(
                     &trace,
                     "agent.stream",
@@ -627,7 +610,6 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             }
         };
         repair_action_only_next_turn = false;
-        pre_source_action_only_next_turn = false;
         final_response_only_next_turn = false;
         let repair_no_content_interrupted = turn_result.repair_no_content_interrupted;
         let action_boundary_interrupted = turn_result.action_boundary_interrupted;
@@ -674,19 +656,6 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         let wrote_this_turn =
             policy.total_write_operations > policy_before_turn.total_write_operations;
         let probed_this_turn = policy.total_shell_probes > policy_before_turn.total_shell_probes;
-        if pre_source_action_only_turn {
-            trace.event(
-                "agent.pre_source_action_only.completed",
-                serde_json::json!({
-                    "turn": turn,
-                    "assistant_content": !response.trim().is_empty(),
-                    "tool_calls_this_turn": tool_calls_this_turn,
-                    "source_mutated": wrote_this_turn,
-                    "validation_probed": probed_this_turn,
-                    "thinking_chars_this_turn": thinking_chars_this_turn,
-                }),
-            )?;
-        }
         let runtime_after_effects = scope.runtime_state_snapshot();
         let terminalize_after_validation = (!runtime_before_turn.terminal_readiness
             && runtime_after_effects.terminal_readiness
@@ -928,11 +897,6 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 continue;
             }
             if thinking_chars_this_turn > 0 && !wrote_this_turn && !probed_this_turn {
-                let schedule_pre_source_action_only =
-                    config.repair_handoff_policy.uses_action_only_retry()
-                        && !pre_source_action_only_used
-                        && policy.total_write_operations == 0
-                        && consecutive_hidden_only_no_action_turns == 1;
                 let escalation_required = consecutive_hidden_only_no_action_turns
                     >= HIDDEN_ONLY_NO_ACTION_ESCALATION_TURNS;
                 trace.event(
@@ -954,32 +918,9 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                         "probed_this_turn": probed_this_turn,
                         "consecutive_hidden_only_no_action_turns": consecutive_hidden_only_no_action_turns,
                         "escalation_required": escalation_required,
-                        "pre_source_action_only_eligible": schedule_pre_source_action_only,
                         "policy": policy,
                     }),
                 )?;
-                if schedule_pre_source_action_only {
-                    pre_source_action_only_used = true;
-                    pre_source_action_only_next_turn = true;
-                    final_summary =
-                        format!("turn {turn} scheduled a pre-source native action-only handoff");
-                    trace.event(
-                        "agent.pre_source_action_only.scheduled",
-                        serde_json::json!({
-                            "turn": turn,
-                            "next_turn": turn + 1,
-                            "prior_thinking_chars": thinking_chars_this_turn,
-                            "prior_hidden_reasoning_retained": false,
-                            "retained_task_and_tool_context": true,
-                            "next_reasoning_effort": ReasoningEffort::Disabled,
-                            "reason": "first_pre_source_hidden_only_no_action_turn",
-                        }),
-                    )?;
-                    messages.push(LlmMessage::user(pre_source_action_only_prompt(
-                        tool_calls_this_turn,
-                    )));
-                    continue;
-                }
                 if escalation_required {
                     final_summary = hidden_only_no_action_hard_failure_summary(
                         turn,
@@ -4856,19 +4797,6 @@ fn hidden_only_no_action_prompt(
     )
 }
 
-fn pre_source_action_only_prompt(tool_calls_this_turn: usize) -> String {
-    format!(
-        "Pre-source action-only handoff is active. The previous turn produced hidden reasoning \
-         but no successful source mutation or validation probe. Tool calls in that turn: \
-         {tool_calls_this_turn}. Prior hidden reasoning was not retained, but the authoritative \
-         task packet and summarized tool results remain available.\n\
-         Take exactly one concrete next step now: write or edit the source change supported by \
-         the retained evidence, invoke one available declared probe, or reply FAIL with a concrete \
-         blocker. Read, list, and arbitrary shell tools are intentionally unavailable. Do not \
-         restate the plan or attempt broad reinspection."
-    )
-}
-
 fn action_boundary_interrupt_prompt(decision: &ActionBoundaryNoActionDecision) -> String {
     action_boundary_interrupt_prompt_text(
         &decision.interrupt,
@@ -6635,6 +6563,24 @@ mod tests {
         assert_eq!(utilization, Some(42.5));
     }
 
+    #[test]
+    fn agent_completion_config_preserves_provider_default_when_context_is_omitted() {
+        let provider_default = CompletionConfig::default().num_ctx;
+
+        let config = agent_completion_config(7, None, None).unwrap();
+
+        assert_eq!(config.num_ctx, provider_default);
+        assert_eq!(config.max_tool_iterations, 7);
+    }
+
+    #[test]
+    fn agent_completion_config_applies_the_configured_provider_context() {
+        let config = agent_completion_config(7, Some(16_384), Some(131_072)).unwrap();
+
+        assert_eq!(config.num_ctx, 131_072);
+        assert_eq!(config.num_predict, Some(16_384));
+    }
+
     #[tokio::test]
     async fn stream_response_traces_exact_provider_request_beside_context_ledger() {
         let temp = tempfile::tempdir().unwrap();
@@ -7337,66 +7283,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn constrained_action_only_converts_first_pre_source_hidden_only_turn() {
+    async fn constrained_action_only_does_not_force_a_pre_source_handoff() {
         let fixture = AgentFixture::new("Inspect, then implement.");
         let gateway = ScriptedGateway::new(vec![
             vec![tool_call_chunk("list_tree", HashMap::new())],
             vec![StreamChunk::Thinking(
-                "I should write src/lib.rs now, but I am still planning.".to_string(),
+                "I should write src/lib.rs now, but I am still planning once.".to_string(),
             )],
-            vec![tool_call_chunk(
-                "write_file",
-                HashMap::from([
-                    ("path".to_string(), json!("src/lib.rs")),
-                    (
-                        "content".to_string(),
-                        json!("pub fn answer() -> u32 { 42 }\n"),
-                    ),
-                ]),
-            )],
-            vec![StreamChunk::Content(
-                "FAIL fixture stops after the source action".to_string(),
+            vec![StreamChunk::Thinking(
+                "I should write src/lib.rs now, but I am still planning twice.".to_string(),
             )],
         ]);
 
-        let summary = fixture.run_with_pre_source_action_only(&gateway, 2).await;
+        let summary = fixture.run_with_constrained_action_only(&gateway, 2).await;
 
-        assert!(fixture.workspace.join("src/lib.rs").is_file());
-        assert_eq!(
-            gateway.reasoning_efforts(),
-            vec![
-                None,
-                None,
-                Some(ReasoningEffort::Disabled),
-                Some(ReasoningEffort::Disabled),
-            ]
-        );
-        assert_eq!(gateway.tool_counts(), vec![5, 5, 2, 2]);
+        assert!(!fixture.workspace.join("src/lib.rs").exists());
+        assert_eq!(gateway.reasoning_efforts(), vec![None, None, None]);
+        assert_eq!(gateway.tool_counts(), vec![5, 5, 5]);
         let trace = std::fs::read_to_string(summary.trace_file).unwrap();
         let provider_requests = trace_payloads(
             &trace,
             crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
         );
-        let action_request = &provider_requests[2];
-        let action_request_text = serde_json::to_string(action_request).unwrap();
-        assert_eq!(
-            action_request["completion"]["reasoning_effort"],
-            json!("disabled")
+        assert!(
+            provider_requests
+                .iter()
+                .all(|request| request["completion"]["num_ctx"] == json!(131_072))
         );
-        assert!(action_request_text.contains("Pre-source action-only handoff is active"));
-        assert!(action_request_text.contains("Inspect, then implement."));
-        let action_tool_names = action_request["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|tool| tool["function"]["name"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(action_tool_names, vec!["write_file", "edit_file"]);
-        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.scheduled\""));
-        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.started\""));
-        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.completed\""));
-        assert!(trace.contains("\"source_mutated\":true"));
-        assert!(trace.contains("\"thinking_chars_this_turn\":0"));
+        assert!(trace.contains("\"kind\":\"agent.turn.hidden_only_no_action_hard_failed\""));
+        assert!(!trace.contains("agent.pre_source_action_only"));
     }
 
     #[tokio::test]
@@ -7516,34 +7431,6 @@ mod tests {
             64
         );
         assert!(fixture.workspace.join("artifact.txt").is_file());
-    }
-
-    #[tokio::test]
-    async fn pre_source_action_only_closes_lifecycle_when_stream_fails() {
-        let fixture = AgentFixture::new("Implement the requested source change.");
-        let gateway = ScriptedGateway::new(vec![vec![StreamChunk::Thinking(
-            "I should write src/lib.rs now, but I am still planning.".to_string(),
-        )]])
-        .failing_on_stream_call(2);
-
-        let error = fixture
-            .try_run_with_pre_source_action_only(&gateway, 2)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("scripted stream failure"), "{error}");
-        let trace_path = std::fs::read_dir(fixture.experiment.join("traces"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
-            .expect("one trace file");
-        let trace = std::fs::read_to_string(trace_path).unwrap();
-        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.scheduled\""));
-        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.started\""));
-        assert!(trace.contains("\"kind\":\"agent.pre_source_action_only.aborted\""));
-        assert!(!trace.contains("\"kind\":\"agent.pre_source_action_only.completed\""));
-        assert!(trace.contains("\"kind\":\"run.failed\""));
     }
 
     #[tokio::test]
@@ -8684,21 +8571,11 @@ mod tests {
             .unwrap()
         }
 
-        async fn run_with_pre_source_action_only(
+        async fn run_with_constrained_action_only(
             &self,
             gateway: &ScriptedGateway,
             max_iterations: usize,
         ) -> AgentRunSummary {
-            self.try_run_with_pre_source_action_only(gateway, max_iterations)
-                .await
-                .unwrap()
-        }
-
-        async fn try_run_with_pre_source_action_only(
-            &self,
-            gateway: &ScriptedGateway,
-            max_iterations: usize,
-        ) -> Result<AgentRunSummary> {
             run_agent_with_gateway(
                 AgentRunConfig {
                     experiment_dir: self.experiment.clone(),
@@ -8724,6 +8601,7 @@ mod tests {
                 self.workspace.clone(),
             )
             .await
+            .unwrap()
         }
 
         async fn run_with_initial_context(&self, gateway: &ScriptedGateway) -> AgentRunSummary {
@@ -8814,7 +8692,6 @@ mod tests {
         tool_counts: StdMutex<Vec<usize>>,
         stream_messages: StdMutex<Vec<Vec<LlmMessage>>>,
         reasoning_efforts: StdMutex<Vec<Option<ReasoningEffort>>>,
-        fail_stream_call: Option<usize>,
     }
 
     impl ScriptedGateway {
@@ -8826,7 +8703,6 @@ mod tests {
                 tool_counts: StdMutex::new(Vec::new()),
                 stream_messages: StdMutex::new(Vec::new()),
                 reasoning_efforts: StdMutex::new(Vec::new()),
-                fail_stream_call: None,
             }
         }
 
@@ -8838,13 +8714,7 @@ mod tests {
                 tool_counts: StdMutex::new(Vec::new()),
                 stream_messages: StdMutex::new(Vec::new()),
                 reasoning_efforts: StdMutex::new(Vec::new()),
-                fail_stream_call: None,
             }
-        }
-
-        fn failing_on_stream_call(mut self, call: usize) -> Self {
-            self.fail_stream_call = Some(call);
-            self
         }
 
         fn tool_counts(&self) -> Vec<usize> {
@@ -8927,14 +8797,13 @@ mod tests {
             config: &'a CompletionConfig,
         ) -> Pin<Box<dyn futures::Stream<Item = mojentic::Result<StreamChunk>> + Send + 'a>>
         {
-            let call = {
+            {
                 let mut messages = self
                     .stream_messages
                     .lock()
                     .expect("scripted gateway message mutex poisoned");
                 messages.push(_messages.to_vec());
-                messages.len()
-            };
+            }
             self.tool_counts
                 .lock()
                 .expect("scripted gateway tool-count mutex poisoned")
@@ -8943,13 +8812,6 @@ mod tests {
                 .lock()
                 .expect("scripted gateway reasoning-effort mutex poisoned")
                 .push(config.reasoning_effort);
-            if self.fail_stream_call == Some(call) {
-                return Box::pin(stream::once(async {
-                    Err(MojenticError::GatewayError(
-                        "scripted stream failure".to_string(),
-                    ))
-                }));
-            }
             let chunks = self
                 .streams
                 .lock()

@@ -58,7 +58,7 @@ struct RunArgs {
     #[arg(long, default_value_t = 50)]
     max_tool_iterations: usize,
 
-    /// Approximate model context window in tokens. Enables utilization traces.
+    /// Model context window in tokens for provider requests and utilization traces.
     #[arg(long)]
     context_window_tokens: Option<usize>,
 
@@ -84,9 +84,8 @@ struct RunArgs {
 
     /// Action handoff policy: text-only preserves the legacy continuation;
     /// constrained ends the failed-probe turn and exposes only repair-action tools;
-    /// constrained-action-only disables model reasoning after a capped repair attempt
-    /// or the first pre-source hidden-only no-action turn, withholding arbitrary shell
-    /// during the native action-only request.
+    /// constrained-action-only disables model reasoning after a capped repair attempt,
+    /// withholding arbitrary shell during the native action-only request.
     #[arg(long, default_value = "text-only")]
     repair_handoff_policy: String,
 
