@@ -1811,8 +1811,6 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let mut constrained_repair_handoff_required = false;
     let mut requested_validation_pending_after_write = requested_validation_pending_after_write;
     let mut requested_validation_ledger = requested_validation_ledger;
-    let mut dirty_feedback_obligation_active = false;
-    let mut dirty_feedback_obligation_action_count = 0usize;
     let profile = crate::profile::profile_by_ref(&requested_validation_ledger.profile)?;
     let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     let correlation_id = format!(
@@ -2394,7 +2392,6 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             }),
         )?;
 
-        let mut dirty_feedback_obligation_pending = false;
         for call in &accumulated_tool_calls {
             let tool_result = run_tool_call(call, active_tools, &correlation_id).await;
             let tool_message = LlmMessage {
@@ -2432,18 +2429,12 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             if is_meaningful_source_edit(call, &tool_result, profile) {
                 requested_validation_pending_after_write = true;
                 requested_validation_ledger.note_source_mutation();
-                dirty_feedback_obligation_pending = true;
             }
             let requested_validation_observation =
                 requested_validation_ledger.observe_tool_result(&tool_result);
-            let observed_source_mutation = is_meaningful_source_edit(call, &tool_result, profile)
-                || requested_validation_observation
-                    .as_ref()
-                    .is_some_and(|observation| observation.source_mutation);
             if let Some(observation) = &requested_validation_observation {
                 if observation.source_mutation {
                     requested_validation_pending_after_write = true;
-                    dirty_feedback_obligation_pending = true;
                 }
                 trace.event(
                     "agent.validation.ledger_observed",
@@ -2456,31 +2447,6 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         "ledger": &requested_validation_ledger,
                     }),
                 )?;
-            }
-            if dirty_feedback_obligation_active {
-                dirty_feedback_obligation_action_count += 1;
-                trace.event(
-                    "agent.validation.dirty_feedback_obligation_action",
-                    serde_json::json!({
-                        "turn": turn,
-                        "llm_call_depth": depth,
-                        "action_index": dirty_feedback_obligation_action_count,
-                        "tool_call_id": &call.id,
-                        "tool_name": &call.name,
-                        "ok": tool_result.ok,
-                        "validation_probe": is_validation_probe_result(&tool_result),
-                        "source_mutation": observed_source_mutation,
-                        "shell_command": if call.name == "shell_command" {
-                            call.arguments.get("command")
-                        } else {
-                            None
-                        },
-                    }),
-                )?;
-            }
-            if is_validation_probe_result(&tool_result) {
-                dirty_feedback_obligation_pending = false;
-                dirty_feedback_obligation_active = false;
             }
             if repair_handoff_policy.is_constrained()
                 && call.name == "execute_probe"
@@ -2534,33 +2500,6 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 final_response_only_after_validation = Some(validation);
                 requested_validation_pending_after_write = false;
             }
-        }
-        if dirty_feedback_obligation_pending
-            && final_response_only_after_validation.is_none()
-            && !constrained_repair_handoff_required
-        {
-            let prompt = profile.post_write_validation_nudge(false);
-            let message_chars = prompt.chars().count();
-            current_messages.push(LlmMessage::user(prompt));
-            dirty_feedback_obligation_active = true;
-            dirty_feedback_obligation_action_count = 0;
-            trace.event(
-                "agent.validation.dirty_feedback_obligation_prompted",
-                serde_json::json!({
-                    "turn": turn,
-                    "llm_call_depth": depth,
-                    "scope": "in_turn",
-                    "requested_validation_command_count": requested_validation_commands.len(),
-                    "completion_authority": if requested_validation_commands.is_empty() {
-                        "feedback_only"
-                    } else {
-                        "declared_probe"
-                    },
-                    "message_chars": message_chars,
-                    "estimated_tokens": estimate_tokens(message_chars),
-                    "message_count_after_append": current_messages.len(),
-                }),
-            )?;
         }
         coalesce_retained_file_observations(
             &mut current_messages,
@@ -8337,60 +8276,6 @@ mod tests {
             trace.contains("\"kind\":\"agent.validation.required_after_edit_at_max_iterations\"")
         );
         assert!(trace.contains("\"kind\":\"run.finished\""));
-    }
-
-    #[tokio::test]
-    async fn fixture_prompts_dirty_feedback_inside_the_active_tool_loop() {
-        let fixture = AgentFixture::new("Edit source once, then check it.");
-        std::fs::create_dir_all(fixture.workspace.join("src")).unwrap();
-        let gateway = ScriptedGateway::new(vec![
-            vec![tool_call_chunk(
-                "write_file",
-                HashMap::from([
-                    ("path".to_string(), json!("src/lib.rs")),
-                    (
-                        "content".to_string(),
-                        json!("pub fn answer() -> u32 { 42 }\n"),
-                    ),
-                ]),
-            )],
-            vec![tool_call_chunk(
-                "read_file",
-                HashMap::from([
-                    ("path".to_string(), json!("src/lib.rs")),
-                    ("line_start".to_string(), json!(1)),
-                    ("line_end".to_string(), json!(20)),
-                ]),
-            )],
-            vec![StreamChunk::Content(
-                "FAIL meaningful behavioral validation is unavailable".to_string(),
-            )],
-        ]);
-
-        let summary = fixture.run(&gateway, 1).await;
-
-        assert_eq!(
-            summary.final_summary,
-            "FAIL meaningful behavioral validation is unavailable"
-        );
-        let requests = gateway.stream_messages();
-        assert_eq!(requests.len(), 3);
-        assert!(requests[1].iter().any(|message| {
-            message.role == MessageRole::User
-                && message.content.as_deref().is_some_and(|content| {
-                    content.contains("source changes without fresh deterministic feedback")
-                        && content.contains("syntax-only check")
-                        && content.contains("does not create completion authority")
-                })
-        }));
-        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
-        assert!(trace.contains("\"kind\":\"agent.validation.dirty_feedback_obligation_prompted\""));
-        assert!(trace.contains("\"scope\":\"in_turn\""));
-        assert!(trace.contains("\"completion_authority\":\"feedback_only\""));
-        assert!(trace.contains("\"kind\":\"agent.validation.dirty_feedback_obligation_action\""));
-        assert!(trace.contains("\"action_index\":1"));
-        assert!(trace.contains("\"tool_name\":\"read_file\""));
-        assert!(trace.contains("\"validation_probe\":false"));
     }
 
     #[tokio::test]
