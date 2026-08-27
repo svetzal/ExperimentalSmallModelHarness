@@ -74,7 +74,7 @@ catalog:
 cargo run -- run \
   --experiment ../Experiments/GenerationN \
   --initial-context-catalog context-catalog.json \
-  --semantic-advisor-model qwen3.6:35b-a3b-coding-nvfp4
+  --semantic-advisor-model qwen3.6:27b-coding-mxfp8
 ```
 
 Catalog records have one harness-enforced disposition:

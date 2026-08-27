@@ -18,12 +18,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-const DEFAULT_MODEL: &str = "qwen3.6:35b-a3b-coding-nvfp4";
-const QWEN36_35B_A3B_CODING_CONTEXT_TOKENS: usize = 262_144;
+const DEFAULT_MODEL: &str = "qwen3.6:27b-coding-mxfp8";
+const QWEN36_27B_CODING_CONTEXT_TOKENS: usize = 262_144;
 
 fn model_context_window_tokens(model: &str) -> Option<usize> {
     match model.strip_prefix("ollama/").unwrap_or(model) {
-        DEFAULT_MODEL => Some(QWEN36_35B_A3B_CODING_CONTEXT_TOKENS),
+        DEFAULT_MODEL => Some(QWEN36_27B_CODING_CONTEXT_TOKENS),
         _ => None,
     }
 }
@@ -67,7 +67,7 @@ struct RunArgs {
     max_tool_iterations: usize,
 
     /// Model context window in tokens for provider requests and utilization traces.
-    /// Defaults to 262144 for qwen3.6:35b-a3b-coding-nvfp4 and to the provider otherwise.
+    /// Defaults to 262144 for qwen3.6:27b-coding-mxfp8 and to the provider otherwise.
     #[arg(long)]
     context_window_tokens: Option<usize>,
 
@@ -174,13 +174,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qwen36_35b_a3b_coding_uses_advertised_context_window() {
+    fn qwen36_27b_coding_uses_advertised_context_window() {
         assert_eq!(
-            model_context_window_tokens("qwen3.6:35b-a3b-coding-nvfp4"),
+            model_context_window_tokens("qwen3.6:27b-coding-mxfp8"),
             Some(262_144)
         );
         assert_eq!(
-            model_context_window_tokens("ollama/qwen3.6:35b-a3b-coding-nvfp4"),
+            model_context_window_tokens("ollama/qwen3.6:27b-coding-mxfp8"),
             Some(262_144)
         );
     }
