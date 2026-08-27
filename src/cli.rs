@@ -19,6 +19,14 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 const DEFAULT_MODEL: &str = "qwen3.6:35b-a3b-coding-nvfp4";
+const QWEN36_35B_A3B_CODING_CONTEXT_TOKENS: usize = 262_144;
+
+fn model_context_window_tokens(model: &str) -> Option<usize> {
+    match model.strip_prefix("ollama/").unwrap_or(model) {
+        DEFAULT_MODEL => Some(QWEN36_35B_A3B_CODING_CONTEXT_TOKENS),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -59,6 +67,7 @@ struct RunArgs {
     max_tool_iterations: usize,
 
     /// Model context window in tokens for provider requests and utilization traces.
+    /// Defaults to 262144 for qwen3.6:35b-a3b-coding-nvfp4 and to the provider otherwise.
     #[arg(long)]
     context_window_tokens: Option<usize>,
 
@@ -134,6 +143,9 @@ impl RunArgs {
                     self.repair_handoff_policy
                 )
             })?;
+        let context_window_tokens = self
+            .context_window_tokens
+            .or_else(|| model_context_window_tokens(&self.model));
         Ok(AgentRunConfig {
             experiment_dir: self.experiment,
             trace_dir: self.trace_dir,
@@ -142,7 +154,7 @@ impl RunArgs {
             model: self.model,
             max_iterations: self.max_iterations,
             max_tool_iterations: self.max_tool_iterations,
-            context_window_tokens: self.context_window_tokens,
+            context_window_tokens,
             packet_type: self.packet_type,
             expected_output_tokens,
             num_predict: self.num_predict,
@@ -154,6 +166,28 @@ impl RunArgs {
             initial_context_catalog_file: self.initial_context_catalog,
             semantic_advisor_model: self.semantic_advisor_model,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qwen36_35b_a3b_coding_uses_advertised_context_window() {
+        assert_eq!(
+            model_context_window_tokens("qwen3.6:35b-a3b-coding-nvfp4"),
+            Some(262_144)
+        );
+        assert_eq!(
+            model_context_window_tokens("ollama/qwen3.6:35b-a3b-coding-nvfp4"),
+            Some(262_144)
+        );
+    }
+
+    #[test]
+    fn unknown_models_leave_context_window_to_the_provider() {
+        assert_eq!(model_context_window_tokens("another-model"), None);
     }
 }
 
