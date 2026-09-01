@@ -57,6 +57,18 @@ pub const ACCEPTANCE_INTERACTION_EVIDENCE_ATTEMPT_FINISHED: &str =
 /// Payload: candidate, evidence, validation outcome, and measurement-only authority.
 pub const ACCEPTANCE_INTERACTION_EVIDENCE_POLICY_EVALUATED: &str =
     "acceptance_interaction_evidence.policy_evaluated";
+/// Accepted atomic and interaction plans were combined into one coverage ledger.
+/// Payload: counts, planning attempts, trace files, advisor model, and authority.
+pub const ACCEPTANCE_LEDGER_PLANNED: &str = "acceptance_ledger.planned";
+/// The coverage ledger was rendered into the retained worker packet.
+/// Payload: stable IDs, entry count, worker-message size, trace files, and authority.
+pub const ACCEPTANCE_LEDGER_DELIVERED: &str = "acceptance_ledger.delivered";
+/// The worker submitted current-epoch evidence citations for ledger IDs.
+/// Payload: accepted IDs, mutation epoch, incomplete IDs, completion, and authority.
+pub const TOOL_SUBMIT_ACCEPTANCE_EVIDENCE: &str = "tool.submit_acceptance_evidence";
+/// A DONE token was withheld because coverage was missing or stale.
+/// Payload: turn, response, ledger snapshot, and coverage-only authority.
+pub const ACCEPTANCE_LEDGER_DONE_REJECTED: &str = "acceptance_ledger.done_rejected";
 /// Initial-context dispositions and budgets were resolved from a catalog.
 pub const INITIAL_CONTEXT_CATALOG_RESOLVED: &str = "initial_context.catalog.resolved";
 /// No semantic advisory was needed because no selectable guidance existed.

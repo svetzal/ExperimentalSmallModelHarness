@@ -26,6 +26,7 @@ pub enum ToolCapability {
     EditFile,
     ShellCommand,
     ExecuteProbe,
+    SubmitAcceptanceEvidence,
 }
 
 /// Stable identity of a domain profile, carried on

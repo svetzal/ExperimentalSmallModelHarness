@@ -36,6 +36,14 @@ pub struct TraceAnalysis {
     pub initial_context_policy_accepted: Option<bool>,
     pub initial_context_policy_violations: Vec<Value>,
     pub initial_context_policy_errors: Vec<String>,
+    pub acceptance_ledger_enabled: bool,
+    pub acceptance_ledger_entry_count: usize,
+    pub acceptance_ledger_delivered_ids: Vec<String>,
+    pub acceptance_ledger_evidence_submission_count: usize,
+    pub acceptance_ledger_covered_ids: Vec<String>,
+    pub acceptance_ledger_latest_incomplete_ids: Vec<String>,
+    pub acceptance_ledger_done_rejection_count: usize,
+    pub acceptance_ledger_latest_mutation_epoch: Option<usize>,
     // Legacy Slice-13 measurements remain populated for preserved traces.
     pub semantic_context_enabled: bool,
     pub semantic_context_analyzer_model: Option<String>,
@@ -511,6 +519,45 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
                     .cloned()
                     .unwrap_or_default();
             }
+            events::ACCEPTANCE_LEDGER_PLANNED => {
+                analysis.acceptance_ledger_enabled = true;
+                analysis.acceptance_ledger_entry_count = payload["entry_count"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or_default();
+            }
+            events::ACCEPTANCE_LEDGER_DELIVERED => {
+                analysis.acceptance_ledger_enabled = true;
+                analysis.acceptance_ledger_delivered_ids = value_string_array(payload, "entry_ids");
+                analysis.acceptance_ledger_entry_count = payload["entry_count"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(analysis.acceptance_ledger_delivered_ids.len());
+            }
+            events::TOOL_SUBMIT_ACCEPTANCE_EVIDENCE => {
+                analysis.acceptance_ledger_enabled = true;
+                analysis.acceptance_ledger_evidence_submission_count += 1;
+                for id in value_string_array(payload, "accepted_ids") {
+                    if !analysis.acceptance_ledger_covered_ids.contains(&id) {
+                        analysis.acceptance_ledger_covered_ids.push(id);
+                    }
+                }
+                analysis.acceptance_ledger_latest_incomplete_ids =
+                    value_string_array(payload, "incomplete_ids");
+                analysis.acceptance_ledger_latest_mutation_epoch = payload["mutation_epoch"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok());
+            }
+            events::ACCEPTANCE_LEDGER_DONE_REJECTED => {
+                analysis.acceptance_ledger_enabled = true;
+                analysis.acceptance_ledger_done_rejection_count += 1;
+                analysis.acceptance_ledger_latest_incomplete_ids =
+                    value_string_array(&payload["ledger"], "incomplete_ids");
+                analysis.acceptance_ledger_latest_mutation_epoch =
+                    payload["ledger"]["mutation_epoch"]
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok());
+            }
             events::SEMANTIC_CONTEXT_ANALYSIS_STARTED => {
                 analysis.semantic_context_enabled = true;
                 analysis.semantic_context_analyzer_model = value_string(payload, "analyzer_model");
@@ -771,6 +818,7 @@ fn apply_run_started(analysis: &mut TraceAnalysis, payload: &Value) {
     analysis.transcript_policy = value_string(payload, "transcript_policy");
     analysis.packet_type = value_string(payload, "packet_type");
     analysis.expected_output_tokens = value_usize(payload, "expected_output_tokens");
+    analysis.acceptance_ledger_enabled = payload["acceptance_ledger"].as_bool().unwrap_or(false);
 }
 
 fn apply_run_finished(analysis: &mut TraceAnalysis, payload: &Value) {
@@ -1122,6 +1170,44 @@ mod tests {
         assert_eq!(analysis.initial_context_worker_message_chars, 900);
         assert_eq!(analysis.initial_context_components.len(), 2);
         assert_eq!(analysis.initial_context_policy_accepted, Some(true));
+    }
+
+    #[test]
+    fn analyzes_acceptance_ledger_coverage_and_staleness() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-acceptance-ledger.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-09-01T00:00:00Z","kind":"run.started","payload":{"model":"worker","acceptance_ledger":true}}
+{"timestamp":"2026-09-01T00:00:01Z","kind":"acceptance_ledger.planned","payload":{"entry_count":3,"authority":"coverage_only"}}
+{"timestamp":"2026-09-01T00:00:02Z","kind":"acceptance_ledger.delivered","payload":{"entry_count":3,"entry_ids":["req-a","req-b","inter-ab"]}}
+{"timestamp":"2026-09-01T00:00:03Z","kind":"tool.submit_acceptance_evidence","payload":{"accepted_ids":["req-a","req-b"],"mutation_epoch":2,"incomplete_ids":["inter-ab"],"coverage_complete":false,"authority":"coverage_only"}}
+{"timestamp":"2026-09-01T00:00:04Z","kind":"tool.submit_acceptance_evidence","payload":{"accepted_ids":["inter-ab"],"mutation_epoch":2,"incomplete_ids":[],"coverage_complete":true,"authority":"coverage_only"}}
+{"timestamp":"2026-09-01T00:00:05Z","kind":"acceptance_ledger.done_rejected","payload":{"turn":4,"ledger":{"mutation_epoch":3,"incomplete_ids":["req-a","req-b","inter-ab"]},"authority":"coverage_only"}}
+{"timestamp":"2026-09-01T00:00:06Z","kind":"run.finished","payload":{"final_summary":"unfinished"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert!(analysis.acceptance_ledger_enabled);
+        assert_eq!(analysis.acceptance_ledger_entry_count, 3);
+        assert_eq!(
+            analysis.acceptance_ledger_delivered_ids,
+            vec!["req-a", "req-b", "inter-ab"]
+        );
+        assert_eq!(analysis.acceptance_ledger_evidence_submission_count, 2);
+        assert_eq!(
+            analysis.acceptance_ledger_covered_ids,
+            vec!["req-a", "req-b", "inter-ab"]
+        );
+        assert_eq!(
+            analysis.acceptance_ledger_latest_incomplete_ids,
+            vec!["req-a", "req-b", "inter-ab"]
+        );
+        assert_eq!(analysis.acceptance_ledger_done_rejection_count, 1);
+        assert_eq!(analysis.acceptance_ledger_latest_mutation_epoch, Some(3));
     }
 
     #[test]

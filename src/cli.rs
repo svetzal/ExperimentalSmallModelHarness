@@ -113,6 +113,12 @@ struct RunArgs {
     /// Model used for isolated semantic advisory calls. Defaults to the worker model.
     #[arg(long)]
     semantic_advisor_model: Option<String>,
+
+    /// Generate a proposal-derived acceptance checklist and interaction ledger,
+    /// retain it in worker context, and require current coverage before DONE.
+    /// Ledger coverage is advisory and does not replace declared probes.
+    #[arg(long, default_value_t = false)]
+    acceptance_ledger: bool,
 }
 
 impl RunArgs {
@@ -165,6 +171,7 @@ impl RunArgs {
             transcript_policy,
             initial_context_catalog_file: self.initial_context_catalog,
             semantic_advisor_model: self.semantic_advisor_model,
+            acceptance_ledger: self.acceptance_ledger,
         })
     }
 }

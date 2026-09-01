@@ -1,3 +1,6 @@
+use crate::acceptance_ledger::{
+    AcceptanceLedgerSnapshot, AcceptanceLedgerSpec, AcceptanceLedgerState,
+};
 use crate::contract::{FileAssertion, Probe};
 use crate::profile::{DomainProfile, ProfileRef, ToolCapability};
 use crate::runtime::{
@@ -49,6 +52,7 @@ pub struct ToolScope {
     access: Arc<AccessPolicy>,
     profile: ProfileRef,
     probes: Arc<Mutex<BTreeMap<String, Probe>>>,
+    acceptance_ledger: Arc<Mutex<AcceptanceLedgerState>>,
 }
 
 #[derive(Debug, Default)]
@@ -245,6 +249,7 @@ impl ToolScope {
             access: Arc::new(access),
             profile,
             probes: Arc::new(Mutex::new(BTreeMap::new())),
+            acceptance_ledger: Arc::new(Mutex::new(AcceptanceLedgerState::default())),
         })
     }
 
@@ -963,6 +968,54 @@ impl ToolScope {
             .is_empty()
     }
 
+    pub fn configure_acceptance_ledger(&self, spec: AcceptanceLedgerSpec) -> Result<()> {
+        let runtime = self.runtime.lock().expect("runtime state mutex poisoned");
+        assert_eq!(
+            runtime.total_tool_calls, 0,
+            "acceptance ledger must be configured before effects begin"
+        );
+        drop(runtime);
+        self.acceptance_ledger
+            .lock()
+            .expect("acceptance ledger mutex poisoned")
+            .configure(spec)
+    }
+
+    fn has_configured_acceptance_ledger(&self) -> bool {
+        self.acceptance_ledger
+            .lock()
+            .expect("acceptance ledger mutex poisoned")
+            .is_configured()
+    }
+
+    pub fn acceptance_ledger_snapshot(&self) -> AcceptanceLedgerSnapshot {
+        let mutation_epoch = self
+            .runtime
+            .lock()
+            .expect("runtime state mutex poisoned")
+            .mutation_epoch;
+        self.acceptance_ledger
+            .lock()
+            .expect("acceptance ledger mutex poisoned")
+            .snapshot(mutation_epoch)
+    }
+
+    fn submit_acceptance_evidence(
+        &self,
+        acceptance_ids: &[String],
+        evidence: &str,
+    ) -> Result<AcceptanceLedgerSnapshot> {
+        let mutation_epoch = self
+            .runtime
+            .lock()
+            .expect("runtime state mutex poisoned")
+            .mutation_epoch;
+        self.acceptance_ledger
+            .lock()
+            .expect("acceptance ledger mutex poisoned")
+            .record(acceptance_ids, evidence, mutation_epoch)
+    }
+
     fn reject_symlink_escape_before_effect(&self, target: &Path) -> Result<()> {
         let existing = if target.exists() {
             target
@@ -1241,6 +1294,11 @@ pub fn tools_for_profile(scope: &ToolScope, profile: &dyn DomainProfile) -> Vec<
     if scope.has_configured_probes() && !capabilities.contains(&ToolCapability::ExecuteProbe) {
         capabilities.push(ToolCapability::ExecuteProbe);
     }
+    if scope.has_configured_acceptance_ledger()
+        && !capabilities.contains(&ToolCapability::SubmitAcceptanceEvidence)
+    {
+        capabilities.push(ToolCapability::SubmitAcceptanceEvidence);
+    }
     capabilities
         .into_iter()
         .map(|capability| match capability {
@@ -1262,8 +1320,98 @@ pub fn tools_for_profile(scope: &ToolScope, profile: &dyn DomainProfile) -> Vec<
             ToolCapability::ExecuteProbe => Box::new(ExecuteProbeTool {
                 scope: scope.clone(),
             }),
+            ToolCapability::SubmitAcceptanceEvidence => Box::new(SubmitAcceptanceEvidenceTool {
+                scope: scope.clone(),
+            }),
         })
         .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct SubmitAcceptanceEvidenceTool {
+    scope: ToolScope,
+}
+
+#[async_trait]
+impl LlmTool for SubmitAcceptanceEvidenceTool {
+    async fn run(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &ToolRunCtx,
+    ) -> mojentic::Result<Value> {
+        self.scope.note_tool_call();
+        let ids = required_array(args, "acceptance_ids")
+            .and_then(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .context("acceptance_ids entries must be strings")
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .map_err(to_mojentic_error)?;
+        let evidence = required_str(args, "evidence").map_err(to_mojentic_error)?;
+        let result = self
+            .scope
+            .submit_acceptance_evidence(&ids, evidence)
+            .map_err(to_mojentic_error);
+        let payload = match &result {
+            Ok(snapshot) => json!({
+                "accepted_ids": ids,
+                "mutation_epoch": snapshot.mutation_epoch,
+                "incomplete_ids": snapshot.incomplete_ids,
+                "coverage_complete": snapshot.is_complete(),
+                "authority": "coverage_only",
+            }),
+            Err(error) => json!({ "error": error.to_string() }),
+        };
+        self.scope.trace_tool_event(
+            crate::runtime_events::TOOL_SUBMIT_ACCEPTANCE_EVIDENCE,
+            payload.clone(),
+        );
+        result.map(|snapshot| {
+            json!({
+                "accepted_ids": ids,
+                "mutation_epoch": snapshot.mutation_epoch,
+                "incomplete_ids": snapshot.incomplete_ids,
+                "coverage_complete": snapshot.is_complete(),
+                "authority": "coverage_only",
+            })
+        })
+    }
+
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            r#type: "function".to_string(),
+            function: FunctionDescriptor {
+                name: "submit_acceptance_evidence".to_string(),
+                description: "Record which advisory acceptance-ledger entries are covered by cited observations after the latest workspace mutation. This tracks coverage only and does not replace deterministic validation.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "acceptance_ids": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 1,
+                            "uniqueItems": true
+                        },
+                        "evidence": {
+                            "type": "string",
+                            "description": "Concise citation of the command, test, inspection, or observed result covering these IDs."
+                        }
+                    },
+                    "required": ["acceptance_ids", "evidence"]
+                }),
+            },
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn LlmTool> {
+        Box::new(self.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3034,6 +3182,20 @@ mod tests {
         Probe::file_text_equals("brief-exact", "brief.md", expected)
     }
 
+    fn acceptance_spec() -> AcceptanceLedgerSpec {
+        AcceptanceLedgerSpec {
+            schema_version: crate::acceptance_ledger::ACCEPTANCE_LEDGER_SCHEMA_VERSION.into(),
+            entries: vec![crate::acceptance_ledger::AcceptanceLedgerEntry {
+                id: "interaction-order-remove".into(),
+                kind: crate::acceptance_ledger::AcceptanceLedgerEntryKind::Interaction,
+                statement: "Exclusion follows ordered inclusion.".into(),
+                suggested_evidence: "Exercise one name in both lists.".into(),
+                source_excerpt: None,
+                linked_item_ids: vec!["include-order".into(), "exclude-remove".into()],
+            }],
+        }
+    }
+
     #[test]
     fn rejects_parent_paths() {
         let temp = tempfile::tempdir().unwrap();
@@ -3060,6 +3222,35 @@ mod tests {
                 .unwrap(),
             inside
         );
+    }
+
+    #[test]
+    fn configured_acceptance_ledger_adds_coverage_tool_and_tracks_mutation_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        scope
+            .configure_acceptance_ledger(acceptance_spec())
+            .unwrap();
+        let tools = tools_for_profile(&scope, crate::profile::default_profile());
+        assert!(
+            tools
+                .iter()
+                .any(|tool| { tool.descriptor().function.name == "submit_acceptance_evidence" })
+        );
+
+        let ids = vec!["interaction-order-remove".to_string()];
+        assert!(
+            scope
+                .submit_acceptance_evidence(&ids, "focused overlap test passed")
+                .unwrap()
+                .is_complete()
+        );
+        scope.observe_runtime(RuntimeEvent::ToolMutation {
+            paths: vec!["src/example.rs".into()],
+            evidence_invalidating_paths: vec!["src/example.rs".into()],
+            source: MutationSource::Write,
+        });
+        assert!(!scope.acceptance_ledger_snapshot().is_complete());
     }
 
     #[tokio::test]

@@ -795,6 +795,70 @@ by the green 229-test Rust suite and seven structural tests. Clippy is
 warning-free. No Qwen efficacy cell has run, so semantic selection remains an
 instrumented hypothesis rather than evidence for default activation.
 
+### Slice 14: Retained Acceptance Coverage Ledger
+
+- Keep acceptance planning and interaction planning isolated, proposal-only
+  effects with deterministic schema, identity, linkage, and provenance gates.
+- Add an opt-in pre-worker treatment that renders accepted atomic requirements
+  and combined risk scenarios once into the retained worker packet.
+- Expose one coverage-only submission tool that accepts stable ledger IDs and a
+  concise evidence citation. Permit one observation to cover several IDs.
+- Record coverage against the current workspace-mutation epoch so later
+  evidence-invalidating mutations make prior submissions stale.
+- Reject `DONE` while any ledger item lacks current coverage, without granting
+  semantic or validation authority to the advisory, the worker, or its tests.
+- Preserve adapter-declared probes as the only authoritative validation gate.
+- Fail the treatment closed when either bounded planning stage cannot produce
+  deterministically acceptable output; do not disguise it as a control run.
+
+Hypothesis ID: `HYP-ACCEPTANCE-LEDGER-01`
+
+Observation: a Qwen3.8 stock-Pi DeepSWE run passed 31 self-authored tests but
+scored 6 of 24 feature tests. One coherent semantic error rejected a column
+present in both `include` and `exclude`, although the public task says include
+fixes order and exclude removes raw columns. That interpretation propagated
+through fit, evaluate, predict, serve, clustering, multi-target, and export
+paths.
+
+Hypothesis: a compact retained ledger of public requirements and their
+high-risk interactions will make the worker explicitly exercise the overlap
+case before completion, reducing coherent self-test blind spots without hidden
+benchmark knowledge.
+
+Nearest alternative explanation: the planner repeats the worker's semantic
+mistake, or ledger submissions add ceremony while the worker cites tests that
+encode the same mistake.
+
+First measurement gate: unchanged Qwen3.8 acceptance planning produced 16
+valid atomic items in one attempt and 250,285 ms. Its interaction planner
+rejected one malformed structured response, then accepted 12 scenarios after
+two attempts and 1,094,957 ms. Accepted scenario `inter-08` explicitly combines
+`include=[f1,f2,f3]` with `exclude=[f1,f2]` and expects exclusion to remove the
+overlapping columns before the remaining filters. The treatment therefore
+passed the preregistered semantic gate.
+
+Initial efficacy cell:
+
+- Task: DeepSWE `igel-persist-feature-schema`.
+- Model: `qwen3.8:27b-mxfp8`.
+- Control: current harness without acceptance ledger.
+- Treatment: identical harness with `--acceptance-ledger`.
+- Replicates: one diagnostic pilot, then three sequential runs per arm.
+- Fixed variables: seed workspace, public instruction, context window,
+  `num_predict`, transcript policy, tool budgets, repair policy, memory policy,
+  and independent verifier.
+- Primary measurement: whether the worker exercises overlapping include and
+  exclude names with removal semantics.
+- Secondary measurements: current ledger coverage, validation reach, feature
+  tests, existing tests, partial reward, runtime, turns, tokens, context
+  pressure, and hard-stop class.
+
+Decision rule: keep the ledger opt-in unless at least two of three treatment
+runs exercise the interaction and treatment does not reduce semantic quality or
+validation reach relative to control. Roll back if coverage can masquerade as
+validation, stale evidence survives mutation, or completion claims rise without
+independent-verifier improvement.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`

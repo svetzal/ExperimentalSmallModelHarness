@@ -1,3 +1,8 @@
+use crate::acceptance_interactions::{
+    DEFAULT_MAX_INTERACTION_SCENARIOS, plan_acceptance_interactions_with_gateway,
+};
+use crate::acceptance_ledger::{AcceptanceLedgerSnapshot, AcceptanceLedgerSpec};
+use crate::acceptance_plan::{DEFAULT_MAX_PLAN_ITEMS, plan_acceptance_with_gateway};
 use crate::tools::{
     SuccessfulValidationSnapshot, ToolPolicySnapshot, ToolScope, ValidationRepairSnapshot,
     tools_for_profile,
@@ -48,6 +53,7 @@ const ACTION_BOUNDARY_INTENT_HIT_LIMIT: usize = 2;
 const ACTION_BOUNDARY_INTENT_BUFFER_CHARS: usize = 4_096;
 const ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS: usize = 512;
 const RESPONSE_TOOL_CALL_ARGUMENT_MAX_CHARS: usize = 4_096;
+const ACCEPTANCE_LEDGER_ADVISORY_OUTPUT_TOKENS: usize = 4_096;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -75,6 +81,9 @@ pub struct AgentRunConfig {
     /// Optional model override for isolated semantic advisory calls. Defaults
     /// to the worker model when an advisory is required.
     pub semantic_advisor_model: Option<String>,
+    /// Generate and retain a proposal-derived acceptance coverage ledger before
+    /// the worker loop. Coverage is advisory and never replaces declared probes.
+    pub acceptance_ledger: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +106,10 @@ pub struct AgentRunSummary {
     pub transcript_policy: TranscriptPolicy,
     pub initial_context_catalog_file: Option<PathBuf>,
     pub semantic_advisor_model: Option<String>,
+    pub acceptance_ledger: bool,
+    pub acceptance_ledger_entry_count: usize,
+    pub acceptance_plan_trace_file: Option<PathBuf>,
+    pub acceptance_interactions_trace_file: Option<PathBuf>,
     pub required_initial_context_ids: Vec<String>,
     pub advisory_selected_context_ids: Vec<String>,
     pub excluded_initial_context_ids: Vec<String>,
@@ -342,6 +355,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "transcript_policy": config.transcript_policy,
             "initial_context_catalog_file": config.initial_context_catalog_file,
             "semantic_advisor_model": config.semantic_advisor_model,
+            "acceptance_ledger": config.acceptance_ledger,
             "requested_validation_commands": &requested_validation_commands,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
             "harness_package_version": env!("CARGO_PKG_VERSION"),
@@ -414,6 +428,72 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         }
     };
 
+    let acceptance_ledger_result: Result<_> = async {
+        if !config.acceptance_ledger {
+            return Ok(None);
+        }
+        let advisor_model = config
+            .semantic_advisor_model
+            .as_deref()
+            .unwrap_or(&config.model);
+        let plan_summary = plan_acceptance_with_gateway(
+            gateway,
+            advisor_model,
+            &resolved_contract.guidance,
+            &trace_dir.join("acceptance-plan"),
+            DEFAULT_MAX_PLAN_ITEMS,
+            ACCEPTANCE_LEDGER_ADVISORY_OUTPUT_TOKENS,
+        )
+        .await?;
+        let interaction_summary = plan_acceptance_interactions_with_gateway(
+            gateway,
+            advisor_model,
+            &resolved_contract.guidance,
+            &plan_summary.plan,
+            &trace_dir.join("acceptance-interactions"),
+            DEFAULT_MAX_INTERACTION_SCENARIOS,
+            ACCEPTANCE_LEDGER_ADVISORY_OUTPUT_TOKENS,
+        )
+        .await?;
+        let spec = AcceptanceLedgerSpec::from_plans(
+            &plan_summary.plan,
+            &interaction_summary.interactions,
+        )?;
+        trace.event(
+            crate::runtime_events::ACCEPTANCE_LEDGER_PLANNED,
+            serde_json::json!({
+                "authority": "coverage_only",
+                "advisor_model": advisor_model,
+                "atomic_item_count": plan_summary.plan.items.len(),
+                "interaction_scenario_count": interaction_summary.interactions.scenarios.len(),
+                "entry_count": spec.entries.len(),
+                "plan_attempts": plan_summary.attempts,
+                "interaction_attempts": interaction_summary.attempts,
+                "plan_trace_file": plan_summary.trace_file,
+                "interaction_trace_file": interaction_summary.trace_file,
+            }),
+        )?;
+        Ok(Some((
+            spec,
+            plan_summary.trace_file,
+            interaction_summary.trace_file,
+        )))
+    }
+    .await;
+    let acceptance_ledger = match acceptance_ledger_result {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            trace.event(
+                crate::runtime_events::RUN_FAILED,
+                serde_json::json!({
+                    "stage": "acceptance_ledger",
+                    "error": error.to_string(),
+                }),
+            )?;
+            return Err(error);
+        }
+    };
+
     let scope_rules = |scope: &crate::contract::Scope| match scope {
         crate::contract::Scope::Unrestricted => Vec::new(),
         crate::contract::Scope::Rules(rules) => rules.clone(),
@@ -432,6 +512,9 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         .map(|probe| (probe.command.clone(), probe.id.clone()))
         .collect::<BTreeMap<_, _>>();
     scope.configure_probes(resolved_contract.probes.clone())?;
+    if let Some((spec, _, _)) = &acceptance_ledger {
+        scope.configure_acceptance_ledger(spec.clone())?;
+    }
     let system_prompt = profile.system_guidance();
     let tools = tools_for_profile(&scope, profile);
     let repair_tools = tools
@@ -454,10 +537,25 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         })
         .map(|tool| tool.clone_box())
         .collect::<Vec<_>>();
-    let worker_message = worker_message_with_declared_probes(
+    let worker_message = worker_message_with_acceptance_ledger(
         &initial_context.worker_message,
-        &resolved_contract.probes,
+        acceptance_ledger.as_ref().map(|(spec, _, _)| spec),
     );
+    let worker_message =
+        worker_message_with_declared_probes(&worker_message, &resolved_contract.probes);
+    if let Some((spec, plan_trace_file, interaction_trace_file)) = &acceptance_ledger {
+        trace.event(
+            crate::runtime_events::ACCEPTANCE_LEDGER_DELIVERED,
+            serde_json::json!({
+                "authority": "coverage_only",
+                "entry_ids": spec.entries.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(),
+                "entry_count": spec.entries.len(),
+                "worker_message_chars": worker_message.chars().count(),
+                "plan_trace_file": plan_trace_file,
+                "interaction_trace_file": interaction_trace_file,
+            }),
+        )?;
+    }
     if !resolved_contract.probes.is_empty() {
         trace.event(
             crate::runtime_events::AGENT_CONTRACT_PROBES_DELIVERED,
@@ -1070,6 +1168,24 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             )));
             continue;
         }
+        if is_done_response(&final_summary) && config.acceptance_ledger {
+            let acceptance = scope.acceptance_ledger_snapshot();
+            if !acceptance.is_complete() {
+                trace.event(
+                    crate::runtime_events::ACCEPTANCE_LEDGER_DONE_REJECTED,
+                    serde_json::json!({
+                        "turn": turn,
+                        "response": final_summary,
+                        "ledger": acceptance,
+                        "authority": "coverage_only",
+                    }),
+                )?;
+                messages.push(LlmMessage::user(acceptance_ledger_done_rejected_prompt(
+                    &acceptance,
+                )));
+                continue;
+            }
+        }
         if is_terminal_response(&final_summary) {
             if let Some(token) = crate::runtime::terminal_token(&final_summary) {
                 let event = crate::runtime::RuntimeEvent::TerminalToken { token };
@@ -1159,6 +1275,15 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         transcript_policy: config.transcript_policy,
         initial_context_catalog_file: config.initial_context_catalog_file,
         semantic_advisor_model: config.semantic_advisor_model,
+        acceptance_ledger: config.acceptance_ledger,
+        acceptance_ledger_entry_count: acceptance_ledger
+            .as_ref()
+            .map(|(spec, _, _)| spec.entries.len())
+            .unwrap_or(0),
+        acceptance_plan_trace_file: acceptance_ledger.as_ref().map(|(_, path, _)| path.clone()),
+        acceptance_interactions_trace_file: acceptance_ledger
+            .as_ref()
+            .map(|(_, _, path)| path.clone()),
         required_initial_context_ids: initial_context.required_ids,
         advisory_selected_context_ids: initial_context.advisory_selected_ids,
         excluded_initial_context_ids: initial_context.excluded_ids,
@@ -1557,6 +1682,24 @@ fn done_rejected_prompt(ledger: &RequestedValidationLedger) -> String {
          Reply DONE only after every listed command passes after the latest \
          source mutation. Reply FAIL only if blocked."
     )
+}
+
+fn acceptance_ledger_done_rejected_prompt(ledger: &AcceptanceLedgerSnapshot) -> String {
+    format!(
+        "DONE is not accepted yet because advisory acceptance coverage is incomplete for mutation epoch {}. Missing or stale ledger IDs: {}. Address those requirements and interactions, gather deterministic observations, then call `submit_acceptance_evidence` with the covered IDs and concise citations. This is a coverage gate; declared probes remain the validation authority.",
+        ledger.mutation_epoch,
+        ledger.incomplete_ids.join(", ")
+    )
+}
+
+fn worker_message_with_acceptance_ledger(
+    base: &str,
+    ledger: Option<&AcceptanceLedgerSpec>,
+) -> String {
+    match ledger {
+        Some(ledger) => format!("{base}\n\n{}", ledger.render_worker_packet()),
+        None => base.to_string(),
+    }
 }
 
 fn worker_message_with_declared_probes(base: &str, probes: &[crate::contract::Probe]) -> String {
@@ -5087,6 +5230,28 @@ mod tests {
     }
 
     #[test]
+    fn absent_acceptance_ledger_leaves_worker_message_byte_identical() {
+        let base = "Complete the task.";
+        assert_eq!(worker_message_with_acceptance_ledger(base, None), base);
+    }
+
+    #[test]
+    fn acceptance_done_rejection_names_only_incomplete_current_ids() {
+        let ledger = AcceptanceLedgerSnapshot {
+            schema_version: crate::acceptance_ledger::ACCEPTANCE_LEDGER_SCHEMA_VERSION.into(),
+            mutation_epoch: 3,
+            entries: Vec::new(),
+            evidence: BTreeMap::new(),
+            incomplete_ids: vec!["req-api".into(), "interaction-overlap".into()],
+        };
+        let prompt = acceptance_ledger_done_rejected_prompt(&ledger);
+        assert!(prompt.contains("mutation epoch 3"));
+        assert!(prompt.contains("req-api, interaction-overlap"));
+        assert!(prompt.contains("coverage gate"));
+        assert!(prompt.contains("declared probes remain the validation authority"));
+    }
+
+    #[test]
     fn declared_command_probe_is_delivered_by_id_without_implementation() {
         let command = "python3 verify_boundary.py --signal SIGINT";
         let message = worker_message_with_declared_probes(
@@ -7556,6 +7721,7 @@ mod tests {
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             initial_context_catalog_file: None,
             semantic_advisor_model: None,
+            acceptance_ledger: false,
         };
         let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
 
@@ -8780,6 +8946,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_rejects_done_until_current_acceptance_coverage_is_submitted() {
+        let task = "Create artifact.txt and validate its exact output.";
+        let fixture = AgentFixture::new(task);
+        let gateway = ScriptedGateway::with_json(
+            vec![
+                vec![StreamChunk::Content("DONE".to_string())],
+                vec![
+                    tool_call_chunk(
+                        "submit_acceptance_evidence",
+                        HashMap::from([
+                            (
+                                "acceptance_ids".to_string(),
+                                json!(["artifact", "validation", "interaction"]),
+                            ),
+                            (
+                                "evidence".to_string(),
+                                json!("exact-output check passed after artifact inspection"),
+                            ),
+                        ]),
+                    ),
+                    StreamChunk::Content("DONE".to_string()),
+                ],
+            ],
+            vec![
+                json!({
+                    "schema_version": "acceptance_plan.v1",
+                    "items": [
+                        {
+                            "id": "artifact",
+                            "requirement": "Create artifact.txt.",
+                            "kind": "artifact",
+                            "source_excerpt": "Create artifact.txt and validate its exact output.",
+                            "suggested_evidence": "Inspect artifact.txt."
+                        },
+                        {
+                            "id": "validation",
+                            "requirement": "Validate exact output.",
+                            "kind": "behavior",
+                            "source_excerpt": "Create artifact.txt and validate its exact output.",
+                            "suggested_evidence": "Run an exact-output check."
+                        }
+                    ]
+                }),
+                json!({
+                    "schema_version": "acceptance_interactions.v1",
+                    "scenarios": [{
+                        "id": "interaction",
+                        "item_ids": ["artifact", "validation"],
+                        "risk": "The artifact can exist while its exact output is wrong.",
+                        "suggested_evidence": "Inspect the artifact and check exact output together."
+                    }]
+                }),
+            ],
+        );
+
+        let summary = fixture.run_with_acceptance_ledger(&gateway, 2).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        assert!(summary.acceptance_ledger);
+        assert_eq!(summary.acceptance_ledger_entry_count, 3);
+        assert_eq!(gateway.json_messages().len(), 2);
+        assert!(gateway.stream_messages().len() >= 2);
+        assert!(
+            gateway.stream_messages()[0][1]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("submit_acceptance_evidence")
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"acceptance_ledger.delivered\""));
+        assert!(trace.contains("\"kind\":\"acceptance_ledger.done_rejected\""));
+        assert!(trace.contains("\"kind\":\"tool.submit_acceptance_evidence\""));
+        assert!(trace.contains("\"coverage_complete\":true"));
+    }
+
+    #[tokio::test]
     async fn fixture_required_only_catalog_skips_advisory_and_excludes_content() {
         let fixture = AgentFixture::new("Produce the requested outcome.");
         std::fs::write(
@@ -8871,6 +9114,40 @@ mod tests {
             self.run_with_trace_dir(gateway, max_iterations, None).await
         }
 
+        async fn run_with_acceptance_ledger(
+            &self,
+            gateway: &ScriptedGateway,
+            max_iterations: usize,
+        ) -> AgentRunSummary {
+            run_agent_with_gateway(
+                AgentRunConfig {
+                    experiment_dir: self.experiment.clone(),
+                    trace_dir: None,
+                    goal_file: PathBuf::from("task.md"),
+                    contract_file: None,
+                    model: "fake-model".to_string(),
+                    max_iterations,
+                    max_tool_iterations: 10,
+                    context_window_tokens: Some(131_072),
+                    packet_type: "narrow-patch".to_string(),
+                    expected_output_tokens: 2_048,
+                    num_predict: None,
+                    max_thinking_only_tokens: 2_048,
+                    repair_exit_thinking_tokens: 16_384,
+                    repair_handoff_policy: RepairHandoffPolicy::TextOnly,
+                    action_boundary_interrupt_tokens: 0,
+                    transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                    initial_context_catalog_file: None,
+                    semantic_advisor_model: None,
+                    acceptance_ledger: true,
+                },
+                gateway,
+                self.workspace.clone(),
+            )
+            .await
+            .unwrap()
+        }
+
         async fn run_with_trace_dir(
             &self,
             gateway: &ScriptedGateway,
@@ -8897,6 +9174,7 @@ mod tests {
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
+                    acceptance_ledger: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -8956,6 +9234,7 @@ mod tests {
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
+                    acceptance_ledger: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -8989,6 +9268,7 @@ mod tests {
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
+                    acceptance_ledger: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -9022,6 +9302,7 @@ mod tests {
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
+                    acceptance_ledger: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -9051,6 +9332,7 @@ mod tests {
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: Some(PathBuf::from("context-catalog.json")),
                     semantic_advisor_model: Some("context-curator-model".to_string()),
+                    acceptance_ledger: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -9177,11 +9459,27 @@ mod tests {
         async fn complete(
             &self,
             _model: &str,
-            _messages: &[LlmMessage],
+            messages: &[LlmMessage],
             _tools: Option<&[Box<dyn LlmTool>]>,
-            _config: &CompletionConfig,
+            config: &CompletionConfig,
         ) -> mojentic::Result<LlmGatewayResponse> {
-            unimplemented!("streaming path only")
+            assert_eq!(config.max_tool_iterations, 0);
+            self.json_messages
+                .lock()
+                .expect("scripted gateway JSON-message mutex poisoned")
+                .push(messages.to_vec());
+            let proposal = self
+                .json_responses
+                .lock()
+                .expect("scripted gateway JSON mutex poisoned")
+                .pop_front()
+                .expect("unexpected structured-output call");
+            Ok(LlmGatewayResponse {
+                content: Some(serde_json::to_string(&proposal).unwrap()),
+                object: None,
+                tool_calls: Vec::new(),
+                thinking: Some("scripted advisory reasoning".into()),
+            })
         }
 
         async fn complete_json(

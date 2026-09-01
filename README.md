@@ -133,6 +133,27 @@ the catalog is omitted—or contains no selectable records—no advisory call is
 made. The semantic-selection policy remains experimental even though native
 context assembly is now foundational.
 
+### Acceptance coverage ledger
+
+`run --acceptance-ledger` enables an experimental pre-worker planning phase.
+The isolated advisor first produces a deterministically validated atomic
+acceptance plan, then a validated set of high-risk interactions between those
+requirements. The accepted entries are rendered once into the retained worker
+packet with their public provenance and suggested evidence.
+
+The treatment adds `submit_acceptance_evidence`. The worker may cite one
+observation for several stable ledger IDs. A submission records coverage at the
+current workspace-mutation epoch; a later evidence-invalidating mutation makes
+that coverage stale. `DONE` is withheld until every atomic and interaction ID
+has current coverage.
+
+Ledger coverage is explicitly advisory. It does not convert model-authored
+tests, inspections, or claims into validation authority. Adapter-declared
+probes retain their existing terminal authority and must still pass after the
+latest relevant mutation. If either planning stage exhausts its bounded
+structured-output attempts, the treatment run fails closed rather than
+silently falling back to a control packet.
+
 ### Declared probe delivery
 
 Adapter-owned probes in an explicit run contract are part of the initial worker
