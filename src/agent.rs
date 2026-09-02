@@ -3375,7 +3375,101 @@ fn coalesce_retained_file_observations(
         llm_call_depth,
         context_window_tokens,
     )?;
+    retain_latest_file_observation_epochs(&mut output, trace, turn, llm_call_depth)?;
     *messages = output;
+    Ok(())
+}
+
+fn retain_latest_file_observation_epochs(
+    messages: &mut Vec<LlmMessage>,
+    trace: &TraceRecorder,
+    turn: usize,
+    llm_call_depth: usize,
+) -> Result<()> {
+    let mut latest_epochs = BTreeMap::<String, usize>::new();
+    let mut index = 0;
+    while index < messages.len() {
+        let span = assistant_tool_exchange_span(messages, index).unwrap_or(1);
+        if let Some(observations) = parse_read_exchange(&messages[index..index + span]) {
+            for observation in observations {
+                if let ParsedFileObservation::Consolidated(value) = observation.observation {
+                    latest_epochs
+                        .entry(value.path)
+                        .and_modify(|epoch| *epoch = (*epoch).max(value.epoch))
+                        .or_insert(value.epoch);
+                }
+            }
+        }
+        index += span;
+    }
+    if latest_epochs.is_empty() {
+        return Ok(());
+    }
+
+    let original = std::mem::take(messages);
+    let mut retained = Vec::with_capacity(original.len());
+    let mut removed_projection_count = 0;
+    let mut cursor = 0;
+    while cursor < original.len() {
+        let span = assistant_tool_exchange_span(&original, cursor).unwrap_or(1);
+        let exchange = &original[cursor..cursor + span];
+        let Some(observations) = parse_read_exchange(exchange) else {
+            retained.extend(exchange.iter().cloned());
+            cursor += span;
+            continue;
+        };
+        let calls = exchange[0]
+            .tool_calls
+            .as_ref()
+            .expect("parsed read exchange has tool calls");
+        let removed_ordinals = observations
+            .iter()
+            .filter_map(|observation| match &observation.observation {
+                ParsedFileObservation::Consolidated(value)
+                    if latest_epochs
+                        .get(&value.path)
+                        .is_some_and(|epoch| *epoch > value.epoch) =>
+                {
+                    Some(observation.ordinal)
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        removed_projection_count += removed_ordinals.len();
+        let retained_ordinals = (0..calls.len())
+            .filter(|ordinal| !removed_ordinals.contains(ordinal))
+            .collect::<Vec<_>>();
+        if !retained_ordinals.is_empty() {
+            let mut assistant = exchange[0].clone();
+            assistant.tool_calls = Some(
+                retained_ordinals
+                    .iter()
+                    .map(|ordinal| calls[*ordinal].clone())
+                    .collect(),
+            );
+            retained.push(assistant);
+            retained.extend(
+                retained_ordinals
+                    .iter()
+                    .map(|ordinal| exchange[*ordinal + 1].clone()),
+            );
+        }
+        cursor += span;
+    }
+    *messages = retained;
+    if removed_projection_count > 0 {
+        trace.event(
+            "llm.context_assembly.superseded_file_observations_removed",
+            serde_json::json!({
+                "schema_version": "latest_file_observation.v1",
+                "turn": turn,
+                "llm_call_depth": llm_call_depth,
+                "removed_projection_count": removed_projection_count,
+                "latest_epochs": latest_epochs,
+                "raw_history_retained_in_trace_only": true,
+            }),
+        )?;
+    }
     Ok(())
 }
 
@@ -5660,6 +5754,9 @@ mod tests {
             validation_required_after_write: false,
             total_write_operations: 0,
             total_shell_probes: 1,
+            total_operational_checks: 0,
+            operational_check_required: false,
+            writes_remaining_before_check: 3,
             validation_repair: None,
             validation_repair_read_paths: BTreeMap::new(),
             latest_successful_validation_after_write: None,
@@ -6176,9 +6273,8 @@ mod tests {
                     .and_then(|content| parse_consolidated_file_observation(content.trim()))
             })
             .collect::<Vec<_>>();
-        assert_eq!(observations.len(), 2);
-        assert_eq!(observations[0].epoch, 0);
-        assert_eq!(observations[1].epoch, 1);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].epoch, 1);
     }
 
     #[test]
@@ -6251,26 +6347,15 @@ mod tests {
                     .and_then(|content| parse_consolidated_file_observation(content.trim()))
             })
             .collect::<Vec<_>>();
-        assert_eq!(observations.len(), 2);
-        assert_eq!(observations[0].epoch, 0);
-        assert_eq!(observations[1].epoch, 1);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].epoch, 1);
         assert!(
             observations[0].segments[0]
-                .content
-                .contains("before mutation")
-        );
-        assert!(
-            observations[1].segments[0]
                 .content
                 .contains("after mutation")
         );
         assert!(
             !observations[0].segments[0]
-                .content
-                .contains("after mutation")
-        );
-        assert!(
-            !observations[1].segments[0]
                 .content
                 .contains("before mutation")
         );
@@ -8113,6 +8198,9 @@ mod tests {
             validation_required_after_write: false,
             total_write_operations,
             total_shell_probes,
+            total_operational_checks: 0,
+            operational_check_required: false,
+            writes_remaining_before_check: 3,
             validation_repair,
             validation_repair_read_paths,
             latest_successful_validation_after_write: None,
@@ -8938,16 +9026,21 @@ mod tests {
                     ),
                 ]),
             )],
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".to_string(), json!("test -f src/lib.rs"))]),
+            )],
             vec![StreamChunk::Content("DONE".to_string())],
         ]);
 
-        let summary = fixture.run_contract(&gateway, 2).await;
+        let summary = fixture.run_contract(&gateway, 3).await;
 
         assert_eq!(summary.final_summary, "DONE");
         let trace = std::fs::read_to_string(summary.trace_file).unwrap();
         assert!(trace.contains("\"kind\":\"agent.stage.first_source_mutation\""));
         assert!(!trace.contains("\"kind\":\"agent.validation.required_after_edit\""));
         assert!(!trace.contains("\"kind\":\"agent.validation_probe.observed\""));
+        assert!(trace.contains("\"kind\":\"agent.operational_check.observed\""));
     }
 
     #[tokio::test]

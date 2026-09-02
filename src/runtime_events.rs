@@ -156,6 +156,19 @@ pub fn legacy_trace_events(event: &RuntimeEvent) -> Vec<LegacyTraceEvent> {
                 "success": success,
             }),
         ),
+        RuntimeEvent::OperationalCheck {
+            command,
+            status,
+            success,
+        } => one(
+            "agent.operational_check.observed",
+            json!({
+                "command": command,
+                "status": status,
+                "success": success,
+                "acceptance_authority": false,
+            }),
+        ),
         RuntimeEvent::RequestedProbeObserved {
             probe_id,
             command,

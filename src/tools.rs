@@ -39,7 +39,6 @@ const DECLARED_PROBE_EVENT_PREFIX: &str = "HARNESS_PROBE_EVENT\t";
 const MAX_DECLARED_PROBE_PHASE_EVENTS: usize = 64;
 const MISMATCH_CONTEXT_BEFORE_BYTES: usize = 16;
 const MISMATCH_CONTEXT_AFTER_BYTES: usize = 32;
-#[cfg(test)]
 const MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL: usize =
     crate::runtime::MAX_CONSECUTIVE_WRITES_WITHOUT_PROBE;
 
@@ -73,6 +72,9 @@ pub struct ToolPolicySnapshot {
     pub validation_required_after_write: bool,
     pub total_write_operations: usize,
     pub total_shell_probes: usize,
+    pub total_operational_checks: usize,
+    pub operational_check_required: bool,
+    pub writes_remaining_before_check: usize,
     pub validation_repair: Option<ValidationRepairSnapshot>,
     pub validation_repair_read_paths: BTreeMap<String, usize>,
     pub latest_successful_validation_after_write: Option<SuccessfulValidationSnapshot>,
@@ -473,7 +475,13 @@ impl ToolScope {
                     "writes_since_shell_probe": runtime.writes_since_probe,
                     "writes_since_shell_probe_paths": runtime.writes_since_probe_paths,
                     "total_write_operations": runtime.total_write_operations,
-                    "required_action": "shell_validation_probe",
+                    "required_action": "shell_command",
+                    "required_action_contract": {
+                        "command": "the most relevant deterministic non-mutating check",
+                        "passing_check_reopens_writes": MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL,
+                        "failing_check_reopens_writes": 1,
+                        "acceptance_authority": false,
+                    },
                 }),
             )?;
             bail!(reason);
@@ -565,6 +573,19 @@ impl ToolScope {
                 }),
             );
         }
+    }
+
+    fn note_operational_check(
+        &self,
+        command: &str,
+        status: Option<i32>,
+        success: bool,
+    ) -> RuntimeDecision {
+        self.observe_runtime(RuntimeEvent::OperationalCheck {
+            command: command.to_string(),
+            status,
+            success,
+        })
     }
 
     fn shell_mutation_snapshot(&self) -> Result<BTreeMap<String, FileFingerprint>> {
@@ -874,9 +895,14 @@ impl ToolScope {
             consecutive_writes_without_shell: runtime.consecutive_writes_without_probe,
             writes_since_shell_probe: runtime.writes_since_probe,
             writes_since_shell_probe_paths: runtime.writes_since_probe_paths.clone(),
-            validation_required_after_write: runtime.validation_required(),
+            validation_required_after_write: runtime.validation_required()
+                || runtime.operational_check_required(),
             total_write_operations: runtime.total_write_operations,
             total_shell_probes: runtime.total_validation_probes,
+            total_operational_checks: runtime.total_operational_checks,
+            operational_check_required: runtime.operational_check_required(),
+            writes_remaining_before_check: MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL
+                .saturating_sub(runtime.consecutive_writes_without_probe),
             validation_repair: runtime
                 .validation_repair
                 .as_ref()
@@ -2424,9 +2450,8 @@ impl LlmTool for ShellCommandTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "shell_command".to_string(),
-                description:
-                    "Run a shell command from the writable workspace by default, or another scoped child directory."
-                        .to_string(),
+                description: "Run a shell command from the writable workspace by default, or another scoped child directory. After one or more writes, a non-mutating command is also the operational check that reopens structured editing: success restores the full edit allowance and failure grants one focused repair edit. This operational checkpoint is not an adapter-owned acceptance probe."
+                    .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -2464,7 +2489,7 @@ impl ShellCommandTool {
         declared_probe_id: Option<&str>,
     ) -> Result<Value> {
         let command = required_str(args, "command")?;
-        validate_shell_command(command, &self.scope.root)?;
+        validate_shell_command(command)?;
         let cwd = self
             .scope
             .resolve_shell_cwd(args.get("cwd").and_then(Value::as_str))?;
@@ -2474,9 +2499,9 @@ impl ShellCommandTool {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
-        // Arbitrary model-authored shell is an opaque effect, not validation
-        // authority. Only an executor-owned, contract-declared probe may
-        // update validation state or clear pending evidence.
+        // Arbitrary model-authored shell may reopen the operational edit
+        // throttle after a non-mutating check. It never impersonates
+        // executor-owned declared-probe acceptance authority.
         let validation_probe = declared_probe_id.is_some();
         let policy_before_command = self.scope.policy_snapshot();
         let command_family = self.scope.profile().command_family(command);
@@ -2569,6 +2594,35 @@ impl ShellCommandTool {
             && policy_before_command.validation_required_after_write
             && output.status.success();
         self.scope.note_sensed_shell_mutation(&shell_mutation_paths);
+        let operational_check = !validation_probe
+            && !shell_mutation_sensed
+            && policy_before_command.consecutive_writes_without_shell > 0;
+        let operational_check_decision = operational_check.then(|| {
+            self.scope.note_operational_check(
+                command,
+                output.status.code(),
+                output.status.success(),
+            )
+        });
+        if operational_check {
+            let _ = self.scope.trace.event(
+                "agent.operational_check.observed",
+                json!({
+                    "command": command,
+                    "command_family": command_family,
+                    "status": output.status.code(),
+                    "success": output.status.success(),
+                    "acceptance_authority": false,
+                    "declared_probe": false,
+                    "write_budget_effect": if output.status.success() {
+                        "full_allowance_reopened"
+                    } else {
+                        "one_repair_write_reopened"
+                    },
+                    "runtime_decision": operational_check_decision,
+                }),
+            );
+        }
         if shell_mutation_sensed {
             let _ = self.scope.trace.event(
                 "agent.shell.mutation_sensed",
@@ -2587,7 +2641,13 @@ impl ShellCommandTool {
             "command_family": command_family,
             "validation_probe": validation_probe,
             "validation_probe_clears_pending_source_writes": validation_probe_clears_pending_source_writes,
+            "operational_check": operational_check,
+            "operational_check_acceptance_authority": false,
+            "write_budget_reopened": operational_check,
+            "writes_remaining_before_check": policy_snapshot.writes_remaining_before_check,
+            "operational_check_required": policy_snapshot.operational_check_required,
             "total_shell_probes": policy_snapshot.total_shell_probes,
+            "total_operational_checks": policy_snapshot.total_operational_checks,
             "total_write_operations": policy_snapshot.total_write_operations,
             "status": output.status.code(),
             "success": output.status.success(),
@@ -2994,26 +3054,9 @@ fn patch_strip_level(patch: &str) -> u8 {
     0
 }
 
-fn validate_shell_command(command: &str, root: &Path) -> Result<()> {
-    for token in command.split_whitespace() {
-        let cleaned = token.trim_matches(|ch| {
-            matches!(
-                ch,
-                '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ';' | ','
-            )
-        });
-        if cleaned.starts_with('/') {
-            let path = Path::new(cleaned);
-            let Ok(canonical) = path.canonicalize() else {
-                bail!("absolute path does not exist inside the tool scope: {cleaned}");
-            };
-            if !canonical.starts_with(root) {
-                bail!("shell commands must not reference paths outside the tool scope: {cleaned}");
-            }
-        }
-        if cleaned == ".." || cleaned.starts_with("../") || cleaned.contains("/../") {
-            bail!("shell commands must not reference parent paths: {cleaned}");
-        }
+fn validate_shell_command(command: &str) -> Result<()> {
+    if command.contains('\0') {
+        bail!("shell command must not contain a NUL byte");
     }
     Ok(())
 }
@@ -4085,22 +4128,17 @@ bytes[0..5] \"cafe\\n\""
     }
 
     #[test]
-    fn rejects_absolute_shell_tokens() {
-        let temp = tempfile::tempdir().unwrap();
-        let scope = scope(&temp);
-        assert!(validate_shell_command("ls /home/user", &scope.root).is_err());
-        assert!(validate_shell_command("cat ../task.md", &scope.root).is_err());
-        assert!(validate_shell_command("cd workspace && cargo test", &scope.root).is_ok());
+    fn shell_validation_does_not_infer_paths_from_program_text() {
+        assert!(
+            validate_shell_command("python -c \"value = Path(root) / 'file'; route = '/predict'\"")
+                .is_ok()
+        );
+        assert!(validate_shell_command("sed -i '/from/a replacement' source.py").is_ok());
     }
 
     #[test]
-    fn permits_absolute_shell_tokens_inside_tool_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let scope = scope(&temp);
-        let file = temp.path().join("src-main.rs");
-        std::fs::write(&file, "fn main() {}\n").unwrap();
-
-        assert!(validate_shell_command(&format!("cat {}", file.display()), &scope.root).is_ok());
+    fn shell_validation_rejects_nul_bytes() {
+        assert!(validate_shell_command("printf 'before\0after'").is_err());
     }
 
     #[test]
@@ -4428,9 +4466,9 @@ bytes[0..5] \"cafe\\n\""
             .to_string();
         let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
 
-        assert!(error.contains("write budget exhausted"));
+        assert!(error.contains("write checkpoint required"));
         assert!(trace.contains("\"kind\":\"agent.write_budget.exhausted\""));
-        assert!(trace.contains("\"required_action\":\"shell_validation_probe\""));
+        assert!(trace.contains("\"required_action\":\"shell_command\""));
         assert!(trace.contains("\"attempted_source_paths\":[\"src/main.rs\"]"));
     }
 
@@ -4553,7 +4591,7 @@ bytes[0..5] \"cafe\\n\""
             .to_string();
         let trace = std::fs::read_to_string(scope.trace.path()).unwrap();
 
-        assert!(error.contains("write budget exhausted"));
+        assert!(error.contains("write checkpoint required"));
         assert!(trace.contains("\"kind\":\"agent.validation.repair_write_allowance.granted\""));
         assert!(trace.contains("\"kind\":\"agent.validation.repair_write_allowance.used\""));
         assert!(scope.policy_snapshot().validation_required_after_write);
@@ -4777,7 +4815,7 @@ bytes[0..5] \"cafe\\n\""
     }
 
     #[tokio::test]
-    async fn observation_shell_command_does_not_reset_write_budget() {
+    async fn non_mutating_shell_check_reopens_write_budget_without_probe_authority() {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
         scope
@@ -4791,7 +4829,70 @@ bytes[0..5] \"cafe\\n\""
         let result = tool.shell(&args).await.unwrap();
 
         assert_eq!(result["validation_probe"], false);
-        assert_eq!(scope.policy_snapshot().writes_since_shell_probe, 1);
+        assert_eq!(result["operational_check"], true);
+        assert_eq!(result["write_budget_reopened"], true);
+        assert_eq!(result["writes_remaining_before_check"], 3);
+        assert_eq!(scope.policy_snapshot().consecutive_writes_without_shell, 0);
+        assert_eq!(scope.policy_snapshot().total_shell_probes, 0);
+        assert_eq!(scope.policy_snapshot().total_operational_checks, 1);
+        assert!(!scope.runtime_state_snapshot().terminal_readiness);
+    }
+
+    #[tokio::test]
+    async fn model_selected_check_supports_completion_only_without_declared_probes() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        scope.configure_probes(Vec::new()).unwrap();
+        scope
+            .note_write_intent(std::slice::from_ref(&scope.root.join("src/main.rs")))
+            .unwrap();
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+
+        let result = tool
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("printf checked"),
+            )]))
+            .await
+            .unwrap();
+
+        assert_eq!(result["operational_check"], true);
+        assert_eq!(result["operational_check_acceptance_authority"], false);
+        assert_eq!(scope.policy_snapshot().total_shell_probes, 0);
+        assert!(scope.runtime_state_snapshot().terminal_readiness);
+    }
+
+    #[tokio::test]
+    async fn failed_operational_check_grants_one_repair_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let source_path = scope.root.join("src/main.rs");
+        for _ in 0..MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL {
+            scope
+                .note_write_intent(std::slice::from_ref(&source_path))
+                .unwrap();
+        }
+        let tool = ShellCommandTool {
+            scope: scope.clone(),
+        };
+        let result = tool
+            .shell(&HashMap::from([("command".to_string(), json!("exit 1"))]))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["operational_check"], true);
+        assert_eq!(result["writes_remaining_before_check"], 1);
+        scope
+            .note_write_intent(std::slice::from_ref(&source_path))
+            .unwrap();
+        assert!(
+            scope
+                .note_write_intent(std::slice::from_ref(&source_path))
+                .is_err()
+        );
     }
 
     #[tokio::test]

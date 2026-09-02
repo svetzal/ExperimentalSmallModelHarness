@@ -56,6 +56,11 @@ pub enum RuntimeEvent {
         failure_text: String,
         failure_details: Vec<String>,
     },
+    OperationalCheck {
+        command: String,
+        status: Option<i32>,
+        success: bool,
+    },
     RequestedProbeObserved {
         probe_id: String,
         command: String,
@@ -181,6 +186,7 @@ pub struct RuntimeState {
     pub pending_evidence_paths: BTreeMap<String, usize>,
     pub total_write_operations: usize,
     pub total_validation_probes: usize,
+    pub total_operational_checks: usize,
     pub mutation_epoch: usize,
     pub fresh_validation_epoch: Option<usize>,
     pub latest_successful_validation: Option<SuccessfulValidation>,
@@ -250,6 +256,7 @@ impl RuntimeState {
             pending_evidence_paths: BTreeMap::new(),
             total_write_operations: 0,
             total_validation_probes: 0,
+            total_operational_checks: 0,
             mutation_epoch: 0,
             fresh_validation_epoch: None,
             latest_successful_validation: None,
@@ -439,6 +446,28 @@ impl RuntimeState {
                 }
                 self.recompute_terminal_readiness();
             }
+            RuntimeEvent::OperationalCheck {
+                command: _,
+                status: _,
+                success,
+            } => {
+                self.total_operational_checks += 1;
+                self.meaningful_action_seen = true;
+                self.repeated_inspections.clear();
+                if *success {
+                    self.consecutive_writes_without_probe = 0;
+                    if !self.validation_enforced {
+                        self.fresh_validation_epoch = Some(self.mutation_epoch);
+                    }
+                } else {
+                    self.consecutive_writes_without_probe =
+                        MAX_CONSECUTIVE_WRITES_WITHOUT_PROBE.saturating_sub(1);
+                    if !self.validation_enforced {
+                        self.fresh_validation_epoch = None;
+                    }
+                }
+                self.recompute_terminal_readiness();
+            }
             RuntimeEvent::RequestedProbeObserved {
                 probe_id,
                 command,
@@ -562,6 +591,12 @@ impl RuntimeState {
         self.validation_enforced && !self.pending_evidence_paths.is_empty()
     }
 
+    pub fn operational_check_required(&self) -> bool {
+        !self.validation_enforced
+            && self.total_write_operations > 0
+            && self.fresh_validation_epoch != Some(self.mutation_epoch)
+    }
+
     pub fn requested_probes_satisfied(&self) -> bool {
         self.requested_probes.iter().all(|probe| {
             probe.status == ProbeStatus::Passed && probe.mutation_epoch == Some(self.mutation_epoch)
@@ -570,6 +605,7 @@ impl RuntimeState {
 
     fn recompute_terminal_readiness(&mut self) {
         self.terminal_readiness = !self.validation_required()
+            && !self.operational_check_required()
             && self.validation_repair.is_none()
             && self.fresh_validation_epoch == Some(self.mutation_epoch)
             && self.requested_probes_satisfied();
@@ -635,7 +671,7 @@ impl RuntimePolicy {
                     }
                 } else {
                     RuntimeDecision::RejectMutation {
-                        reason: "write budget exhausted: run a shell validation probe before editing again".to_string(),
+                        reason: "write checkpoint required before another structured edit: call shell_command with the most relevant deterministic non-mutating check; a passing check restores 3 edits and a failing check grants 1 repair edit".to_string(),
                     }
                 };
             }
@@ -708,6 +744,9 @@ impl RuntimePolicy {
             } => RuntimeDecision::AcceptFail,
             RuntimeEvent::ValidationProbe { success: false, .. } => RuntimeDecision::PromptRepair,
             RuntimeEvent::ValidationProbe { success: true, .. } if after.terminal_readiness => {
+                RuntimeDecision::AcceptDone
+            }
+            RuntimeEvent::OperationalCheck { success: true, .. } if after.terminal_readiness => {
                 RuntimeDecision::AcceptDone
             }
             RuntimeEvent::ToolMutation { .. } => RuntimeDecision::RequestValidation,
