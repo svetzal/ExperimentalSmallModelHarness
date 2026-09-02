@@ -859,6 +859,47 @@ validation reach relative to control. Roll back if coverage can masquerade as
 validation, stale evidence survives mutation, or completion claims rise without
 independent-verifier improvement.
 
+## Bounded Reasoning Continuity Pilot
+
+Hypothesis ID: `HYP-REASONING-CHECKPOINT-01`
+
+Observation: the first acceptance-ledger pilot completed inspection, then
+spent two full thinking-only turns reconstructing a useful implementation plan.
+Each hidden trace reached an intention to write code, but the next provider
+request retained neither trace, so no source mutation occurred before the
+thinking-only hard stop.
+
+Hypothesis: retaining a bounded tail of the model's own immediately preceding
+hidden reasoning will let a later ordinary turn continue into action without
+forcing think/action separation, disabling reasoning, or narrowing tools.
+
+Nearest alternative explanation: the model's failure is an action-boundary
+capability problem, so repeating its own reasoning tail only consumes context
+and produces another hidden-only turn.
+
+Smallest diagnostic cell:
+
+- Task: DeepSWE `igel-persist-feature-schema`.
+- Model: `qwen3.8:27b-mxfp8`.
+- Treatment: current harness with an 8,192-token reasoning-checkpoint tail.
+- Control reference: the preserved acceptance-ledger pilot's post-inspection
+  hidden-only behavior; acceptance-ledger planning is disabled in the new run.
+- Fixed variables: public instruction, seed workspace, 262,144-token requested
+  context, 16,384-token output and thinking caps, tool surface, repair policy,
+  transcript policy, host-pressure safety policy, and independent verifier.
+- Primary measurement: source mutation or validation in the request immediately
+  following checkpoint delivery.
+- Secondary measurements: checkpoint capture/delivery counts and sizes,
+  provider-request evidence, turns, runtime, context pressure, and verifier
+  outcome.
+
+Refutation: checkpoint delivery is observed but the next request again reaches
+the same hidden-only boundary without mutation or validation. A positive pilot
+only justifies replicated comparison; it does not establish an efficacy gain.
+Rollback if control requests change when the option is zero, checkpoint content
+gains authority over task or tool evidence, reasoning is disabled, tools are
+narrowed, or raw reasoning is copied into summary events.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`

@@ -154,6 +154,21 @@ latest relevant mutation. If either planning stage exhausts its bounded
 structured-output attempts, the treatment run fails closed rather than
 silently falling back to a control packet.
 
+### Bounded reasoning continuity
+
+`run --reasoning-checkpoint-tokens N` enables an experimental continuity aid
+for hidden-only no-action turns. The harness retains at most the approximate
+`N`-token tail of the model's own hidden reasoning and supplies that tail once
+in the next ordinary user turn. The checkpoint is explicitly labeled as
+incomplete, self-generated continuity state rather than task authority.
+
+The default is zero, which preserves the prior prompt and provider request.
+Enabling the treatment does not disable reasoning or narrow the tool surface.
+Only the newest checkpoint is retained. Trace events record size, omitted
+prefix size, and a SHA-256 digest; the exact checkpoint remains available in
+the provider-request snapshot rather than being duplicated into summary
+events.
+
 ### Declared probe delivery
 
 Adapter-owned probes in an explicit run contract are part of the initial worker

@@ -54,6 +54,7 @@ const ACTION_BOUNDARY_INTENT_BUFFER_CHARS: usize = 4_096;
 const ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS: usize = 512;
 const RESPONSE_TOOL_CALL_ARGUMENT_MAX_CHARS: usize = 4_096;
 const ACCEPTANCE_LEDGER_ADVISORY_OUTPUT_TOKENS: usize = 4_096;
+const REASONING_CHECKPOINT_PREFIX: &str = "[harness-reasoning-checkpoint]";
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
@@ -74,6 +75,9 @@ pub struct AgentRunConfig {
     pub repair_exit_thinking_tokens: usize,
     pub repair_handoff_policy: RepairHandoffPolicy,
     pub action_boundary_interrupt_tokens: usize,
+    /// Approximate token budget for retaining the tail of a hidden-only
+    /// no-action turn into the next ordinary turn. Zero disables retention.
+    pub reasoning_checkpoint_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
     /// Optional adapter-owned initial-context catalog. Required, selectable,
     /// and excluded guidance dispositions are enforced by the assembler.
@@ -103,6 +107,7 @@ pub struct AgentRunSummary {
     pub repair_exit_thinking_tokens: usize,
     pub repair_handoff_policy: RepairHandoffPolicy,
     pub action_boundary_interrupt_tokens: usize,
+    pub reasoning_checkpoint_tokens: usize,
     pub transcript_policy: TranscriptPolicy,
     pub initial_context_catalog_file: Option<PathBuf>,
     pub semantic_advisor_model: Option<String>,
@@ -351,6 +356,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "repair_exit_thinking_tokens": config.repair_exit_thinking_tokens,
             "repair_handoff_policy": config.repair_handoff_policy,
             "action_boundary_interrupt_tokens": config.action_boundary_interrupt_tokens,
+            "reasoning_checkpoint_tokens": config.reasoning_checkpoint_tokens,
             "assembly_policy": config.transcript_policy.as_str(),
             "transcript_policy": config.transcript_policy,
             "initial_context_catalog_file": config.initial_context_catalog_file,
@@ -595,6 +601,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     let mut final_response_only_next_turn = false;
     let mut authoritative_constrained_repair_active = false;
     let mut repair_action_only_next_turn = false;
+    let mut pending_reasoning_checkpoint_delivery: Option<serde_json::Value> = None;
     let mut requested_validation_ledger = RequestedValidationLedger::new_for_probes(
         &resolved_contract.probes,
         resolved_contract.profile.clone(),
@@ -605,6 +612,13 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     let no_tools: Vec<Box<dyn LlmTool>> = Vec::new();
     for turn in 1..=config.max_iterations {
         scope.observe_runtime(crate::runtime::RuntimeEvent::TurnStarted { turn });
+        if let Some(mut metadata) = pending_reasoning_checkpoint_delivery.take() {
+            metadata["delivery_turn"] = serde_json::json!(turn);
+            trace.event(
+                crate::runtime_events::AGENT_REASONING_CHECKPOINT_DELIVERED,
+                metadata,
+            )?;
+        }
         let runtime_before_turn = scope.runtime_state_snapshot();
         let policy_before_turn = scope.policy_snapshot();
         let requested_validation_ledger_before_turn = requested_validation_ledger.clone();
@@ -677,6 +691,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
             repair_handoff_policy: config.repair_handoff_policy,
             action_boundary_interrupt_tokens: config.action_boundary_interrupt_tokens,
+            reasoning_checkpoint_tokens: config.reasoning_checkpoint_tokens,
             validation_repair_active: policy_before_turn.validation_repair.is_some(),
             transcript_policy: config.transcript_policy,
             throughput_registry_path: experiment_dir.join("model-throughput.jsonl"),
@@ -718,6 +733,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             authoritative_constrained_repair_active = false;
         }
         let thinking_chars_this_turn = turn_result.thinking_chars;
+        let reasoning_checkpoint = turn_result.reasoning_checkpoint;
         let response = turn_result.response;
         requested_validation_ledger = turn_result.requested_validation_ledger;
         for entry in &requested_validation_ledger.entries {
@@ -741,6 +757,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             }
         }
         messages = turn_result.messages;
+        let consumed_reasoning_checkpoints = remove_prior_reasoning_checkpoints(&mut messages);
         trace.event(
             "agent.turn.finished",
             serde_json::json!({
@@ -1049,9 +1066,29 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 final_summary = format!(
                     "turn {turn} produced hidden reasoning but no source mutation, validation probe, or final text"
                 );
+                if let Some(checkpoint) = &reasoning_checkpoint {
+                    let metadata = serde_json::json!({
+                        "source_turn": turn,
+                        "total_thinking_chars": checkpoint.total_thinking_chars,
+                        "retained_chars": checkpoint.retained_tail.len(),
+                        "retained_estimated_tokens": estimate_tokens(checkpoint.retained_tail.len()),
+                        "omitted_prefix_chars": checkpoint.omitted_prefix_chars,
+                        "retained_sha256": checkpoint.retained_sha256,
+                        "removed_consumed_checkpoints": consumed_reasoning_checkpoints,
+                        "authority": "self_generated_continuity_only",
+                        "reasoning_disabled_next_turn": false,
+                        "tool_surface_narrowed_next_turn": false,
+                    });
+                    trace.event(
+                        crate::runtime_events::AGENT_REASONING_CHECKPOINT_CAPTURED,
+                        &metadata,
+                    )?;
+                    pending_reasoning_checkpoint_delivery = Some(metadata);
+                }
                 messages.push(LlmMessage::user(hidden_only_no_action_prompt(
                     consecutive_hidden_only_no_action_turns,
                     tool_calls_this_turn,
+                    reasoning_checkpoint.as_ref(),
                 )));
                 continue;
             }
@@ -1272,6 +1309,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
         repair_handoff_policy: config.repair_handoff_policy,
         action_boundary_interrupt_tokens: config.action_boundary_interrupt_tokens,
+        reasoning_checkpoint_tokens: config.reasoning_checkpoint_tokens,
         transcript_policy: config.transcript_policy,
         initial_context_catalog_file: config.initial_context_catalog_file,
         semantic_advisor_model: config.semantic_advisor_model,
@@ -1807,6 +1845,7 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     repair_exit_thinking_tokens: usize,
     repair_handoff_policy: RepairHandoffPolicy,
     action_boundary_interrupt_tokens: usize,
+    reasoning_checkpoint_tokens: usize,
     validation_repair_active: bool,
     transcript_policy: TranscriptPolicy,
     throughput_registry_path: PathBuf,
@@ -1825,11 +1864,20 @@ struct StreamResponseResult {
     response: String,
     messages: Vec<LlmMessage>,
     thinking_chars: usize,
+    reasoning_checkpoint: Option<ReasoningCheckpoint>,
     repair_no_content_interrupted: bool,
     action_boundary_interrupted: Option<ActionBoundaryInterrupt>,
     repair_depth_hard_stop: Option<RepairDepthDecision>,
     authoritative_constrained_handoff_required: bool,
     requested_validation_ledger: RequestedValidationLedger,
+}
+
+#[derive(Debug, Clone)]
+struct ReasoningCheckpoint {
+    total_thinking_chars: usize,
+    retained_tail: String,
+    omitted_prefix_chars: usize,
+    retained_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1917,6 +1965,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         repair_exit_thinking_tokens,
         repair_handoff_policy,
         action_boundary_interrupt_tokens,
+        reasoning_checkpoint_tokens,
         validation_repair_active,
         transcript_policy,
         throughput_registry_path,
@@ -1942,6 +1991,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     let mut content_chars = 0usize;
     let mut thinking_chunk_count = 0usize;
     let mut thinking_chars = 0usize;
+    let reasoning_checkpoint_max_chars =
+        reasoning_checkpoint_tokens.saturating_mul(APPROX_CHARS_PER_TOKEN);
+    let mut reasoning_checkpoint_tail = String::new();
     let mut stream_progress_frame_count = 0usize;
     let mut tool_call_progress_frame_count = 0usize;
     let mut no_content_segment_eval_count = 0usize;
@@ -2006,6 +2058,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 response,
                 messages: current_messages,
                 thinking_chars,
+                reasoning_checkpoint: reasoning_checkpoint(
+                    thinking_chars,
+                    reasoning_checkpoint_tail,
+                ),
                 repair_no_content_interrupted,
                 action_boundary_interrupted,
                 repair_depth_hard_stop: Some(decision),
@@ -2210,6 +2266,11 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     no_content_segment_eval_count = 0;
                     thinking_chunk_count += 1;
                     thinking_chars += thinking.len();
+                    push_bounded_buffer(
+                        &mut reasoning_checkpoint_tail,
+                        &thinking,
+                        reasoning_checkpoint_max_chars,
+                    );
                     call_thinking_chunk_count += 1;
                     call_thinking_chars += thinking.len();
                     push_bounded_buffer(
@@ -2506,6 +2567,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 response,
                 messages: current_messages,
                 thinking_chars,
+                reasoning_checkpoint: reasoning_checkpoint(
+                    thinking_chars,
+                    reasoning_checkpoint_tail,
+                ),
                 repair_no_content_interrupted,
                 action_boundary_interrupted,
                 repair_depth_hard_stop: None,
@@ -2674,6 +2739,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 response,
                 messages: current_messages,
                 thinking_chars,
+                reasoning_checkpoint: reasoning_checkpoint(
+                    thinking_chars,
+                    reasoning_checkpoint_tail,
+                ),
                 repair_no_content_interrupted,
                 action_boundary_interrupted,
                 repair_depth_hard_stop: None,
@@ -5011,16 +5080,72 @@ fn empty_response_prompt(consecutive_empty_responses: usize) -> String {
 fn hidden_only_no_action_prompt(
     consecutive_hidden_only_no_action_turns: usize,
     tool_calls_this_turn: usize,
+    checkpoint: Option<&ReasoningCheckpoint>,
 ) -> String {
+    let Some(checkpoint) = checkpoint else {
+        return format!(
+            "Hidden-only no-action turn detected. Your previous turn produced hidden reasoning \
+             but no visible final text, no source mutation, and no validation probe. \
+             Consecutive hidden-only no-action turns: {consecutive_hidden_only_no_action_turns}. \
+             Tool calls in the previous turn: {tool_calls_this_turn}. \
+             In the next turn, take exactly one concrete action: write or edit the next source change, \
+             run a deterministic validation probe, or reply FAIL with a concrete blocker. \
+             Do not repeat broad inspection or restate the plan."
+        );
+    };
+    let checkpoint = reasoning_checkpoint_prompt(checkpoint);
     format!(
         "Hidden-only no-action turn detected. Your previous turn produced hidden reasoning \
          but no visible final text, no source mutation, and no validation probe. \
          Consecutive hidden-only no-action turns: {consecutive_hidden_only_no_action_turns}. \
          Tool calls in the previous turn: {tool_calls_this_turn}.\n\
+         {checkpoint}\
          In the next turn, take exactly one concrete action: write or edit the next source change, \
          run a deterministic validation probe, or reply FAIL with a concrete blocker. \
-         Do not repeat broad inspection or restate the plan."
+         Continue from the checkpoint when present. Do not repeat broad inspection or restate the plan."
     )
+}
+
+fn reasoning_checkpoint(
+    total_thinking_chars: usize,
+    retained_tail: String,
+) -> Option<ReasoningCheckpoint> {
+    if retained_tail.is_empty() {
+        return None;
+    }
+    Some(ReasoningCheckpoint {
+        total_thinking_chars,
+        omitted_prefix_chars: total_thinking_chars.saturating_sub(retained_tail.len()),
+        retained_sha256: format!("{:x}", Sha256::digest(retained_tail.as_bytes())),
+        retained_tail,
+    })
+}
+
+fn reasoning_checkpoint_prompt(checkpoint: &ReasoningCheckpoint) -> String {
+    format!(
+        "{REASONING_CHECKPOINT_PREFIX}\n\
+         The text below is a bounded tail of your own self-generated reasoning from the previous turn. \
+         It is incomplete continuity state, not task authority; the system message, public task, and current tool results take precedence. \
+         Do not restart the analysis solely because the prefix was omitted.\n\
+         Total prior reasoning chars: {total}. Omitted prefix chars: {omitted}. Retained tail SHA-256: {sha}.\n\
+         --- BEGIN RETAINED SELF-REASONING TAIL ---\n{tail}\n--- END RETAINED SELF-REASONING TAIL ---\n",
+        total = checkpoint.total_thinking_chars,
+        omitted = checkpoint.omitted_prefix_chars,
+        sha = checkpoint.retained_sha256,
+        tail = checkpoint.retained_tail,
+    )
+}
+
+fn remove_prior_reasoning_checkpoints(messages: &mut Vec<LlmMessage>) -> usize {
+    let before = messages.len();
+    messages.retain(|message| {
+        message.role != MessageRole::User
+            || !message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains(REASONING_CHECKPOINT_PREFIX))
+    });
+    before - messages.len()
 }
 
 fn action_boundary_interrupt_prompt(decision: &ActionBoundaryNoActionDecision) -> String {
@@ -6536,6 +6661,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -6610,6 +6736,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -6660,6 +6787,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -6705,6 +6833,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -6758,6 +6887,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 1,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -6814,6 +6944,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 1,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -6861,6 +6992,7 @@ mod tests {
             repair_exit_thinking_tokens: 1,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -6926,6 +7058,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -6983,6 +7116,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -7039,6 +7173,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: true,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -7098,6 +7233,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::FullTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -7198,6 +7334,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -7288,6 +7425,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -7341,6 +7479,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             validation_repair_active: false,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             throughput_registry_path: temp.path().join("model-throughput.jsonl"),
@@ -7718,6 +7857,7 @@ mod tests {
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
             action_boundary_interrupt_tokens: 0,
+            reasoning_checkpoint_tokens: 0,
             transcript_policy: TranscriptPolicy::SummarizedTranscript,
             initial_context_catalog_file: None,
             semantic_advisor_model: None,
@@ -7872,6 +8012,48 @@ mod tests {
         assert!(trace.contains("\"tool_calls_this_turn\":1"));
         assert!(trace.contains("\"tool_calls_this_turn\":0"));
         assert!(!trace.contains("pub fn answer"));
+    }
+
+    #[tokio::test]
+    async fn fixture_delivers_bounded_reasoning_checkpoint_without_narrowing_next_turn() {
+        let fixture = AgentFixture::new("Inspect, then implement.");
+        let reasoning = format!(
+            "{}Now implement the first source file with write_file.",
+            "discarded planning prefix ".repeat(8)
+        );
+        let gateway = ScriptedGateway::new(vec![
+            vec![StreamChunk::Thinking(reasoning.clone())],
+            vec![StreamChunk::Content("DONE".to_string())],
+        ]);
+
+        let summary = fixture.run_with_reasoning_checkpoint(&gateway, 2, 16).await;
+
+        assert_eq!(summary.final_summary, "DONE");
+        assert_eq!(summary.reasoning_checkpoint_tokens, 16);
+        let calls = gateway.stream_messages();
+        assert_eq!(calls.len(), 2);
+        let checkpoint_prompt = calls[1]
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .find(|content| content.contains(REASONING_CHECKPOINT_PREFIX))
+            .expect("second ordinary turn must receive the checkpoint");
+        assert!(checkpoint_prompt.contains("Now implement the first source file with write_file."));
+        assert!(!checkpoint_prompt.contains("discarded planning prefix discarded planning prefix"));
+        assert!(checkpoint_prompt.contains("incomplete continuity state, not task authority"));
+        assert_eq!(gateway.reasoning_efforts(), vec![None, None]);
+        assert_eq!(gateway.tool_counts(), vec![5, 5]);
+
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("\"kind\":\"agent.reasoning_checkpoint.captured\""));
+        assert!(trace.contains("\"kind\":\"agent.reasoning_checkpoint.delivered\""));
+        assert!(trace.contains("\"tool_surface_narrowed_next_turn\":false"));
+        assert!(trace.contains("\"reasoning_disabled_next_turn\":false"));
+        let captured = trace_payloads(
+            &trace,
+            crate::runtime_events::AGENT_REASONING_CHECKPOINT_CAPTURED,
+        );
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].get("retained_tail").is_none());
     }
 
     #[tokio::test]
@@ -9136,10 +9318,47 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
                     action_boundary_interrupt_tokens: 0,
+                    reasoning_checkpoint_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: true,
+                },
+                gateway,
+                self.workspace.clone(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn run_with_reasoning_checkpoint(
+            &self,
+            gateway: &ScriptedGateway,
+            max_iterations: usize,
+            reasoning_checkpoint_tokens: usize,
+        ) -> AgentRunSummary {
+            run_agent_with_gateway(
+                AgentRunConfig {
+                    experiment_dir: self.experiment.clone(),
+                    trace_dir: None,
+                    goal_file: PathBuf::from("task.md"),
+                    contract_file: None,
+                    model: "fake-model".to_string(),
+                    max_iterations,
+                    max_tool_iterations: 10,
+                    context_window_tokens: Some(131_072),
+                    packet_type: "narrow-patch".to_string(),
+                    expected_output_tokens: 2_048,
+                    num_predict: None,
+                    max_thinking_only_tokens: 2_048,
+                    repair_exit_thinking_tokens: 16_384,
+                    repair_handoff_policy: RepairHandoffPolicy::TextOnly,
+                    action_boundary_interrupt_tokens: 0,
+                    reasoning_checkpoint_tokens,
+                    transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                    initial_context_catalog_file: None,
+                    semantic_advisor_model: None,
+                    acceptance_ledger: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -9171,6 +9390,7 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
                     action_boundary_interrupt_tokens: 0,
+                    reasoning_checkpoint_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
@@ -9231,6 +9451,7 @@ mod tests {
                     repair_exit_thinking_tokens,
                     repair_handoff_policy,
                     action_boundary_interrupt_tokens: 0,
+                    reasoning_checkpoint_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
@@ -9265,6 +9486,7 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
                     action_boundary_interrupt_tokens: 1,
+                    reasoning_checkpoint_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
@@ -9299,6 +9521,7 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::ConstrainedActionOnly,
                     action_boundary_interrupt_tokens: 0,
+                    reasoning_checkpoint_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
@@ -9329,6 +9552,7 @@ mod tests {
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
                     action_boundary_interrupt_tokens: 0,
+                    reasoning_checkpoint_tokens: 0,
                     transcript_policy: TranscriptPolicy::SummarizedTranscript,
                     initial_context_catalog_file: Some(PathBuf::from("context-catalog.json")),
                     semantic_advisor_model: Some("context-curator-model".to_string()),

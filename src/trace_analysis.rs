@@ -44,6 +44,14 @@ pub struct TraceAnalysis {
     pub acceptance_ledger_latest_incomplete_ids: Vec<String>,
     pub acceptance_ledger_done_rejection_count: usize,
     pub acceptance_ledger_latest_mutation_epoch: Option<usize>,
+    pub reasoning_checkpoint_tokens: Option<usize>,
+    pub reasoning_checkpoint_enabled: bool,
+    pub reasoning_checkpoint_capture_count: usize,
+    pub reasoning_checkpoint_delivery_count: usize,
+    pub reasoning_checkpoint_max_retained_chars: usize,
+    pub reasoning_checkpoint_max_retained_estimated_tokens: usize,
+    pub reasoning_checkpoint_total_omitted_prefix_chars: usize,
+    pub reasoning_checkpoint_last_sha256: Option<String>,
     // Legacy Slice-13 measurements remain populated for preserved traces.
     pub semantic_context_enabled: bool,
     pub semantic_context_analyzer_model: Option<String>,
@@ -558,6 +566,27 @@ pub fn analyze_trace(path: impl AsRef<Path>) -> Result<TraceAnalysis> {
                         .as_u64()
                         .and_then(|value| usize::try_from(value).ok());
             }
+            events::AGENT_REASONING_CHECKPOINT_CAPTURED => {
+                analysis.reasoning_checkpoint_enabled = true;
+                analysis.reasoning_checkpoint_capture_count += 1;
+                analysis.reasoning_checkpoint_max_retained_chars = analysis
+                    .reasoning_checkpoint_max_retained_chars
+                    .max(value_usize(payload, "retained_chars").unwrap_or_default());
+                analysis.reasoning_checkpoint_max_retained_estimated_tokens = analysis
+                    .reasoning_checkpoint_max_retained_estimated_tokens
+                    .max(value_usize(payload, "retained_estimated_tokens").unwrap_or_default());
+                analysis.reasoning_checkpoint_total_omitted_prefix_chars = analysis
+                    .reasoning_checkpoint_total_omitted_prefix_chars
+                    .saturating_add(
+                        value_usize(payload, "omitted_prefix_chars").unwrap_or_default(),
+                    );
+                analysis.reasoning_checkpoint_last_sha256 =
+                    value_string(payload, "retained_sha256");
+            }
+            events::AGENT_REASONING_CHECKPOINT_DELIVERED => {
+                analysis.reasoning_checkpoint_enabled = true;
+                analysis.reasoning_checkpoint_delivery_count += 1;
+            }
             events::SEMANTIC_CONTEXT_ANALYSIS_STARTED => {
                 analysis.semantic_context_enabled = true;
                 analysis.semantic_context_analyzer_model = value_string(payload, "analyzer_model");
@@ -819,6 +848,10 @@ fn apply_run_started(analysis: &mut TraceAnalysis, payload: &Value) {
     analysis.packet_type = value_string(payload, "packet_type");
     analysis.expected_output_tokens = value_usize(payload, "expected_output_tokens");
     analysis.acceptance_ledger_enabled = payload["acceptance_ledger"].as_bool().unwrap_or(false);
+    analysis.reasoning_checkpoint_tokens = value_usize(payload, "reasoning_checkpoint_tokens");
+    analysis.reasoning_checkpoint_enabled = analysis
+        .reasoning_checkpoint_tokens
+        .is_some_and(|tokens| tokens > 0);
 }
 
 fn apply_run_finished(analysis: &mut TraceAnalysis, payload: &Value) {
@@ -1208,6 +1241,41 @@ mod tests {
         );
         assert_eq!(analysis.acceptance_ledger_done_rejection_count, 1);
         assert_eq!(analysis.acceptance_ledger_latest_mutation_epoch, Some(3));
+    }
+
+    #[test]
+    fn analyzes_reasoning_checkpoint_continuity_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run-reasoning-checkpoint.jsonl");
+        std::fs::write(
+            &trace,
+            r#"{"timestamp":"2026-09-01T00:00:00Z","kind":"run.started","payload":{"model":"worker","reasoning_checkpoint_tokens":8192}}
+{"timestamp":"2026-09-01T00:00:01Z","kind":"agent.reasoning_checkpoint.captured","payload":{"retained_chars":32768,"retained_estimated_tokens":8192,"omitted_prefix_chars":5000,"retained_sha256":"abc123"}}
+{"timestamp":"2026-09-01T00:00:02Z","kind":"agent.reasoning_checkpoint.delivered","payload":{"retained_chars":32768,"retained_estimated_tokens":8192,"omitted_prefix_chars":5000,"retained_sha256":"abc123"}}
+{"timestamp":"2026-09-01T00:00:03Z","kind":"run.finished","payload":{"final_summary":"DONE"}}
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_trace(&trace).unwrap();
+
+        assert_eq!(analysis.reasoning_checkpoint_tokens, Some(8192));
+        assert!(analysis.reasoning_checkpoint_enabled);
+        assert_eq!(analysis.reasoning_checkpoint_capture_count, 1);
+        assert_eq!(analysis.reasoning_checkpoint_delivery_count, 1);
+        assert_eq!(analysis.reasoning_checkpoint_max_retained_chars, 32768);
+        assert_eq!(
+            analysis.reasoning_checkpoint_max_retained_estimated_tokens,
+            8192
+        );
+        assert_eq!(
+            analysis.reasoning_checkpoint_total_omitted_prefix_chars,
+            5000
+        );
+        assert_eq!(
+            analysis.reasoning_checkpoint_last_sha256.as_deref(),
+            Some("abc123")
+        );
     }
 
     #[test]

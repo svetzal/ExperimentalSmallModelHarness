@@ -102,6 +102,12 @@ struct RunArgs {
     #[arg(long, default_value_t = 0)]
     action_boundary_interrupt_tokens: usize,
 
+    /// Retain this many tokens (approximately) from the tail of a hidden-only
+    /// no-action turn as a continuity checkpoint for the next ordinary turn.
+    /// This does not disable reasoning or narrow the tool surface. 0 disables.
+    #[arg(long, default_value_t = 0)]
+    reasoning_checkpoint_tokens: usize,
+
     /// Transcript retention policy for model/tool context.
     #[arg(long, default_value = "summarized-transcript")]
     transcript_policy: String,
@@ -168,6 +174,7 @@ impl RunArgs {
             repair_exit_thinking_tokens,
             repair_handoff_policy,
             action_boundary_interrupt_tokens: self.action_boundary_interrupt_tokens,
+            reasoning_checkpoint_tokens: self.reasoning_checkpoint_tokens,
             transcript_policy,
             initial_context_catalog_file: self.initial_context_catalog,
             semantic_advisor_model: self.semantic_advisor_model,

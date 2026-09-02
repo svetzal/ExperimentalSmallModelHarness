@@ -335,6 +335,10 @@ pub const LLM_THINKING_ONLY_STREAM_HARD_FAILED: &str = "llm.thinking_only_stream
 /// hidden-only no-action escalation.
 pub const LLM_THINKING_ONLY_STREAM_ACTION_TRANSITIONED: &str =
     "llm.thinking_only_stream.action_transitioned";
+/// A bounded tail of self-generated hidden reasoning was retained for continuity.
+pub const AGENT_REASONING_CHECKPOINT_CAPTURED: &str = "agent.reasoning_checkpoint.captured";
+/// The bounded reasoning checkpoint was included in the next ordinary-turn prompt.
+pub const AGENT_REASONING_CHECKPOINT_DELIVERED: &str = "agent.reasoning_checkpoint.delivered";
 
 /// Provider metrics reported runaway output without assistant content,
 /// surfaced reasoning, or a completed tool call.
