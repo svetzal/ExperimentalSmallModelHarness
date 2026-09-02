@@ -900,6 +900,46 @@ Rollback if control requests change when the option is zero, checkpoint content
 gains authority over task or tool evidence, reasoning is disabled, tools are
 narrowed, or raw reasoning is copied into summary events.
 
+## Line-Numbered File-View Gate
+
+Hypothesis ID: `HYP-LINE-NUMBERED-FILE-VIEW-01`
+
+Observation: in the reasoning-checkpoint pilot, the model issued 24 file reads
+across 15 paths. It read `igel/utils.py` four times after an earlier full result
+had been compacted into a lossy generic preview. The retained canonical file
+projection exposed range metadata, but its content had no inline line numbers
+and the size-saving rule frequently left raw reads authoritative.
+
+Hypothesis: one authoritative, event-sourced, line-numbered projection for each
+path and mutation epoch will make observed and missing ranges unambiguous and
+reduce redundant reads without changing model, task, reasoning, repair, or tool
+budgets.
+
+Nearest alternative explanation: rereads are caused by model strategy or task
+difficulty, so clearer retained file state will not reduce them.
+
+Smallest measured cell:
+
+- Task: DeepSWE `igel-persist-feature-schema`.
+- Model: `qwen3.8:27b-mxfp8`.
+- Treatment: version-three authoritative file views with inline line numbers.
+- Control reference: the preserved reasoning-checkpoint pilot.
+- Fixed variables: seed workspace, public instruction, 262,144-token requested
+  context, 16,384-token output and thinking caps, 8,192-token reasoning
+  checkpoint, tool surface and budgets, repair policy, transcript policy,
+  host-pressure safety policy, and independent verifier.
+- Primary measurement: total and duplicate file reads, including repeated
+  identical and overlapping ranges by path and mutation epoch.
+- Secondary measurements: provider-visible file-view completeness, retained
+  context size, mutation, validation, runtime, and verifier outcome.
+
+Deterministic replay of the control trace must first collapse the four
+`igel/utils.py` reads into one complete 227-line view without losing mixed-batch
+non-read tool results. Refutation: the treatment retains multiple authoritative
+views for an unchanged path, obscures missing ranges, or does not reduce repeat
+reads in the live cell. A positive pilot warrants replication; it does not yet
+establish efficacy.
+
 ## First Experimental Gate
 
 Hypothesis ID: `HYP-GEN-01`

@@ -282,12 +282,15 @@ largest batch, bounded-argument truncations, and whether per-call response
 evidence is complete. Stream progress counts remain progress evidence only;
 they never create executable calls in the Harness.
 
-Repeated reads of an unchanged file are rendered as one event-sourced canonical
-projection in provider context. Version-two projections explicitly report
-`content_status` as `complete` or `partial`; partial projections name exact
-`missing_ranges`. The content bound scales with the actual provider window and
-is capped, while raw read events remain unchanged in the trace. Read-only shell
-effects do not split a file epoch, but confirmed workspace mutations do.
+Every successful read of an unchanged file is rendered as one authoritative,
+event-sourced projection in provider context. Version-three projections put
+the content in a line-numbered text view (`1|content`) and explicitly report
+whether it is `complete` or `partial`; partial projections name exact missing
+ranges. Later reads update that same path-and-mutation-epoch view instead of
+adding another provider-visible read result. The content bound scales with the
+actual provider window and is capped, while raw read events remain unchanged in
+the trace only. Read-only shell effects do not split a file epoch, but confirmed
+workspace mutations do.
 
 Experiments are intentionally run from separate, scoped workspaces. Generated
 agents should see their work tree and task-relevant guidance, not experiment

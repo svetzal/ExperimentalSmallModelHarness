@@ -41,6 +41,9 @@ const REPAIR_HANDOFF_RAW_TOOL_RESULT_RECENT_COUNT: usize = 2;
 const REPAIR_HANDOFF_RAW_TOOL_RESULT_MAX_CHARS: usize = 3_000;
 const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
 const FILE_OBSERVATION_PREFIX: &str = "[harness-consolidated-file-observation]";
+const FILE_OBSERVATION_METADATA_PREFIX: &str = "Metadata: ";
+const FILE_OBSERVATION_CONTENT_START: &str = "--- BEGIN LINE-NUMBERED CONTENT ---";
+const FILE_OBSERVATION_CONTENT_END: &str = "--- END LINE-NUMBERED CONTENT ---";
 const FILE_OBSERVATION_CONTENT_MIN_CHARS: usize = 20_000;
 const FILE_OBSERVATION_CONTENT_MAX_CHARS: usize = 120_000;
 const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
@@ -3258,6 +3261,32 @@ struct FileObservationSegment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileObservationSegmentMetadata {
+    line_start: usize,
+    line_end: usize,
+    last_line_complete: bool,
+    last_observed_sequence: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsolidatedFileObservationMetadata {
+    schema_version: String,
+    path: String,
+    epoch: usize,
+    source_read_count: usize,
+    unique_read_signatures: Vec<String>,
+    requested_ranges: Vec<FileObservationRange>,
+    historically_observed_ranges: Vec<FileObservationRange>,
+    retained_ranges: Vec<FileObservationRange>,
+    content_status: String,
+    missing_ranges: Vec<FileObservationRange>,
+    content_budget_chars: usize,
+    total_lines: usize,
+    line_number_width: usize,
+    segments: Vec<FileObservationSegmentMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConsolidatedFileObservation {
     schema_version: String,
     path: String,
@@ -3380,31 +3409,33 @@ fn flush_file_observation_epoch(
         .flat_map(|(_, _, observations)| observations)
     {
         *path_read_counts
-            .entry(parsed_observation_path(observation).to_string())
-            .or_default() += parsed_observation_source_count(observation);
+            .entry(parsed_observation_path(&observation.observation).to_string())
+            .or_default() += parsed_observation_source_count(&observation.observation);
     }
-    let repeated_paths = path_read_counts
-        .iter()
-        .filter_map(|(path, count)| (*count > 1).then_some(path.clone()))
+    let projected_paths = path_read_counts
+        .keys()
+        .cloned()
         .collect::<std::collections::BTreeSet<_>>();
-    if repeated_paths.is_empty() {
+    if projected_paths.is_empty() {
         output.extend(epoch_messages);
         return Ok(());
     }
-    let source_read_count = repeated_paths
+    let source_read_count = projected_paths
         .iter()
         .filter_map(|path| path_read_counts.get(path))
         .sum::<usize>();
-    let file_count = repeated_paths.len();
+    let file_count = projected_paths.len();
 
     let mut accumulators = BTreeMap::<String, FileObservationAccumulator>::new();
     for observation in exchanges
         .iter()
         .flat_map(|(_, _, observations)| observations)
-        .filter(|observation| repeated_paths.contains(parsed_observation_path(observation)))
+        .filter(|observation| {
+            projected_paths.contains(parsed_observation_path(&observation.observation))
+        })
         .cloned()
     {
-        merge_parsed_file_observation(&mut accumulators, observation);
+        merge_parsed_file_observation(&mut accumulators, observation.observation);
     }
     if accumulators
         .values()
@@ -3434,9 +3465,9 @@ fn flush_file_observation_epoch(
         .iter()
         .rev()
         .find(|(_, _, observations)| {
-            observations
-                .iter()
-                .any(|observation| repeated_paths.contains(parsed_observation_path(observation)))
+            observations.iter().any(|observation| {
+                projected_paths.contains(parsed_observation_path(&observation.observation))
+            })
         })
         .map(|(start, _, _)| *start)
         .unwrap_or(0);
@@ -3451,7 +3482,7 @@ fn flush_file_observation_epoch(
             candidate.extend(retained_read_exchange(
                 &epoch_messages[cursor..cursor + *span],
                 observations,
-                &repeated_paths,
+                &projected_paths,
             ));
             if cursor == last_exchange_start {
                 candidate.push(assistant.clone());
@@ -3465,27 +3496,11 @@ fn flush_file_observation_epoch(
     }
     let retained_message_count = candidate.len();
     let retained_chars = candidate.iter().map(message_chars).sum::<usize>();
-    if retained_chars >= original_chars {
-        trace.event(
-            "llm.context_assembly.file_observation_coalescing_skipped",
-            serde_json::json!({
-                "turn": turn,
-                "llm_call_depth": llm_call_depth,
-                "epoch": epoch,
-                "reason": "replacement_would_not_reduce_characters",
-                "source_read_count": source_read_count,
-                "file_count": file_count,
-            }),
-        )?;
-        output.extend(epoch_messages);
-        return Ok(());
-    }
-
     output.extend(candidate);
     trace.event(
         "llm.context_assembly.file_observations_coalesced",
         serde_json::json!({
-            "schema_version": "file_observation_coalescing.v1",
+            "schema_version": "file_observation_coalescing.v2",
             "turn": turn,
             "llm_call_depth": llm_call_depth,
             "epoch": epoch,
@@ -3495,9 +3510,9 @@ fn flush_file_observation_epoch(
             "retained_message_count": retained_message_count,
             "original_chars": original_chars,
             "retained_chars": retained_chars,
-            "saved_chars": original_chars.saturating_sub(retained_chars),
-            "saved_estimated_tokens": estimate_tokens(original_chars)
-                .saturating_sub(estimate_tokens(retained_chars)),
+            "character_delta": retained_chars as i128 - original_chars as i128,
+            "estimated_token_delta": estimate_tokens(retained_chars) as i128
+                - estimate_tokens(original_chars) as i128,
             "files": consolidated.iter().map(|value| serde_json::json!({
                 "path": value.path,
                 "source_read_count": value.source_read_count,
@@ -3510,7 +3525,8 @@ fn flush_file_observation_epoch(
                 "content_budget_chars": value.content_budget_chars,
                 "total_lines": value.total_lines,
             })).collect::<Vec<_>>(),
-            "raw_tool_events_preserved": true,
+            "raw_tool_events_preserved_in_trace_only": true,
+            "authoritative_provider_projection": true,
         }),
     )?;
     Ok(())
@@ -3520,6 +3536,12 @@ fn flush_file_observation_epoch(
 enum ParsedFileObservation {
     Raw(RawFileObservation),
     Consolidated(ConsolidatedFileObservation),
+}
+
+#[derive(Debug, Clone)]
+struct ParsedReadObservation {
+    ordinal: usize,
+    observation: ParsedFileObservation,
 }
 
 fn parsed_observation_path(observation: &ParsedFileObservation) -> &str {
@@ -3538,17 +3560,21 @@ fn parsed_observation_source_count(observation: &ParsedFileObservation) -> usize
 
 fn retained_read_exchange(
     exchange: &[LlmMessage],
-    observations: &[ParsedFileObservation],
+    observations: &[ParsedReadObservation],
     removed_paths: &std::collections::BTreeSet<String>,
 ) -> Vec<LlmMessage> {
     let assistant = &exchange[0];
     let calls = assistant.tool_calls.as_ref().expect("parsed read exchange");
-    let retained_ordinals = observations
+    let removed_ordinals = observations
         .iter()
-        .enumerate()
-        .filter_map(|(ordinal, observation)| {
-            (!removed_paths.contains(parsed_observation_path(observation))).then_some(ordinal)
+        .filter_map(|observation| {
+            removed_paths
+                .contains(parsed_observation_path(&observation.observation))
+                .then_some(observation.ordinal)
         })
+        .collect::<std::collections::BTreeSet<_>>();
+    let retained_ordinals = (0..calls.len())
+        .filter(|ordinal| !removed_ordinals.contains(ordinal))
         .collect::<Vec<_>>();
     if retained_ordinals.is_empty() {
         return Vec::new();
@@ -3584,20 +3610,27 @@ fn assistant_tool_exchange_span(messages: &[LlmMessage], index: usize) -> Option
         .then_some(calls.len() + 1)
 }
 
-fn parse_read_exchange(messages: &[LlmMessage]) -> Option<Vec<ParsedFileObservation>> {
+fn parse_read_exchange(messages: &[LlmMessage]) -> Option<Vec<ParsedReadObservation>> {
     let assistant = messages.first()?;
     let calls = assistant.tool_calls.as_ref()?;
-    if calls.is_empty()
-        || !calls.iter().all(|call| call.name == "read_file")
-        || messages.len() != calls.len() + 1
-    {
+    if calls.is_empty() || messages.len() != calls.len() + 1 {
         return None;
     }
-    calls
+    let observations = calls
         .iter()
         .zip(messages.iter().skip(1))
-        .map(|(call, message)| parse_read_tool_message(call, message))
-        .collect()
+        .enumerate()
+        .filter_map(|(ordinal, (call, message))| {
+            (call.name == "read_file")
+                .then(|| parse_read_tool_message(call, message))
+                .flatten()
+                .map(|observation| ParsedReadObservation {
+                    ordinal,
+                    observation,
+                })
+        })
+        .collect::<Vec<_>>();
+    (!observations.is_empty()).then_some(observations)
 }
 
 fn parse_read_tool_message(
@@ -3613,7 +3646,7 @@ fn parse_read_tool_message(
     }
     let content = message.content.as_deref()?;
     if let Some(json) = content.strip_prefix(FILE_OBSERVATION_PREFIX) {
-        let value = serde_json::from_str::<ConsolidatedFileObservation>(json.trim()).ok()?;
+        let value = parse_consolidated_file_observation(json.trim())?;
         return Some(ParsedFileObservation::Consolidated(value));
     }
     let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
@@ -3646,6 +3679,67 @@ fn parse_read_tool_message(
         truncated_by_bytes,
         signature,
     }))
+}
+
+fn parse_consolidated_file_observation(content: &str) -> Option<ConsolidatedFileObservation> {
+    if !content.starts_with(FILE_OBSERVATION_METADATA_PREFIX) {
+        return serde_json::from_str(content).ok();
+    }
+    let mut lines = content.split('\n');
+    let metadata_line = lines.next()?;
+    let metadata = serde_json::from_str::<ConsolidatedFileObservationMetadata>(
+        metadata_line.strip_prefix(FILE_OBSERVATION_METADATA_PREFIX)?,
+    )
+    .ok()?;
+    if !lines.any(|line| line == FILE_OBSERVATION_CONTENT_START) {
+        return None;
+    }
+    let mut numbered_lines = BTreeMap::<usize, String>::new();
+    let mut saw_content_end = false;
+    for line in &mut lines {
+        if line == FILE_OBSERVATION_CONTENT_END {
+            saw_content_end = true;
+            break;
+        }
+        let (prefix, file_content) = line.split_once('|')?;
+        if prefix.len() != metadata.line_number_width {
+            return None;
+        }
+        let line_number = prefix.trim().parse::<usize>().ok()?;
+        numbered_lines.insert(line_number, file_content.to_string());
+    }
+    if !saw_content_end {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(metadata.segments.len());
+    for segment in metadata.segments {
+        let content = (segment.line_start..=segment.line_end)
+            .map(|line| numbered_lines.get(&line).cloned())
+            .collect::<Option<Vec<_>>>()?
+            .join("\n");
+        segments.push(FileObservationSegment {
+            line_start: segment.line_start,
+            line_end: segment.line_end,
+            content,
+            last_line_complete: segment.last_line_complete,
+            last_observed_sequence: segment.last_observed_sequence,
+        });
+    }
+    Some(ConsolidatedFileObservation {
+        schema_version: metadata.schema_version,
+        path: metadata.path,
+        epoch: metadata.epoch,
+        source_read_count: metadata.source_read_count,
+        unique_read_signatures: metadata.unique_read_signatures,
+        requested_ranges: metadata.requested_ranges,
+        historically_observed_ranges: metadata.historically_observed_ranges,
+        retained_ranges: metadata.retained_ranges,
+        content_status: metadata.content_status,
+        missing_ranges: metadata.missing_ranges,
+        content_budget_chars: metadata.content_budget_chars,
+        total_lines: metadata.total_lines,
+        segments,
+    })
 }
 
 fn file_observation_mutation_barrier(exchange: &[LlmMessage]) -> bool {
@@ -3837,10 +3931,16 @@ impl FileObservationAccumulator {
         self.unique_read_signatures.dedup();
         let continuation_read = self.unique_read_signatures.len() > 1;
         let content_budget_chars = file_observation_content_budget(context_window_tokens);
+        let total_lines = self.total_lines.unwrap_or_default();
+        let line_number_width = file_observation_line_number_width(total_lines);
         let requested_ranges = merge_file_observation_ranges(self.reported_ranges);
         let historically_observed_ranges = merge_file_observation_ranges(self.observed_ranges);
-        let retained_lines =
-            bounded_file_observation_lines(&self.lines, content_budget_chars, continuation_read);
+        let retained_lines = bounded_file_observation_lines(
+            &self.lines,
+            content_budget_chars,
+            continuation_read,
+            line_number_width,
+        );
         let retained_ranges = merge_file_observation_ranges(
             retained_lines
                 .keys()
@@ -3861,7 +3961,6 @@ impl FileObservationAccumulator {
                 })
                 .collect(),
         );
-        let total_lines = self.total_lines.unwrap_or_default();
         let full_file_range = (total_lines > 0).then_some(FileObservationRange {
             line_start: 1,
             line_end: total_lines,
@@ -3880,7 +3979,7 @@ impl FileObservationAccumulator {
         };
         let segments = file_observation_segments(&retained_lines);
         ConsolidatedFileObservation {
-            schema_version: "file_observation.v2".to_string(),
+            schema_version: "file_observation.v3".to_string(),
             path,
             epoch,
             source_read_count: self.source_read_count,
@@ -3902,6 +4001,10 @@ fn file_observation_content_budget(context_window_tokens: usize) -> usize {
         FILE_OBSERVATION_CONTENT_MIN_CHARS,
         FILE_OBSERVATION_CONTENT_MAX_CHARS,
     )
+}
+
+fn file_observation_line_number_width(total_lines: usize) -> usize {
+    total_lines.max(1).to_string().len()
 }
 
 fn merge_file_observation_ranges(
@@ -3946,10 +4049,16 @@ fn bounded_file_observation_lines(
     lines: &BTreeMap<usize, (String, bool, usize)>,
     max_chars: usize,
     prefer_recent: bool,
+    line_number_width: usize,
 ) -> BTreeMap<usize, (String, bool, usize)> {
     let content_chars = lines
         .values()
-        .map(|(content, _, _)| content.len().saturating_add(1))
+        .map(|(content, _, _)| {
+            content
+                .len()
+                .saturating_add(line_number_width)
+                .saturating_add(2)
+        })
         .sum::<usize>();
     if content_chars <= max_chars {
         return lines.clone();
@@ -3961,7 +4070,10 @@ fn bounded_file_observation_lines(
     let mut retained = BTreeMap::new();
     let mut retained_chars = 0usize;
     for (line, (content, complete, sequence)) in candidates {
-        let line_chars = content.len().saturating_add(1);
+        let line_chars = content
+            .len()
+            .saturating_add(line_number_width)
+            .saturating_add(2);
         if retained_chars.saturating_add(line_chars) > max_chars {
             break;
         }
@@ -4043,15 +4155,83 @@ fn consolidated_file_observation_messages(
         .zip(observations)
         .map(|(call, observation)| LlmMessage {
             role: MessageRole::Tool,
-            content: Some(format!(
-                "{FILE_OBSERVATION_PREFIX}\n{}",
-                serde_json::to_string(observation).unwrap_or_default()
-            )),
+            content: Some(render_consolidated_file_observation(observation)),
             tool_calls: Some(vec![call]),
             image_paths: None,
         })
         .collect();
     (assistant, tools)
+}
+
+fn render_consolidated_file_observation(observation: &ConsolidatedFileObservation) -> String {
+    let line_number_width = file_observation_line_number_width(observation.total_lines);
+    let metadata = ConsolidatedFileObservationMetadata {
+        schema_version: observation.schema_version.clone(),
+        path: observation.path.clone(),
+        epoch: observation.epoch,
+        source_read_count: observation.source_read_count,
+        unique_read_signatures: observation.unique_read_signatures.clone(),
+        requested_ranges: observation.requested_ranges.clone(),
+        historically_observed_ranges: observation.historically_observed_ranges.clone(),
+        retained_ranges: observation.retained_ranges.clone(),
+        content_status: observation.content_status.clone(),
+        missing_ranges: observation.missing_ranges.clone(),
+        content_budget_chars: observation.content_budget_chars,
+        total_lines: observation.total_lines,
+        line_number_width,
+        segments: observation
+            .segments
+            .iter()
+            .map(|segment| FileObservationSegmentMetadata {
+                line_start: segment.line_start,
+                line_end: segment.line_end,
+                last_line_complete: segment.last_line_complete,
+                last_observed_sequence: segment.last_observed_sequence,
+            })
+            .collect(),
+    };
+    let mut rendered = format!(
+        "{FILE_OBSERVATION_PREFIX}\n\
+         {FILE_OBSERVATION_METADATA_PREFIX}{}\n\
+         File: {}\n\
+         Mutation epoch: {}\n\
+         Status: {}\n\
+         Retained ranges: {}\n\
+         Missing ranges: {}\n\
+         Line format: <absolute line>|<file content>; the prefix is display metadata, not file content.\n\
+         {FILE_OBSERVATION_CONTENT_START}\n",
+        serde_json::to_string(&metadata).unwrap_or_default(),
+        observation.path,
+        observation.epoch,
+        observation.content_status,
+        render_file_observation_ranges(&observation.retained_ranges),
+        render_file_observation_ranges(&observation.missing_ranges),
+    );
+    for segment in &observation.segments {
+        for (offset, content) in segment.content.split('\n').enumerate() {
+            let line_number = segment.line_start + offset;
+            rendered.push_str(&format!("{line_number:>line_number_width$}|{content}\n"));
+        }
+    }
+    rendered.push_str(FILE_OBSERVATION_CONTENT_END);
+    rendered
+}
+
+fn render_file_observation_ranges(ranges: &[FileObservationRange]) -> String {
+    if ranges.is_empty() {
+        return "none".to_string();
+    }
+    ranges
+        .iter()
+        .map(|range| {
+            if range.line_start == range.line_end {
+                range.line_start.to_string()
+            } else {
+                format!("{}-{}", range.line_start, range.line_end)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn short_observation_signature(
@@ -5667,7 +5847,7 @@ mod tests {
         assert_eq!(messages[1].role, MessageRole::Tool);
         let content = messages[1].content.as_deref().unwrap();
         assert!(content.starts_with(FILE_OBSERVATION_PREFIX));
-        let observation = serde_json::from_str::<ConsolidatedFileObservation>(
+        let observation = parse_consolidated_file_observation(
             content
                 .strip_prefix(FILE_OBSERVATION_PREFIX)
                 .unwrap()
@@ -5675,7 +5855,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(observation.path, "src/main.rs");
-        assert_eq!(observation.schema_version, "file_observation.v2");
+        assert_eq!(observation.schema_version, "file_observation.v3");
         assert_eq!(observation.content_status, "complete");
         assert!(observation.missing_ranges.is_empty());
         assert_eq!(observation.source_read_count, 3);
@@ -5699,7 +5879,122 @@ mod tests {
         assert!(messages.iter().map(message_chars).sum::<usize>() < original_chars);
         let trace_content = std::fs::read_to_string(trace.path()).unwrap();
         assert!(trace_content.contains("llm.context_assembly.file_observations_coalesced"));
-        assert!(trace_content.contains("\"raw_tool_events_preserved\":true"));
+        assert!(trace_content.contains("\"authoritative_provider_projection\":true"));
+        assert!(content.contains("  1|line-001-"));
+        assert!(content.contains("200|line-200-"));
+    }
+
+    #[test]
+    fn first_read_becomes_an_authoritative_line_numbered_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let lines = (1..=120)
+            .map(|line| format!("content-{line:03}-{}", "x".repeat(60)))
+            .collect::<Vec<_>>();
+        let mut messages = read_exchange(
+            "read-1",
+            "src/lib.rs",
+            1,
+            120,
+            120,
+            &lines.join("\n"),
+            false,
+        );
+
+        coalesce_retained_file_observations(&mut messages, &trace, 1, 1, 131_072).unwrap();
+        compact_retained_tool_results(
+            &mut messages,
+            &[],
+            &trace,
+            1,
+            1,
+            TranscriptPolicy::SummarizedTranscript,
+            Some(1_000),
+        )
+        .unwrap();
+
+        assert_eq!(messages.len(), 2);
+        let content = messages[1].content.as_deref().unwrap();
+        assert!(content.starts_with(FILE_OBSERVATION_PREFIX));
+        assert!(!content.starts_with(TOOL_RESULT_SUMMARY_PREFIX));
+        assert!(content.contains("  1|content-001-"));
+        assert!(content.contains("120|content-120-"));
+        assert!(content.contains("Status: complete"));
+        assert!(content.contains("Missing ranges: none"));
+    }
+
+    #[test]
+    fn mixed_tool_batch_projects_reads_and_preserves_other_tool_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
+        let read_call = LlmToolCall {
+            id: Some("mixed-read".to_string()),
+            name: "read_file".to_string(),
+            arguments: HashMap::from([("path".to_string(), json!("src/lib.rs"))]),
+        };
+        let shell_call = LlmToolCall {
+            id: Some("mixed-shell".to_string()),
+            name: "shell_command".to_string(),
+            arguments: HashMap::from([("command".to_string(), json!("git status"))]),
+        };
+        let mut messages = vec![LlmMessage {
+            role: MessageRole::Assistant,
+            content: Some("Inspecting file and status.".to_string()),
+            tool_calls: Some(vec![read_call.clone(), shell_call.clone()]),
+            image_paths: None,
+        }];
+        messages.push(LlmMessage {
+            role: MessageRole::Tool,
+            content: Some(
+                json!({
+                    "path": "src/lib.rs",
+                    "content": "alpha\nbeta",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "total_lines": 2,
+                    "truncated_by_lines": false,
+                    "truncated_by_bytes": false,
+                })
+                .to_string(),
+            ),
+            tool_calls: Some(vec![read_call]),
+            image_paths: None,
+        });
+        messages.push(LlmMessage {
+            role: MessageRole::Tool,
+            content: Some(
+                json!({
+                    "status": 0,
+                    "stdout": "clean",
+                    "shell_mutation_sensed": false,
+                })
+                .to_string(),
+            ),
+            tool_calls: Some(vec![shell_call]),
+            image_paths: None,
+        });
+
+        coalesce_retained_file_observations(&mut messages, &trace, 1, 1, 131_072).unwrap();
+
+        assert!(messages.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.name == "shell_command"))
+        }));
+        let projection = messages
+            .iter()
+            .find_map(|message| {
+                message
+                    .content
+                    .as_deref()?
+                    .strip_prefix(FILE_OBSERVATION_PREFIX)
+            })
+            .expect("mixed read must become a canonical projection");
+        let observation = parse_consolidated_file_observation(projection.trim()).unwrap();
+        assert_eq!(observation.path, "src/lib.rs");
+        assert_eq!(observation.content_status, "complete");
+        assert_eq!(observation.segments[0].content, "alpha\nbeta");
     }
 
     #[test]
@@ -5770,9 +6065,7 @@ mod tests {
                     .content
                     .as_deref()?
                     .strip_prefix(FILE_OBSERVATION_PREFIX)
-                    .and_then(|content| {
-                        serde_json::from_str::<ConsolidatedFileObservation>(content.trim()).ok()
-                    })
+                    .and_then(|content| parse_consolidated_file_observation(content.trim()))
             })
             .collect::<Vec<_>>();
         assert_eq!(observations.len(), 1);
@@ -5821,9 +6114,7 @@ mod tests {
                     .content
                     .as_deref()?
                     .strip_prefix(FILE_OBSERVATION_PREFIX)
-                    .and_then(|content| {
-                        serde_json::from_str::<ConsolidatedFileObservation>(content.trim()).ok()
-                    })
+                    .and_then(|content| parse_consolidated_file_observation(content.trim()))
             })
             .unwrap();
         assert_eq!(observation.content_status, "partial");
@@ -5874,16 +6165,20 @@ mod tests {
             &content,
             false,
         ));
-        let original = serde_json::to_string(&messages).unwrap();
-
         coalesce_retained_file_observations(&mut messages, &trace, 2, 4, 131_072).unwrap();
-
-        assert_eq!(serde_json::to_string(&messages).unwrap(), original);
-        assert!(
-            !std::fs::read_to_string(trace.path())
-                .unwrap()
-                .contains("file_observations_coalesced")
-        );
+        let observations = messages
+            .iter()
+            .filter_map(|message| {
+                message
+                    .content
+                    .as_deref()?
+                    .strip_prefix(FILE_OBSERVATION_PREFIX)
+                    .and_then(|content| parse_consolidated_file_observation(content.trim()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].epoch, 0);
+        assert_eq!(observations[1].epoch, 1);
     }
 
     #[test]
@@ -5953,9 +6248,7 @@ mod tests {
                     .content
                     .as_deref()?
                     .strip_prefix(FILE_OBSERVATION_PREFIX)
-                    .and_then(|content| {
-                        serde_json::from_str::<ConsolidatedFileObservation>(content.trim()).ok()
-                    })
+                    .and_then(|content| parse_consolidated_file_observation(content.trim()))
             })
             .collect::<Vec<_>>();
         assert_eq!(observations.len(), 2);
@@ -6075,7 +6368,7 @@ mod tests {
                 "run.started",
                 json!({
                     "model": "deterministic-context-replay",
-                    "packet_type": "file-observation-coalescing-v1",
+                    "packet_type": "file-observation-coalescing-v2",
                     "assembly_policy": "append_summarized_tool_transcript",
                     "context_window_tokens": 131072,
                 }),
@@ -6147,9 +6440,7 @@ mod tests {
                     .content
                     .as_deref()
                     .and_then(|content| content.strip_prefix(FILE_OBSERVATION_PREFIX))
-                    .and_then(|content| {
-                        serde_json::from_str::<ConsolidatedFileObservation>(content.trim()).ok()
-                    })
+                    .and_then(|content| parse_consolidated_file_observation(content.trim()))
             })
             .collect::<Vec<_>>();
         assert!(!observations.is_empty());
@@ -6162,11 +6453,11 @@ mod tests {
                 "retained_message_count": messages.len(),
                 "original_chars": original_chars,
                 "retained_chars": retained_chars,
-                "saved_chars": original_chars - retained_chars,
+                "character_delta": retained_chars as i128 - original_chars as i128,
                 "original_estimated_tokens": estimate_tokens(original_chars),
                 "retained_estimated_tokens": estimate_tokens(retained_chars),
-                "saved_estimated_tokens": estimate_tokens(original_chars)
-                    .saturating_sub(estimate_tokens(retained_chars)),
+                "estimated_token_delta": estimate_tokens(retained_chars) as i128
+                    - estimate_tokens(original_chars) as i128,
                 "files": observations.iter().map(|observation| json!({
                     "path": observation.path,
                     "source_read_count": observation.source_read_count,
@@ -6255,9 +6546,7 @@ mod tests {
                     .content
                     .as_deref()?
                     .strip_prefix(FILE_OBSERVATION_PREFIX)
-                    .and_then(|content| {
-                        serde_json::from_str::<ConsolidatedFileObservation>(content.trim()).ok()
-                    })
+                    .and_then(|content| parse_consolidated_file_observation(content.trim()))
             })
             .filter(|observation| observation.path == target_path)
             .collect::<Vec<_>>();
