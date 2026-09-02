@@ -827,6 +827,26 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         let consecutive_empty_responses = runtime_after_turn.consecutive_empty_responses;
         let consecutive_hidden_only_no_action_turns =
             runtime_after_turn.consecutive_hidden_only_no_action_turns;
+        if policy.consecutive_write_checkpoint_denials
+            >= crate::tools::MAX_CONSECUTIVE_WRITE_CHECKPOINT_DENIALS
+        {
+            final_summary = format!(
+                "write checkpoint hard stop after {} consecutive denied edits; the required shell_command checkpoint was not used",
+                policy.consecutive_write_checkpoint_denials
+            );
+            trace.event(
+                "agent.write_checkpoint.hard_failed",
+                serde_json::json!({
+                    "turn": turn,
+                    "consecutive_denials": policy.consecutive_write_checkpoint_denials,
+                    "total_denials": policy.total_write_checkpoint_denials,
+                    "required_action": "shell_command",
+                    "final_summary": final_summary,
+                }),
+            )?;
+            exhausted_iterations = false;
+            break;
+        }
         let repair_no_action = matches!(
             turn_decision,
             crate::runtime::RuntimeDecision::EscalateRepair
@@ -5757,6 +5777,8 @@ mod tests {
             total_operational_checks: 0,
             operational_check_required: false,
             writes_remaining_before_check: 3,
+            consecutive_write_checkpoint_denials: 0,
+            total_write_checkpoint_denials: 0,
             validation_repair: None,
             validation_repair_read_paths: BTreeMap::new(),
             latest_successful_validation_after_write: None,
@@ -8201,6 +8223,8 @@ mod tests {
             total_operational_checks: 0,
             operational_check_required: false,
             writes_remaining_before_check: 3,
+            consecutive_write_checkpoint_denials: 0,
+            total_write_checkpoint_denials: 0,
             validation_repair,
             validation_repair_read_paths,
             latest_successful_validation_after_write: None,

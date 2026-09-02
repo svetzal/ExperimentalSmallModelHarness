@@ -41,6 +41,7 @@ const MISMATCH_CONTEXT_BEFORE_BYTES: usize = 16;
 const MISMATCH_CONTEXT_AFTER_BYTES: usize = 32;
 const MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL: usize =
     crate::runtime::MAX_CONSECUTIVE_WRITES_WITHOUT_PROBE;
+pub const MAX_CONSECUTIVE_WRITE_CHECKPOINT_DENIALS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct ToolScope {
@@ -61,6 +62,8 @@ struct ToolMeasurements {
     max_tool_result_chars: usize,
     max_tool_result_kind: Option<String>,
     tool_result_chars_by_kind: BTreeMap<String, usize>,
+    consecutive_write_checkpoint_denials: usize,
+    total_write_checkpoint_denials: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -75,6 +78,8 @@ pub struct ToolPolicySnapshot {
     pub total_operational_checks: usize,
     pub operational_check_required: bool,
     pub writes_remaining_before_check: usize,
+    pub consecutive_write_checkpoint_denials: usize,
+    pub total_write_checkpoint_denials: usize,
     pub validation_repair: Option<ValidationRepairSnapshot>,
     pub validation_repair_read_paths: BTreeMap<String, usize>,
     pub latest_successful_validation_after_write: Option<SuccessfulValidationSnapshot>,
@@ -466,6 +471,18 @@ impl ToolScope {
             }
         );
         if let RuntimeDecision::RejectMutation { reason } = decision {
+            let (consecutive_denials, total_denials) = {
+                let mut measurements = self
+                    .measurements
+                    .lock()
+                    .expect("tool measurements mutex poisoned");
+                measurements.consecutive_write_checkpoint_denials += 1;
+                measurements.total_write_checkpoint_denials += 1;
+                (
+                    measurements.consecutive_write_checkpoint_denials,
+                    measurements.total_write_checkpoint_denials,
+                )
+            };
             self.trace.event(
                 "agent.write_budget.exhausted",
                 json!({
@@ -475,6 +492,9 @@ impl ToolScope {
                     "writes_since_shell_probe": runtime.writes_since_probe,
                     "writes_since_shell_probe_paths": runtime.writes_since_probe_paths,
                     "total_write_operations": runtime.total_write_operations,
+                    "consecutive_denials": consecutive_denials,
+                    "total_denials": total_denials,
+                    "hard_stop_after": MAX_CONSECUTIVE_WRITE_CHECKPOINT_DENIALS,
                     "required_action": "shell_command",
                     "required_action_contract": {
                         "command": "the most relevant deterministic non-mutating check",
@@ -484,6 +504,11 @@ impl ToolScope {
                     },
                 }),
             )?;
+            if consecutive_denials >= MAX_CONSECUTIVE_WRITE_CHECKPOINT_DENIALS {
+                bail!(
+                    "{reason}. This edit has now been denied {consecutive_denials} consecutive times; do not retry it. Call shell_command now or end with FAIL"
+                );
+            }
             bail!(reason);
         }
         runtime.reduce(&event);
@@ -581,11 +606,16 @@ impl ToolScope {
         status: Option<i32>,
         success: bool,
     ) -> RuntimeDecision {
-        self.observe_runtime(RuntimeEvent::OperationalCheck {
+        let decision = self.observe_runtime(RuntimeEvent::OperationalCheck {
             command: command.to_string(),
             status,
             success,
-        })
+        });
+        self.measurements
+            .lock()
+            .expect("tool measurements mutex poisoned")
+            .consecutive_write_checkpoint_denials = 0;
+        decision
     }
 
     fn shell_mutation_snapshot(&self) -> Result<BTreeMap<String, FileFingerprint>> {
@@ -903,6 +933,8 @@ impl ToolScope {
             operational_check_required: runtime.operational_check_required(),
             writes_remaining_before_check: MAX_CONSECUTIVE_WRITES_WITHOUT_SHELL
                 .saturating_sub(runtime.consecutive_writes_without_probe),
+            consecutive_write_checkpoint_denials: measurements.consecutive_write_checkpoint_denials,
+            total_write_checkpoint_denials: measurements.total_write_checkpoint_denials,
             validation_repair: runtime
                 .validation_repair
                 .as_ref()
