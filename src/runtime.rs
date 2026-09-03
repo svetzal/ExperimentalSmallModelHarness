@@ -8,8 +8,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const MAX_CONSECUTIVE_WRITES_WITHOUT_PROBE: usize = 3;
-pub const FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE: usize = 1;
 pub const MAX_REPAIR_NO_ACTION_TURNS: usize = 2;
 pub const MAX_ACTION_BOUNDARY_NO_ACTION_TURNS: usize = 2;
 pub const EMPTY_RESPONSE_ESCALATION_TURNS: usize = 3;
@@ -55,11 +53,6 @@ pub enum RuntimeEvent {
         caused_mutation: bool,
         failure_text: String,
         failure_details: Vec<String>,
-    },
-    OperationalCheck {
-        command: String,
-        status: Option<i32>,
-        success: bool,
     },
     RequestedProbeObserved {
         probe_id: String,
@@ -180,18 +173,15 @@ pub struct RuntimeState {
     pub run_finished: bool,
     pub current_turn: usize,
     pub total_tool_calls: usize,
-    pub consecutive_writes_without_probe: usize,
     pub writes_since_probe: usize,
     pub writes_since_probe_paths: BTreeMap<String, usize>,
     pub pending_evidence_paths: BTreeMap<String, usize>,
     pub total_write_operations: usize,
     pub total_validation_probes: usize,
-    pub total_operational_checks: usize,
     pub mutation_epoch: usize,
     pub fresh_validation_epoch: Option<usize>,
     pub latest_successful_validation: Option<SuccessfulValidation>,
     pub validation_repair: Option<ValidationRepair>,
-    pub validation_repair_write_allowance: usize,
     pub validation_repair_read_paths: BTreeMap<String, usize>,
     pub repeated_command_failures: BTreeMap<String, usize>,
     pub repeated_failure_summaries: BTreeMap<String, usize>,
@@ -250,18 +240,15 @@ impl RuntimeState {
             run_finished: false,
             current_turn: 0,
             total_tool_calls: 0,
-            consecutive_writes_without_probe: 0,
             writes_since_probe: 0,
             writes_since_probe_paths: BTreeMap::new(),
             pending_evidence_paths: BTreeMap::new(),
             total_write_operations: 0,
             total_validation_probes: 0,
-            total_operational_checks: 0,
             mutation_epoch: 0,
             fresh_validation_epoch: None,
             latest_successful_validation: None,
             validation_repair: None,
-            validation_repair_write_allowance: 0,
             validation_repair_read_paths: BTreeMap::new(),
             repeated_command_failures: BTreeMap::new(),
             repeated_failure_summaries: BTreeMap::new(),
@@ -277,7 +264,7 @@ impl RuntimeState {
             meaningful_action_seen: false,
             consecutive_empty_responses: 0,
             consecutive_hidden_only_no_action_turns: 0,
-            terminal_readiness: false,
+            terminal_readiness: !validation_enforced,
             terminal_token: None,
             manual_stop: None,
             environment_stop: None,
@@ -309,14 +296,6 @@ impl RuntimeState {
                 evidence_invalidating_paths,
                 ..
             } => {
-                if self.consecutive_writes_without_probe >= MAX_CONSECUTIVE_WRITES_WITHOUT_PROBE
-                    && !evidence_invalidating_paths.is_empty()
-                    && self.validation_repair.is_some()
-                    && self.validation_repair_write_allowance > 0
-                {
-                    self.validation_repair_write_allowance -= 1;
-                }
-                self.consecutive_writes_without_probe += 1;
                 self.writes_since_probe += 1;
                 self.total_write_operations += 1;
                 for path in paths {
@@ -390,13 +369,11 @@ impl RuntimeState {
                 }
                 if *success {
                     if *clears_pending_mutations && !*caused_mutation {
-                        self.consecutive_writes_without_probe = 0;
                         self.writes_since_probe = 0;
                         self.writes_since_probe_paths.clear();
                         self.pending_evidence_paths.clear();
                     }
                     self.validation_repair = None;
-                    self.validation_repair_write_allowance = 0;
                     self.validation_repair_read_paths.clear();
                     self.active_repair_failure_key = None;
                     self.consecutive_repair_no_action_turns = 0;
@@ -436,35 +413,8 @@ impl RuntimeState {
                     };
                     self.active_repair_failure_key = Some(repair.failure_key());
                     self.validation_repair = Some(repair);
-                    self.validation_repair_write_allowance = if had_pending_mutations {
-                        FAILED_VALIDATION_REPAIR_WRITE_ALLOWANCE
-                    } else {
-                        0
-                    };
                     self.validation_repair_read_paths.clear();
                     self.fresh_validation_epoch = None;
-                }
-                self.recompute_terminal_readiness();
-            }
-            RuntimeEvent::OperationalCheck {
-                command: _,
-                status: _,
-                success,
-            } => {
-                self.total_operational_checks += 1;
-                self.meaningful_action_seen = true;
-                self.repeated_inspections.clear();
-                if *success {
-                    self.consecutive_writes_without_probe = 0;
-                    if !self.validation_enforced {
-                        self.fresh_validation_epoch = Some(self.mutation_epoch);
-                    }
-                } else {
-                    self.consecutive_writes_without_probe =
-                        MAX_CONSECUTIVE_WRITES_WITHOUT_PROBE.saturating_sub(1);
-                    if !self.validation_enforced {
-                        self.fresh_validation_epoch = None;
-                    }
                 }
                 self.recompute_terminal_readiness();
             }
@@ -591,12 +541,6 @@ impl RuntimeState {
         self.validation_enforced && !self.pending_evidence_paths.is_empty()
     }
 
-    pub fn operational_check_required(&self) -> bool {
-        !self.validation_enforced
-            && self.total_write_operations > 0
-            && self.fresh_validation_epoch != Some(self.mutation_epoch)
-    }
-
     pub fn requested_probes_satisfied(&self) -> bool {
         self.requested_probes.iter().all(|probe| {
             probe.status == ProbeStatus::Passed && probe.mutation_epoch == Some(self.mutation_epoch)
@@ -604,11 +548,14 @@ impl RuntimeState {
     }
 
     fn recompute_terminal_readiness(&mut self) {
-        self.terminal_readiness = !self.validation_required()
-            && !self.operational_check_required()
-            && self.validation_repair.is_none()
-            && self.fresh_validation_epoch == Some(self.mutation_epoch)
-            && self.requested_probes_satisfied();
+        self.terminal_readiness = if self.validation_enforced {
+            !self.validation_required()
+                && self.validation_repair.is_none()
+                && self.fresh_validation_epoch == Some(self.mutation_epoch)
+                && self.requested_probes_satisfied()
+        } else {
+            true
+        };
     }
 }
 
@@ -627,7 +574,7 @@ impl ValidationRepair {
 pub enum RuntimeDecision {
     Continue,
     RequestValidation,
-    AllowMutation { consume_repair_allowance: bool },
+    AllowMutation,
     RejectMutation { reason: String },
     PromptRepair,
     EscalateRepair,
@@ -651,33 +598,13 @@ pub struct RuntimePolicy;
 
 impl RuntimePolicy {
     pub fn decide(&self, state: &RuntimeState, event: &RuntimeEvent) -> RuntimeDecision {
-        if let RuntimeEvent::ToolMutation {
-            evidence_invalidating_paths,
-            ..
-        } = event
-        {
+        if matches!(event, RuntimeEvent::ToolMutation { .. }) {
             if state.run_finished {
                 return RuntimeDecision::RejectMutation {
                     reason: "run is already terminal".to_string(),
                 };
             }
-            if state.consecutive_writes_without_probe >= MAX_CONSECUTIVE_WRITES_WITHOUT_PROBE {
-                let allowance = !evidence_invalidating_paths.is_empty()
-                    && state.validation_repair.is_some()
-                    && state.validation_repair_write_allowance > 0;
-                return if allowance {
-                    RuntimeDecision::AllowMutation {
-                        consume_repair_allowance: true,
-                    }
-                } else {
-                    RuntimeDecision::RejectMutation {
-                        reason: "write checkpoint required before another structured edit: call shell_command with the most relevant deterministic non-mutating check; a passing check restores 3 edits and a failing check grants 1 repair edit".to_string(),
-                    }
-                };
-            }
-            return RuntimeDecision::AllowMutation {
-                consume_repair_allowance: false,
-            };
+            return RuntimeDecision::AllowMutation;
         }
 
         let mut after = state.clone();
@@ -746,9 +673,6 @@ impl RuntimePolicy {
             RuntimeEvent::ValidationProbe { success: true, .. } if after.terminal_readiness => {
                 RuntimeDecision::AcceptDone
             }
-            RuntimeEvent::OperationalCheck { success: true, .. } if after.terminal_readiness => {
-                RuntimeDecision::AcceptDone
-            }
             RuntimeEvent::ToolMutation { .. } => RuntimeDecision::RequestValidation,
             RuntimeEvent::RequestedProbeObserved { .. } if after.terminal_readiness => {
                 RuntimeDecision::AcceptDone
@@ -807,7 +731,7 @@ impl<E: RuntimeEffects> RuntimeOrchestrator<E> {
             source: MutationSource::Write,
         };
         let decision = self.policy.decide(&self.state, &event);
-        if matches!(decision, RuntimeDecision::AllowMutation { .. }) {
+        if matches!(decision, RuntimeDecision::AllowMutation) {
             self.effects.mutate(&paths)?;
             self.state.reduce(&event);
         }
@@ -972,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_validation_activates_repair_and_grants_exactly_one_allowance() {
+    fn failed_validation_activates_repair_without_restricting_edits() {
         let policy = RuntimePolicy;
         let mut state = RuntimeState::default();
         for _ in 0..3 {
@@ -980,19 +904,15 @@ mod tests {
         }
         state.reduce(&probe(None, false, false));
         assert!(state.validation_repair.is_some());
-        assert_eq!(state.validation_repair_write_allowance, 1);
         assert_eq!(
             policy.decide(&state, &mutation()),
-            RuntimeDecision::AllowMutation {
-                consume_repair_allowance: true
-            }
+            RuntimeDecision::AllowMutation
         );
         state.reduce(&mutation());
-        assert_eq!(state.validation_repair_write_allowance, 0);
-        assert!(matches!(
+        assert_eq!(
             policy.decide(&state, &mutation()),
-            RuntimeDecision::RejectMutation { .. }
-        ));
+            RuntimeDecision::AllowMutation
+        );
     }
 
     #[test]
@@ -1338,13 +1258,7 @@ mod tests {
         };
         assert!(matches!(
             orchestrator.request_mutation(vec!["artifact".into()], vec!["artifact".into()]),
-            Ok(RuntimeDecision::RejectMutation { .. })
-        ));
-        assert_eq!(orchestrator.effects.mutations, 0);
-        orchestrator.state.reduce(&probe(None, true, true));
-        assert!(matches!(
-            orchestrator.request_mutation(vec!["artifact".into()], vec!["artifact".into()]),
-            Ok(RuntimeDecision::AllowMutation { .. })
+            Ok(RuntimeDecision::AllowMutation)
         ));
         assert_eq!(orchestrator.effects.mutations, 1);
         orchestrator.state.reduce(&probe(None, true, true));

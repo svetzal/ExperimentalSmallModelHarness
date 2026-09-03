@@ -827,26 +827,6 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         let consecutive_empty_responses = runtime_after_turn.consecutive_empty_responses;
         let consecutive_hidden_only_no_action_turns =
             runtime_after_turn.consecutive_hidden_only_no_action_turns;
-        if policy.consecutive_write_checkpoint_denials
-            >= crate::tools::MAX_CONSECUTIVE_WRITE_CHECKPOINT_DENIALS
-        {
-            final_summary = format!(
-                "write checkpoint hard stop after {} consecutive denied edits; the required shell_command checkpoint was not used",
-                policy.consecutive_write_checkpoint_denials
-            );
-            trace.event(
-                "agent.write_checkpoint.hard_failed",
-                serde_json::json!({
-                    "turn": turn,
-                    "consecutive_denials": policy.consecutive_write_checkpoint_denials,
-                    "total_denials": policy.total_write_checkpoint_denials,
-                    "required_action": "shell_command",
-                    "final_summary": final_summary,
-                }),
-            )?;
-            exhausted_iterations = false;
-            break;
-        }
         let repair_no_action = matches!(
             turn_decision,
             crate::runtime::RuntimeDecision::EscalateRepair
@@ -5768,17 +5748,11 @@ mod tests {
     fn context_snapshot_includes_inferred_tool_pressure() {
         let policy = ToolPolicySnapshot {
             total_tool_calls: 3,
-            consecutive_writes_without_shell: 0,
             writes_since_shell_probe: 0,
             writes_since_shell_probe_paths: BTreeMap::new(),
             validation_required_after_write: false,
             total_write_operations: 0,
             total_shell_probes: 1,
-            total_operational_checks: 0,
-            operational_check_required: false,
-            writes_remaining_before_check: 3,
-            consecutive_write_checkpoint_denials: 0,
-            total_write_checkpoint_denials: 0,
             validation_repair: None,
             validation_repair_read_paths: BTreeMap::new(),
             latest_successful_validation_after_write: None,
@@ -8214,17 +8188,11 @@ mod tests {
     ) -> ToolPolicySnapshot {
         ToolPolicySnapshot {
             total_tool_calls: 0,
-            consecutive_writes_without_shell: 0,
             writes_since_shell_probe: 0,
             writes_since_shell_probe_paths: BTreeMap::new(),
             validation_required_after_write: false,
             total_write_operations,
             total_shell_probes,
-            total_operational_checks: 0,
-            operational_check_required: false,
-            writes_remaining_before_check: 3,
-            consecutive_write_checkpoint_denials: 0,
-            total_write_checkpoint_denials: 0,
             validation_repair,
             validation_repair_read_paths,
             latest_successful_validation_after_write: None,
@@ -9050,21 +9018,16 @@ mod tests {
                     ),
                 ]),
             )],
-            vec![tool_call_chunk(
-                "shell_command",
-                HashMap::from([("command".to_string(), json!("test -f src/lib.rs"))]),
-            )],
             vec![StreamChunk::Content("DONE".to_string())],
         ]);
 
-        let summary = fixture.run_contract(&gateway, 3).await;
+        let summary = fixture.run_contract(&gateway, 2).await;
 
         assert_eq!(summary.final_summary, "DONE");
         let trace = std::fs::read_to_string(summary.trace_file).unwrap();
         assert!(trace.contains("\"kind\":\"agent.stage.first_source_mutation\""));
         assert!(!trace.contains("\"kind\":\"agent.validation.required_after_edit\""));
         assert!(!trace.contains("\"kind\":\"agent.validation_probe.observed\""));
-        assert!(trace.contains("\"kind\":\"agent.operational_check.observed\""));
     }
 
     #[tokio::test]
