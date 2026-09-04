@@ -2414,7 +2414,7 @@ impl LlmTool for ReplaceFileLinesTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "replace_file_lines".to_string(),
-                description: "Replace one inclusive line range in an existing UTF-8 file. Line numbers are the absolute prefixes shown by read_file. Returns the actual resulting numbered lines."
+                description: "Replace one inclusive line range in an existing UTF-8 file. Line numbers are the absolute prefixes shown by read_file. If the selected range ends at a line boundary, the replacement remains a complete line even when its text omits the trailing newline. Returns the actual resulting numbered lines and reports any boundary normalization."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -2444,7 +2444,10 @@ impl ReplaceFileLinesTool {
         let path_arg = required_str(args, "path")?;
         let start_line = required_u64(args, "start_line")?;
         let end_line = required_u64(args, "end_line")?;
-        let replacement = required_str(args, "replacement")?;
+        let replacement = args
+            .get("replacement")
+            .and_then(Value::as_str)
+            .context("missing required string argument \"replacement\"")?;
         let path = self.scope.resolve_existing_or_new(path_arg)?;
         self.scope.check_write(&path)?;
         if !path.is_file() {
@@ -2454,9 +2457,11 @@ impl ReplaceFileLinesTool {
             .await
             .with_context(|| format!("reading {}", path.display()))?;
         verify_optional_file_hash(args, &original)?;
-        let (start_index, end_index, _) = selected_line_range(&original, start_line, end_line, 0)?;
+        let (start_index, end_index, selected) =
+            selected_line_range(&original, start_line, end_line, 0)?;
+        let normalized = line_range_replacement(&selected, replacement);
         let mut lines = split_lines_preserving_newlines(&original);
-        lines.splice(start_index..end_index, [replacement.to_string()]);
+        lines.splice(start_index..end_index, [normalized.text.clone()]);
         let content = lines.concat();
         self.scope.note_write_intent(std::slice::from_ref(&path))?;
         tokio::fs::write(&path, content.as_bytes())
@@ -2468,6 +2473,9 @@ impl ReplaceFileLinesTool {
             "end_line": end_line,
             "bytes_before": original.len(),
             "bytes_after": content.len(),
+            "requested_replacement_bytes": replacement.len(),
+            "normalized_replacement_bytes": normalized.text.len(),
+            "line_boundary_normalized": normalized.line_boundary_normalized,
             "mutation_receipt": mutation_receipt(
                 Some(&original),
                 &content,
@@ -3148,6 +3156,19 @@ struct NormalizedInsertion {
 struct NormalizedReplacement {
     text: String,
     line_boundary_normalized: bool,
+}
+
+fn line_range_replacement(selected: &str, replacement: &str) -> NormalizedReplacement {
+    let should_normalize =
+        selected.ends_with('\n') && !replacement.is_empty() && !replacement.ends_with('\n');
+    let mut text = replacement.to_string();
+    if should_normalize {
+        text.push('\n');
+    }
+    NormalizedReplacement {
+        text,
+        line_boundary_normalized: should_normalize,
+    }
 }
 
 fn line_aware_insertion(
@@ -4621,6 +4642,74 @@ bytes[0..5] \"cafe\\n\""
             .to_string();
         assert!(error.contains("no mutation occurred"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\nTWO\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn replace_file_lines_preserves_the_selected_trailing_line_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.rs");
+        std::fs::write(&file, "fn example() {\n    old();\n}\n").unwrap();
+        let tool = ReplaceFileLinesTool { scope };
+
+        let result = tool
+            .replace(&HashMap::from([
+                ("path".to_string(), json!("example.rs")),
+                ("start_line".to_string(), json!(2)),
+                ("end_line".to_string(), json!(2)),
+                ("replacement".to_string(), json!("    new();")),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fn example() {\n    new();\n}\n"
+        );
+        assert_eq!(result["line_boundary_normalized"], json!(true));
+        assert_eq!(result["requested_replacement_bytes"], json!(10));
+        assert_eq!(result["normalized_replacement_bytes"], json!(11));
+        assert!(
+            result["mutation_receipt"]["after_view"]
+                .as_str()
+                .unwrap()
+                .contains("3|}")
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_file_lines_does_not_invent_an_eof_newline_or_block_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.txt");
+        std::fs::write(&file, "one\ntwo").unwrap();
+        let tool = ReplaceFileLinesTool {
+            scope: scope.clone(),
+        };
+
+        let eof_result = tool
+            .replace(&HashMap::from([
+                ("path".to_string(), json!("example.txt")),
+                ("start_line".to_string(), json!(2)),
+                ("end_line".to_string(), json!(2)),
+                ("replacement".to_string(), json!("TWO")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\nTWO");
+        assert_eq!(eof_result["line_boundary_normalized"], json!(false));
+
+        let delete_result = ReplaceFileLinesTool { scope }
+            .replace(&HashMap::from([
+                ("path".to_string(), json!("example.txt")),
+                ("start_line".to_string(), json!(1)),
+                ("end_line".to_string(), json!(1)),
+                ("replacement".to_string(), json!("")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "TWO");
+        assert_eq!(delete_result["line_boundary_normalized"], json!(false));
     }
 
     #[tokio::test]
