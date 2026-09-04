@@ -4,8 +4,8 @@ use crate::acceptance_interactions::{
 use crate::acceptance_ledger::{AcceptanceLedgerSnapshot, AcceptanceLedgerSpec};
 use crate::acceptance_plan::{DEFAULT_MAX_PLAN_ITEMS, plan_acceptance_with_gateway};
 use crate::tools::{
-    SuccessfulValidationSnapshot, ToolPolicySnapshot, ToolScope, ValidationRepairSnapshot,
-    tools_for_profile,
+    SuccessfulValidationSnapshot, ToolPolicySnapshot, ToolScope, ToolSurface,
+    ValidationRepairSnapshot, tools_for_profile,
 };
 use crate::trace::TraceRecorder;
 use anyhow::{Context, Result};
@@ -341,6 +341,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         .unwrap_or_else(|| experiment_dir.join("traces"));
     let trace = Arc::new(TraceRecorder::create(&trace_dir)?);
     let harness_source_state = crate::provenance::capture();
+    let tool_surface = ToolSurface::from_environment()?;
     trace.event(
         "run.started",
         serde_json::json!({
@@ -365,6 +366,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "initial_context_catalog_file": config.initial_context_catalog_file,
             "semantic_advisor_model": config.semantic_advisor_model,
             "acceptance_ledger": config.acceptance_ledger,
+            "tool_surface": tool_surface,
             "requested_validation_commands": &requested_validation_commands,
             "context_instrumentation_version": CONTEXT_INSTRUMENTATION_VERSION,
             "harness_package_version": env!("CARGO_PKG_VERSION"),
@@ -514,6 +516,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         scope_rules(&resolved_contract.read_scope),
         scope_rules(&resolved_contract.write_scope),
     )?;
+    scope.configure_tool_surface(tool_surface);
     let requested_probe_ids_by_command = resolved_contract
         .probes
         .iter()
@@ -531,7 +534,13 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         .filter(|tool| {
             matches!(
                 tool.descriptor().function.name.as_str(),
-                "edit_file" | "write_file" | "shell_command" | "execute_probe"
+                "edit_file"
+                    | "replace_file_lines"
+                    | "apply_patch"
+                    | "apply_change_set"
+                    | "write_file"
+                    | "shell_command"
+                    | "execute_probe"
             )
         })
         .map(|tool| tool.clone_box())
@@ -541,7 +550,12 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         .filter(|tool| {
             matches!(
                 tool.descriptor().function.name.as_str(),
-                "edit_file" | "write_file" | "execute_probe"
+                "edit_file"
+                    | "replace_file_lines"
+                    | "apply_patch"
+                    | "apply_change_set"
+                    | "write_file"
+                    | "execute_probe"
             )
         })
         .map(|tool| tool.clone_box())
@@ -3852,7 +3866,14 @@ fn file_observation_mutation_barrier(exchange: &[LlmMessage]) -> bool {
 fn tool_result_reports_mutation(tool_name: &str, content: Option<&str>) -> bool {
     if !matches!(
         tool_name,
-        "write_file" | "edit_file" | "patch_file" | "shell_command" | "execute_probe"
+        "write_file"
+            | "edit_file"
+            | "replace_file_lines"
+            | "patch_file"
+            | "apply_patch"
+            | "apply_change_set"
+            | "shell_command"
+            | "execute_probe"
     ) {
         return false;
     }
@@ -3865,7 +3886,8 @@ fn tool_result_reports_mutation(tool_name: &str, content: Option<&str>) -> bool 
         return false;
     }
     match tool_name {
-        "write_file" | "edit_file" | "patch_file" => value
+        "write_file" | "edit_file" | "replace_file_lines" | "patch_file" | "apply_patch"
+        | "apply_change_set" => value
             .get("content_changed")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true),
@@ -5116,7 +5138,12 @@ fn is_meaningful_source_edit(
             .get("path")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|path| profile.path_requires_validation_after_write(path)),
-        "patch_file" => true,
+        "patch_file" | "apply_patch" | "apply_change_set" => true,
+        "replace_file_lines" => call
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| profile.path_requires_validation_after_write(path)),
         "write_file" => call
             .arguments
             .get("path")

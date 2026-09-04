@@ -39,6 +39,66 @@ const DECLARED_PROBE_EVENT_PREFIX: &str = "HARNESS_PROBE_EVENT\t";
 const MAX_DECLARED_PROBE_PHASE_EVENTS: usize = 64;
 const MISMATCH_CONTEXT_BEFORE_BYTES: usize = 16;
 const MISMATCH_CONTEXT_AFTER_BYTES: usize = 32;
+const MUTATION_RECEIPT_CONTEXT_LINES: usize = 4;
+const MUTATION_RECEIPT_MAX_LINES: usize = 40;
+const EXPERIMENTAL_TOOL_SURFACE_ENV: &str = "HARNESS_EXPERIMENTAL_TOOL_SURFACE";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolSurface {
+    #[default]
+    Control,
+    Receipts,
+    LineRange,
+    ApplyPatch,
+    ApplyPatchChoice,
+    AtomicChangeSet,
+    NaturalShell,
+}
+
+impl ToolSurface {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "control" => Some(Self::Control),
+            "receipts" => Some(Self::Receipts),
+            "line-range" => Some(Self::LineRange),
+            "apply-patch" => Some(Self::ApplyPatch),
+            "apply-patch-choice" => Some(Self::ApplyPatchChoice),
+            "atomic-change-set" => Some(Self::AtomicChangeSet),
+            "natural-shell" => Some(Self::NaturalShell),
+            _ => None,
+        }
+    }
+
+    pub fn from_environment() -> Result<Self> {
+        let Some(value) = std::env::var_os(EXPERIMENTAL_TOOL_SURFACE_ENV) else {
+            return Ok(Self::Control);
+        };
+        let value = value.to_string_lossy();
+        Self::parse(&value).with_context(|| {
+            format!(
+                "invalid {EXPERIMENTAL_TOOL_SURFACE_ENV}={value:?}; expected control, receipts, \
+line-range, apply-patch, apply-patch-choice, atomic-change-set, or natural-shell"
+            )
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Receipts => "receipts",
+            Self::LineRange => "line-range",
+            Self::ApplyPatch => "apply-patch",
+            Self::ApplyPatchChoice => "apply-patch-choice",
+            Self::AtomicChangeSet => "atomic-change-set",
+            Self::NaturalShell => "natural-shell",
+        }
+    }
+
+    fn mutation_receipts(self) -> bool {
+        !matches!(self, Self::Control | Self::NaturalShell)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolScope {
@@ -50,6 +110,7 @@ pub struct ToolScope {
     profile: ProfileRef,
     probes: Arc<Mutex<BTreeMap<String, Probe>>>,
     acceptance_ledger: Arc<Mutex<AcceptanceLedgerState>>,
+    tool_surface: Arc<Mutex<ToolSurface>>,
 }
 
 #[derive(Debug, Default)]
@@ -246,7 +307,22 @@ impl ToolScope {
             profile,
             probes: Arc::new(Mutex::new(BTreeMap::new())),
             acceptance_ledger: Arc::new(Mutex::new(AcceptanceLedgerState::default())),
+            tool_surface: Arc::new(Mutex::new(ToolSurface::Control)),
         })
+    }
+
+    pub fn configure_tool_surface(&self, surface: ToolSurface) {
+        *self
+            .tool_surface
+            .lock()
+            .expect("tool surface mutex poisoned") = surface;
+    }
+
+    pub fn tool_surface(&self) -> ToolSurface {
+        *self
+            .tool_surface
+            .lock()
+            .expect("tool surface mutex poisoned")
     }
 
     fn profile(&self) -> &'static dyn DomainProfile {
@@ -1250,32 +1326,62 @@ pub fn tools_for_profile(scope: &ToolScope, profile: &dyn DomainProfile) -> Vec<
     {
         capabilities.push(ToolCapability::SubmitAcceptanceEvidence);
     }
-    capabilities
-        .into_iter()
-        .map(|capability| match capability {
-            ToolCapability::ListTree => Box::new(ListTreeTool {
+    let surface = scope.tool_surface();
+    let mut tools = Vec::<Box<dyn LlmTool>>::new();
+    for capability in capabilities {
+        match capability {
+            ToolCapability::ListTree => tools.push(Box::new(ListTreeTool {
                 scope: scope.clone(),
-            }) as Box<dyn LlmTool>,
-            ToolCapability::ReadFile => Box::new(ReadFileTool {
+            })),
+            ToolCapability::ReadFile => tools.push(Box::new(ReadFileTool {
                 scope: scope.clone(),
-            }),
-            ToolCapability::WriteFile => Box::new(WriteFileTool {
+            })),
+            ToolCapability::WriteFile => {
+                if !matches!(surface, ToolSurface::AtomicChangeSet) {
+                    tools.push(Box::new(WriteFileTool {
+                        scope: scope.clone(),
+                    }));
+                }
+            }
+            ToolCapability::EditFile => match surface {
+                ToolSurface::Control | ToolSurface::Receipts => {
+                    tools.push(Box::new(EditFileTool {
+                        scope: scope.clone(),
+                    }));
+                }
+                ToolSurface::LineRange => tools.push(Box::new(ReplaceFileLinesTool {
+                    scope: scope.clone(),
+                })),
+                ToolSurface::ApplyPatch => tools.push(Box::new(PatchFileTool {
+                    scope: scope.clone(),
+                })),
+                ToolSurface::ApplyPatchChoice => {
+                    tools.push(Box::new(EditFileTool {
+                        scope: scope.clone(),
+                    }));
+                    tools.push(Box::new(PatchFileTool {
+                        scope: scope.clone(),
+                    }));
+                }
+                ToolSurface::AtomicChangeSet => tools.push(Box::new(ApplyChangeSetTool {
+                    scope: scope.clone(),
+                })),
+                ToolSurface::NaturalShell => {}
+            },
+            ToolCapability::ShellCommand => tools.push(Box::new(ShellCommandTool {
                 scope: scope.clone(),
-            }),
-            ToolCapability::EditFile => Box::new(EditFileTool {
+            })),
+            ToolCapability::ExecuteProbe => tools.push(Box::new(ExecuteProbeTool {
                 scope: scope.clone(),
-            }),
-            ToolCapability::ShellCommand => Box::new(ShellCommandTool {
-                scope: scope.clone(),
-            }),
-            ToolCapability::ExecuteProbe => Box::new(ExecuteProbeTool {
-                scope: scope.clone(),
-            }),
-            ToolCapability::SubmitAcceptanceEvidence => Box::new(SubmitAcceptanceEvidenceTool {
-                scope: scope.clone(),
-            }),
-        })
-        .collect()
+            })),
+            ToolCapability::SubmitAcceptanceEvidence => {
+                tools.push(Box::new(SubmitAcceptanceEvidenceTool {
+                    scope: scope.clone(),
+                }));
+            }
+        }
+    }
+    tools
 }
 
 #[derive(Debug, Clone)]
@@ -1855,15 +1961,90 @@ impl WriteFileTool {
         tokio::fs::write(&path, content)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
-        Ok(json!({
+        let mut result = json!({
             "path": self.scope.relative_display(&path),
             "bytes_written": content.len(),
             "previous_bytes": previous_bytes,
             "content_changed": content_changed,
             "before_sha256": before_sha256,
             "after_sha256": after_sha256
-        }))
+        });
+        if self.scope.tool_surface().mutation_receipts() {
+            result["mutation_receipt"] = mutation_receipt(
+                previous_content
+                    .as_deref()
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok()),
+                content,
+                self.scope.runtime_state_snapshot().mutation_epoch,
+            );
+        }
+        Ok(result)
     }
+}
+
+fn mutation_receipt(before: Option<&str>, after: &str, mutation_epoch: usize) -> Value {
+    let before_lines = before.map(|content| content.lines().collect::<Vec<_>>());
+    let after_lines = after.lines().collect::<Vec<_>>();
+    let (start_line, end_line) = changed_line_range(before_lines.as_deref(), &after_lines);
+    let view_start = start_line
+        .saturating_sub(MUTATION_RECEIPT_CONTEXT_LINES)
+        .max(1);
+    let view_end = end_line
+        .saturating_add(MUTATION_RECEIPT_CONTEXT_LINES)
+        .min(after_lines.len().max(1));
+    json!({
+        "mutation_epoch": mutation_epoch,
+        "after_sha256": format!("{:x}", Sha256::digest(after.as_bytes())),
+        "total_lines": after_lines.len(),
+        "changed_range": {
+            "line_start": start_line,
+            "line_end": end_line,
+        },
+        "after_view": numbered_line_view(&after_lines, view_start, view_end),
+        "after_view_range": {
+            "line_start": view_start,
+            "line_end": view_end,
+        },
+        "line_format": "<absolute line>|<file content>",
+    })
+}
+
+fn changed_line_range(before: Option<&[&str]>, after: &[&str]) -> (usize, usize) {
+    let Some(before) = before else {
+        return (1, after.len().clamp(1, MUTATION_RECEIPT_MAX_LINES));
+    };
+    let prefix = before
+        .iter()
+        .zip(after)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = before[prefix..]
+        .iter()
+        .rev()
+        .zip(after[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let start = prefix.saturating_add(1);
+    let end = after.len().saturating_sub(suffix).max(start);
+    (start, end.min(start + MUTATION_RECEIPT_MAX_LINES - 1))
+}
+
+fn numbered_line_view(lines: &[&str], start_line: usize, end_line: usize) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let start_line = start_line.clamp(1, lines.len());
+    let end_line = end_line.clamp(start_line, lines.len());
+    let width = end_line.to_string().len();
+    (start_line..=end_line)
+        .map(|line_number| {
+            format!(
+                "{line_number:>width$}|{}\n",
+                lines[line_number - 1],
+                width = width
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1986,6 +2167,7 @@ impl EditFileTool {
         let mut content = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("reading {}", path.display()))?;
+        let original_content = content.clone();
         let bytes_before = content.len();
         let mut applied = Vec::new();
 
@@ -2186,14 +2368,332 @@ impl EditFileTool {
         tokio::fs::write(&path, content.as_bytes())
             .await
             .with_context(|| format!("writing {}", path.display()))?;
-        Ok(json!({
+        let mut result = json!({
             "path": self.scope.relative_display(&path),
             "edit_count": applied.len(),
             "bytes_before": bytes_before,
             "bytes_after": content.len(),
             "edits_applied": applied,
+        });
+        if self.scope.tool_surface().mutation_receipts() {
+            result["mutation_receipt"] = mutation_receipt(
+                Some(&original_content),
+                &content,
+                self.scope.runtime_state_snapshot().mutation_epoch,
+            );
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplaceFileLinesTool {
+    scope: ToolScope,
+}
+
+#[async_trait]
+impl LlmTool for ReplaceFileLinesTool {
+    async fn run(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &ToolRunCtx,
+    ) -> mojentic::Result<Value> {
+        self.scope.note_tool_call();
+        let result = self.replace(args).await.map_err(to_mojentic_error);
+        let payload = match &result {
+            Ok(value) => value.clone(),
+            Err(error) => json!({ "error": error.to_string() }),
+        };
+        self.scope
+            .trace_tool_event("tool.replace_file_lines", payload);
+        result
+    }
+
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            r#type: "function".to_string(),
+            function: FunctionDescriptor {
+                name: "replace_file_lines".to_string(),
+                description: "Replace one inclusive line range in an existing UTF-8 file. Line numbers are the absolute prefixes shown by read_file. Returns the actual resulting numbered lines."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "start_line": { "type": "integer", "minimum": 1 },
+                        "end_line": { "type": "integer", "minimum": 1 },
+                        "replacement": { "type": "string" },
+                        "expected_file_sha256": {
+                            "type": "string",
+                            "description": "Optional hash from the newest file view."
+                        }
+                    },
+                    "required": ["path", "start_line", "end_line", "replacement"]
+                }),
+            },
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn LlmTool> {
+        Box::new(self.clone())
+    }
+}
+
+impl ReplaceFileLinesTool {
+    async fn replace(&self, args: &HashMap<String, Value>) -> Result<Value> {
+        let path_arg = required_str(args, "path")?;
+        let start_line = required_u64(args, "start_line")?;
+        let end_line = required_u64(args, "end_line")?;
+        let replacement = required_str(args, "replacement")?;
+        let path = self.scope.resolve_existing_or_new(path_arg)?;
+        self.scope.check_write(&path)?;
+        if !path.is_file() {
+            bail!("replace_file_lines can only edit an existing file: {path_arg}");
+        }
+        let original = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        verify_optional_file_hash(args, &original)?;
+        let (start_index, end_index, _) = selected_line_range(&original, start_line, end_line, 0)?;
+        let mut lines = split_lines_preserving_newlines(&original);
+        lines.splice(start_index..end_index, [replacement.to_string()]);
+        let content = lines.concat();
+        self.scope.note_write_intent(std::slice::from_ref(&path))?;
+        tokio::fs::write(&path, content.as_bytes())
+            .await
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(json!({
+            "path": self.scope.relative_display(&path),
+            "start_line": start_line,
+            "end_line": end_line,
+            "bytes_before": original.len(),
+            "bytes_after": content.len(),
+            "mutation_receipt": mutation_receipt(
+                Some(&original),
+                &content,
+                self.scope.runtime_state_snapshot().mutation_epoch,
+            ),
         }))
     }
+}
+
+fn required_u64(args: &HashMap<String, Value>, key: &str) -> Result<u64> {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("missing required positive integer argument {key:?}"))
+}
+
+fn verify_optional_file_hash(args: &HashMap<String, Value>, content: &str) -> Result<()> {
+    let Some(expected) = args.get("expected_file_sha256").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let actual = format!("{:x}", Sha256::digest(content.as_bytes()));
+    if expected != actual {
+        bail!(
+            "expected_file_sha256 is stale: expected {expected}, current {actual}; no mutation occurred"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyChangeSetTool {
+    scope: ToolScope,
+}
+
+#[derive(Debug)]
+struct PreparedChange {
+    path: PathBuf,
+    before: Option<String>,
+    after: String,
+}
+
+#[async_trait]
+impl LlmTool for ApplyChangeSetTool {
+    async fn run(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &ToolRunCtx,
+    ) -> mojentic::Result<Value> {
+        self.scope.note_tool_call();
+        let result = self.apply(args).await.map_err(to_mojentic_error);
+        let payload = match &result {
+            Ok(value) => value.clone(),
+            Err(error) => json!({ "error": error.to_string() }),
+        };
+        self.scope
+            .trace_tool_event("tool.apply_change_set", payload);
+        result
+    }
+
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            r#type: "function".to_string(),
+            function: FunctionDescriptor {
+                name: "apply_change_set".to_string(),
+                description: "Preflight and apply a multi-file change set. Every entry must be valid before any file is changed. Use replace_lines for existing files and create_file for new files. Returns actual numbered results for every changed file."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "changes": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {
+                                        "type": "string",
+                                        "enum": ["replace_lines", "create_file"]
+                                    },
+                                    "path": { "type": "string" },
+                                    "start_line": { "type": "integer", "minimum": 1 },
+                                    "end_line": { "type": "integer", "minimum": 1 },
+                                    "replacement": { "type": "string" },
+                                    "content": { "type": "string" },
+                                    "expected_file_sha256": { "type": "string" }
+                                },
+                                "required": ["kind", "path"]
+                            }
+                        }
+                    },
+                    "required": ["changes"]
+                }),
+            },
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn LlmTool> {
+        Box::new(self.clone())
+    }
+}
+
+impl ApplyChangeSetTool {
+    async fn apply(&self, args: &HashMap<String, Value>) -> Result<Value> {
+        let changes = required_array(args, "changes")?;
+        let mut prepared = Vec::with_capacity(changes.len());
+        let mut seen = HashSet::new();
+        for (index, change) in changes.iter().enumerate() {
+            let object = change
+                .as_object()
+                .with_context(|| format!("changes[{index}] must be an object"))?;
+            let kind = required_edit_str(object, index, "kind")?;
+            let path_arg = required_edit_str(object, index, "path")?;
+            let path = self.scope.resolve_existing_or_new(path_arg)?;
+            self.scope.check_write(&path)?;
+            if !seen.insert(path.clone()) {
+                bail!("changes[{index}] repeats path {path_arg:?}; combine edits for one file");
+            }
+            let before = match tokio::fs::read_to_string(&path).await {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", path.display()));
+                }
+            };
+            let after = match kind {
+                "create_file" => {
+                    if before.is_some() {
+                        bail!("changes[{index}] create_file target already exists: {path_arg}");
+                    }
+                    required_edit_str(object, index, "content")?.to_string()
+                }
+                "replace_lines" => {
+                    let content = before.as_deref().with_context(|| {
+                        format!("changes[{index}] replace_lines target does not exist: {path_arg}")
+                    })?;
+                    verify_optional_object_file_hash(object, index, content)?;
+                    let start_line = required_edit_u64(object, index, "start_line")?;
+                    let end_line = required_edit_u64(object, index, "end_line")?;
+                    let replacement = required_edit_str(object, index, "replacement")?;
+                    let (start_index, end_index, _) =
+                        selected_line_range(content, start_line, end_line, index)?;
+                    let mut lines = split_lines_preserving_newlines(content);
+                    lines.splice(start_index..end_index, [replacement.to_string()]);
+                    lines.concat()
+                }
+                other => bail!("changes[{index}].kind is unsupported: {other}"),
+            };
+            prepared.push(PreparedChange {
+                path,
+                before,
+                after,
+            });
+        }
+
+        let paths = prepared
+            .iter()
+            .map(|change| change.path.clone())
+            .collect::<Vec<_>>();
+        self.scope.note_write_intent(&paths)?;
+        let mut written = Vec::new();
+        for change in &prepared {
+            if let Some(parent) = change.path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            if let Err(error) = tokio::fs::write(&change.path, change.after.as_bytes()).await {
+                rollback_prepared_changes(&prepared, &written).await?;
+                return Err(error).with_context(|| format!("writing {}", change.path.display()));
+            }
+            written.push(change.path.clone());
+        }
+        let mutation_epoch = self.scope.runtime_state_snapshot().mutation_epoch;
+        let receipts = prepared
+            .iter()
+            .map(|change| {
+                json!({
+                    "path": self.scope.relative_display(&change.path),
+                    "mutation_receipt": mutation_receipt(
+                        change.before.as_deref(),
+                        &change.after,
+                        mutation_epoch,
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "change_count": prepared.len(),
+            "mutation_epoch": mutation_epoch,
+            "changes": receipts,
+        }))
+    }
+}
+
+fn verify_optional_object_file_hash(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+    content: &str,
+) -> Result<()> {
+    let Some(expected) = object.get("expected_file_sha256").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let actual = format!("{:x}", Sha256::digest(content.as_bytes()));
+    if expected != actual {
+        bail!(
+            "changes[{index}].expected_file_sha256 is stale: expected {expected}, current {actual}; no mutation occurred"
+        );
+    }
+    Ok(())
+}
+
+async fn rollback_prepared_changes(prepared: &[PreparedChange], written: &[PathBuf]) -> Result<()> {
+    for path in written.iter().rev() {
+        let change = prepared
+            .iter()
+            .find(|change| &change.path == path)
+            .expect("written paths come from prepared changes");
+        match &change.before {
+            Some(content) => tokio::fs::write(path, content)
+                .await
+                .with_context(|| format!("rolling back {}", path.display()))?,
+            None => tokio::fs::remove_file(path)
+                .await
+                .with_context(|| format!("rolling back {}", path.display()))?,
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2222,8 +2722,8 @@ impl LlmTool for PatchFileTool {
         ToolDescriptor {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
-                name: "patch_file".to_string(),
-                description: "Apply a unified diff under the active experiment root using patch."
+                name: "apply_patch".to_string(),
+                description: "Apply a unified diff under the active experiment root after a complete dry run. A failed dry run leaves every file unchanged."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -2246,6 +2746,13 @@ impl PatchFileTool {
         let patch = required_str(args, "patch")?;
         let touched_paths = patch_paths(&self.scope, patch)?;
         validate_patch_paths(&self.scope, patch)?;
+        let before = touched_paths
+            .iter()
+            .map(|path| {
+                let content = fs::read_to_string(path).ok();
+                (path.clone(), content)
+            })
+            .collect::<BTreeMap<_, _>>();
         self.scope.note_write_intent(&touched_paths)?;
         self.scope.note_patch_fallback_choice(
             &touched_paths,
@@ -2308,11 +2815,29 @@ impl PatchFileTool {
             );
         }
         cleanup_new_patch_artifacts(&artifacts, &pre_existing_artifacts)?;
+        let mutation_epoch = self.scope.runtime_state_snapshot().mutation_epoch;
+        let receipts = touched_paths
+            .iter()
+            .filter_map(|path| {
+                fs::read_to_string(path).ok().map(|after| {
+                    json!({
+                        "path": self.scope.relative_display(path),
+                        "mutation_receipt": mutation_receipt(
+                            before.get(path).and_then(Option::as_deref),
+                            &after,
+                            mutation_epoch,
+                        ),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
             "strip_level": strip_level,
             "status": output.status.code(),
             "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr)
+            "stderr": String::from_utf8_lossy(&output.stderr),
+            "content_changed": true,
+            "changes": receipts,
         }))
     }
 }
@@ -4014,6 +4539,168 @@ bytes[0..5] \"cafe\\n\""
 
         assert!(names.contains(&"edit_file".to_string()));
         assert!(!names.contains(&"patch_file".to_string()));
+    }
+
+    #[test]
+    fn experimental_surfaces_expose_the_intended_mutation_tools() {
+        let cases = [
+            (ToolSurface::Control, vec!["write_file", "edit_file"]),
+            (ToolSurface::Receipts, vec!["write_file", "edit_file"]),
+            (
+                ToolSurface::LineRange,
+                vec!["write_file", "replace_file_lines"],
+            ),
+            (ToolSurface::ApplyPatch, vec!["write_file", "apply_patch"]),
+            (
+                ToolSurface::ApplyPatchChoice,
+                vec!["write_file", "edit_file", "apply_patch"],
+            ),
+            (ToolSurface::AtomicChangeSet, vec!["apply_change_set"]),
+            (ToolSurface::NaturalShell, vec!["write_file"]),
+        ];
+        for (surface, expected_mutation_tools) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let scope = scope(&temp);
+            scope.configure_tool_surface(surface);
+            let names = coding_tools(&scope)
+                .iter()
+                .map(|tool| tool.descriptor().function.name)
+                .collect::<Vec<_>>();
+            let actual = names
+                .iter()
+                .filter(|name| {
+                    matches!(
+                        name.as_str(),
+                        "write_file"
+                            | "edit_file"
+                            | "replace_file_lines"
+                            | "apply_patch"
+                            | "apply_change_set"
+                    )
+                })
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected_mutation_tools, "surface {surface:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_file_lines_returns_numbered_receipt_and_rejects_stale_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let tool = ReplaceFileLinesTool { scope };
+        let result = tool
+            .replace(&HashMap::from([
+                ("path".to_string(), json!("example.txt")),
+                ("start_line".to_string(), json!(2)),
+                ("end_line".to_string(), json!(2)),
+                ("replacement".to_string(), json!("TWO\n")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\nTWO\nthree\n");
+        assert!(
+            result["mutation_receipt"]["after_view"]
+                .as_str()
+                .unwrap()
+                .contains("2|TWO")
+        );
+
+        let error = tool
+            .replace(&HashMap::from([
+                ("path".to_string(), json!("example.txt")),
+                ("start_line".to_string(), json!(2)),
+                ("end_line".to_string(), json!(2)),
+                ("replacement".to_string(), json!("bad\n")),
+                ("expected_file_sha256".to_string(), json!("stale")),
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no mutation occurred"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\nTWO\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn apply_change_set_changes_multiple_files_after_complete_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::write(temp.path().join("one.txt"), "old one\n").unwrap();
+        std::fs::write(temp.path().join("two.txt"), "old two\n").unwrap();
+        let tool = ApplyChangeSetTool { scope };
+        let result = tool
+            .apply(&HashMap::from([(
+                "changes".to_string(),
+                json!([
+                    {
+                        "kind": "replace_lines",
+                        "path": "one.txt",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "replacement": "new one\n"
+                    },
+                    {
+                        "kind": "replace_lines",
+                        "path": "two.txt",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "replacement": "new two\n"
+                    }
+                ]),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(result["change_count"], json!(2));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("one.txt")).unwrap(),
+            "new one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("two.txt")).unwrap(),
+            "new two\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_change_set_preflight_failure_leaves_every_file_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        std::fs::write(temp.path().join("one.txt"), "old one\n").unwrap();
+        std::fs::write(temp.path().join("two.txt"), "old two\n").unwrap();
+        let tool = ApplyChangeSetTool { scope };
+        assert!(
+            tool.apply(&HashMap::from([(
+                "changes".to_string(),
+                json!([
+                    {
+                        "kind": "replace_lines",
+                        "path": "one.txt",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "replacement": "new one\n"
+                    },
+                    {
+                        "kind": "replace_lines",
+                        "path": "two.txt",
+                        "start_line": 99,
+                        "end_line": 99,
+                        "replacement": "bad\n"
+                    }
+                ]),
+            )]))
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("one.txt")).unwrap(),
+            "old one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("two.txt")).unwrap(),
+            "old two\n"
+        );
     }
 
     #[test]
