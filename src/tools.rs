@@ -2593,7 +2593,7 @@ impl LlmTool for UnifiedLineEditTool {
             r#type: "function".to_string(),
             function: FunctionDescriptor {
                 name: "edit_file".to_string(),
-                description: "The only tool for creating or changing files. Use insert_before or insert_after when adding content so the visible anchor line is preserved. Use replace only to rewrite the inclusive visible line range. Line numbers are the absolute prefixes from read_file. Concurrent calls for one file share the same pre-edit coordinates."
+                description: "Use this single tool for every file change. For additions, choose insert_after or insert_before so the visible anchor line remains untouched. Choose replace only when existing lines must be rewritten, and create only for a new path. Line numbers are the absolute prefixes from read_file. Concurrent calls for one file share the same pre-edit coordinates."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -2601,8 +2601,8 @@ impl LlmTool for UnifiedLineEditTool {
                         "path": { "type": "string" },
                         "operation": {
                             "type": "string",
-                            "enum": ["create", "replace", "insert_before", "insert_after"],
-                            "description": "Choose insert_before or insert_after for additions; replace only for existing lines that must be rewritten."
+                            "enum": ["insert_after", "insert_before", "replace", "create"],
+                            "description": "For additive edits, choose insert_after or insert_before. The anchor line is preserved."
                         },
                         "line": {
                             "type": "integer",
@@ -2612,7 +2612,7 @@ impl LlmTool for UnifiedLineEditTool {
                         "end_line": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Last inclusive line for replacement. Omit for insertion and create."
+                            "description": "Optional last inclusive replacement line. Defaults to line. Omit for insertion and create."
                         },
                         "content": {
                             "type": "string",
@@ -3013,7 +3013,11 @@ async fn prepare_atomic_line_range_batch(
                 match operation {
                     "replace" => {
                         let start_line = required_u64(&call.arguments, "line")?;
-                        let end_line = required_u64(&call.arguments, "end_line")?;
+                        let end_line = call
+                            .arguments
+                            .get("end_line")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(start_line);
                         let replacement = call
                             .arguments
                             .get("content")
@@ -5564,7 +5568,6 @@ bytes[0..5] \"cafe\\n\""
                 ("path".to_string(), json!("src/example.rs")),
                 ("operation".to_string(), json!("replace")),
                 ("line".to_string(), json!(2)),
-                ("end_line".to_string(), json!(2)),
                 ("content".to_string(), json!("    primary: usize,")),
             ]))
             .await
