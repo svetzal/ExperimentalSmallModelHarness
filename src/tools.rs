@@ -51,6 +51,7 @@ pub enum ToolSurface {
     Receipts,
     LineRange,
     LineRangeInsert,
+    UnifiedLineEdit,
     ApplyPatch,
     ApplyPatchChoice,
     AtomicChangeSet,
@@ -64,6 +65,7 @@ impl ToolSurface {
             "receipts" => Some(Self::Receipts),
             "line-range" => Some(Self::LineRange),
             "line-range-insert" => Some(Self::LineRangeInsert),
+            "unified-line-edit" => Some(Self::UnifiedLineEdit),
             "apply-patch" => Some(Self::ApplyPatch),
             "apply-patch-choice" => Some(Self::ApplyPatchChoice),
             "atomic-change-set" => Some(Self::AtomicChangeSet),
@@ -80,7 +82,7 @@ impl ToolSurface {
         Self::parse(&value).with_context(|| {
             format!(
                 "invalid {EXPERIMENTAL_TOOL_SURFACE_ENV}={value:?}; expected control, receipts, \
-line-range, line-range-insert, apply-patch, apply-patch-choice, atomic-change-set, or natural-shell"
+line-range, line-range-insert, unified-line-edit, apply-patch, apply-patch-choice, atomic-change-set, or natural-shell"
             )
         })
     }
@@ -91,6 +93,7 @@ line-range, line-range-insert, apply-patch, apply-patch-choice, atomic-change-se
             Self::Receipts => "receipts",
             Self::LineRange => "line-range",
             Self::LineRangeInsert => "line-range-insert",
+            Self::UnifiedLineEdit => "unified-line-edit",
             Self::ApplyPatch => "apply-patch",
             Self::ApplyPatchChoice => "apply-patch-choice",
             Self::AtomicChangeSet => "atomic-change-set",
@@ -1340,7 +1343,10 @@ pub fn tools_for_profile(scope: &ToolScope, profile: &dyn DomainProfile) -> Vec<
                 scope: scope.clone(),
             })),
             ToolCapability::WriteFile => {
-                if !matches!(surface, ToolSurface::AtomicChangeSet) {
+                if !matches!(
+                    surface,
+                    ToolSurface::AtomicChangeSet | ToolSurface::UnifiedLineEdit
+                ) {
                     tools.push(Box::new(WriteFileTool {
                         scope: scope.clone(),
                     }));
@@ -1363,6 +1369,9 @@ pub fn tools_for_profile(scope: &ToolScope, profile: &dyn DomainProfile) -> Vec<
                         scope: scope.clone(),
                     }));
                 }
+                ToolSurface::UnifiedLineEdit => tools.push(Box::new(UnifiedLineEditTool {
+                    scope: scope.clone(),
+                })),
                 ToolSurface::ApplyPatch => tools.push(Box::new(PatchFileTool {
                     scope: scope.clone(),
                 })),
@@ -2521,6 +2530,181 @@ pub struct InsertFileLinesTool {
     scope: ToolScope,
 }
 
+#[derive(Debug, Clone)]
+pub struct UnifiedLineEditTool {
+    scope: ToolScope,
+}
+
+#[async_trait]
+impl LlmTool for UnifiedLineEditTool {
+    async fn run(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &ToolRunCtx,
+    ) -> mojentic::Result<Value> {
+        if let Some(batch) = args.get("__harness_atomic_batch").and_then(Value::as_array) {
+            let calls = batch
+                .iter()
+                .map(|item| {
+                    let call_index = item
+                        .get("call_index")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .context("atomic line-mutation batch item omitted call_index")?;
+                    let arguments = item
+                        .get("arguments")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .context("atomic line-mutation batch item omitted arguments")?;
+                    Ok(AtomicLineRangeBatchCall {
+                        call_index,
+                        tool_name: "edit_file".to_string(),
+                        arguments,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+                .map_err(to_mojentic_error)?;
+            let results = run_atomic_line_range_batch(&self.scope, &calls).await;
+            return Ok(json!({
+                "atomic_batch": true,
+                "results": results.into_iter().map(|result| {
+                    json!({
+                        "call_index": result.call_index,
+                        "ok": result.ok,
+                        "content": serde_json::from_str::<Value>(&result.content)
+                            .unwrap_or_else(|_| json!({ "error": result.content })),
+                    })
+                }).collect::<Vec<_>>(),
+            }));
+        }
+
+        self.scope.note_tool_call();
+        let result = self.edit(args).await.map_err(to_mojentic_error);
+        let payload = match &result {
+            Ok(value) => value.clone(),
+            Err(error) => json!({ "error": error.to_string() }),
+        };
+        self.scope.trace_tool_event("tool.edit_file", payload);
+        result
+    }
+
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            r#type: "function".to_string(),
+            function: FunctionDescriptor {
+                name: "edit_file".to_string(),
+                description: "The only tool for creating or changing files. Use insert_before or insert_after when adding content so the visible anchor line is preserved. Use replace only to rewrite the inclusive visible line range. Line numbers are the absolute prefixes from read_file. Concurrent calls for one file share the same pre-edit coordinates."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "operation": {
+                            "type": "string",
+                            "enum": ["create", "replace", "insert_before", "insert_after"],
+                            "description": "Choose insert_before or insert_after for additions; replace only for existing lines that must be rewritten."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Anchor line for insertion, or first inclusive line for replacement. Omit only for create."
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Last inclusive line for replacement. Omit for insertion and create."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Complete content to create, insert, or replace."
+                        },
+                        "expected_file_sha256": {
+                            "type": "string",
+                            "description": "Optional hash from the newest file view."
+                        }
+                    },
+                    "required": ["path", "operation", "content"]
+                }),
+            },
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn LlmTool> {
+        Box::new(self.clone())
+    }
+}
+
+impl UnifiedLineEditTool {
+    async fn edit(&self, args: &HashMap<String, Value>) -> Result<Value> {
+        let operation = required_str(args, "operation")?;
+        if operation == "create" {
+            return self.create(args).await;
+        }
+        if !matches!(operation, "replace" | "insert_before" | "insert_after") {
+            bail!("operation must be create, replace, insert_before, or insert_after");
+        }
+        let call = AtomicLineRangeBatchCall {
+            call_index: 0,
+            tool_name: "edit_file".to_string(),
+            arguments: args.clone(),
+        };
+        let (path, original, mut edits) =
+            prepare_atomic_line_range_batch(&self.scope, &[call], 1).await?;
+        let edit = edits.pop().context("prepared line edit was missing")?;
+        let mut lines = split_lines_preserving_newlines(&original);
+        lines.splice(
+            edit.start_index..edit.end_index,
+            [edit.normalized.text.clone()],
+        );
+        let content = lines.concat();
+        self.scope.note_write_intent(std::slice::from_ref(&path))?;
+        tokio::fs::write(&path, content.as_bytes())
+            .await
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(line_mutation_result(
+            &self.scope,
+            &path,
+            &original,
+            &content,
+            &edit,
+            None,
+        ))
+    }
+
+    async fn create(&self, args: &HashMap<String, Value>) -> Result<Value> {
+        let path_arg = required_str(args, "path")?;
+        let content = args
+            .get("content")
+            .and_then(Value::as_str)
+            .context("missing required string argument \"content\"")?;
+        let path = self.scope.resolve_existing_or_new(path_arg)?;
+        self.scope.check_write(&path)?;
+        if path.exists() {
+            bail!("create requires a new file; {path_arg:?} already exists");
+        }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating parent directories for {}", path.display()))?;
+        }
+        self.scope.note_write_intent(std::slice::from_ref(&path))?;
+        tokio::fs::write(&path, content.as_bytes())
+            .await
+            .with_context(|| format!("creating {}", path.display()))?;
+        Ok(json!({
+            "path": self.scope.relative_display(&path),
+            "operation": "create",
+            "bytes_before": 0,
+            "bytes_after": content.len(),
+            "mutation_receipt": mutation_receipt(
+                None,
+                content,
+                self.scope.runtime_state_snapshot().mutation_epoch,
+            ),
+        }))
+    }
+}
+
 #[async_trait]
 impl LlmTool for InsertFileLinesTool {
     async fn run(
@@ -2740,6 +2924,12 @@ async fn prepare_atomic_line_range_batch(
     {
         bail!("atomic line-mutation batch calls must target one file");
     }
+    if calls.iter().any(|call| {
+        call.tool_name == "edit_file"
+            && call.arguments.get("operation").and_then(Value::as_str) == Some("create")
+    }) {
+        bail!("edit_file create cannot be combined with other edits to the same path");
+    }
     let path = scope.resolve_existing_or_new(path_arg)?;
     scope.check_write(&path)?;
     if !path.is_file() {
@@ -2817,6 +3007,77 @@ async fn prepare_atomic_line_range_batch(
                     normalized,
                     position: Some(position.to_string()),
                 });
+            }
+            "edit_file" => {
+                let operation = required_str(&call.arguments, "operation")?;
+                match operation {
+                    "replace" => {
+                        let start_line = required_u64(&call.arguments, "line")?;
+                        let end_line = required_u64(&call.arguments, "end_line")?;
+                        let replacement = call
+                            .arguments
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .context("missing required string argument \"content\"")?
+                            .to_string();
+                        let (start_index, end_index, selected) =
+                            selected_line_range(&original, start_line, end_line, call.call_index)?;
+                        edits.push(PreparedLineRangeEdit {
+                            call_index: call.call_index,
+                            tool_name: call.tool_name.clone(),
+                            start_line,
+                            end_line,
+                            start_index,
+                            end_index,
+                            normalized: line_range_replacement(&selected, &replacement),
+                            replacement,
+                            position: None,
+                        });
+                    }
+                    "insert_before" | "insert_after" => {
+                        let anchor_line = required_u64(&call.arguments, "line")?;
+                        let insertion = call
+                            .arguments
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .context("missing required string argument \"content\"")?
+                            .to_string();
+                        if insertion.is_empty() {
+                            bail!("edit_file insertion content must not be empty");
+                        }
+                        let lines = split_lines_preserving_newlines(&original);
+                        let anchor_index = usize::try_from(anchor_line.saturating_sub(1))
+                            .context("line does not fit this platform")?;
+                        if anchor_index >= lines.len() {
+                            bail!(
+                                "edit_file line {anchor_line} exceeds file length {}",
+                                lines.len()
+                            );
+                        }
+                        let insertion_index = if operation == "insert_before" {
+                            anchor_index
+                        } else {
+                            anchor_index + 1
+                        };
+                        let normalized =
+                            line_range_insertion(&original, &lines, insertion_index, &insertion);
+                        edits.push(PreparedLineRangeEdit {
+                            call_index: call.call_index,
+                            tool_name: call.tool_name.clone(),
+                            start_line: anchor_line,
+                            end_line: anchor_line,
+                            start_index: insertion_index,
+                            end_index: insertion_index,
+                            replacement: insertion,
+                            normalized,
+                            position: Some(operation.to_string()),
+                        });
+                    }
+                    "create" => bail!(
+                        "edit_file create cannot be combined with other edits to the same path"
+                    ),
+                    other => bail!("edit_file operation is unsupported: {other}"),
+                }
             }
             other => bail!("unsupported atomic line-mutation tool {other:?}"),
         }
@@ -2926,11 +3187,10 @@ fn line_mutation_result(
                 scope.runtime_state_snapshot().mutation_epoch,
             )
         });
-    if edit.tool_name == "insert_file_lines" {
+    if let Some(position) = &edit.position {
         let mut value = json!({
             "path": scope.relative_display(path),
             "anchor_line": edit.start_line,
-            "position": edit.position,
             "bytes_before": original.len(),
             "bytes_after": content.len(),
             "requested_content_bytes": edit.replacement.len(),
@@ -2938,6 +3198,11 @@ fn line_mutation_result(
             "line_boundary_normalized": edit.normalized.line_boundary_normalized,
             "mutation_receipt": receipt,
         });
+        if edit.tool_name == "edit_file" {
+            value["operation"] = json!(position);
+        } else {
+            value["position"] = json!(position);
+        }
         if let Some((batch, _)) = atomic {
             value["atomic_batch"] = batch.clone();
         }
@@ -2954,6 +3219,9 @@ fn line_mutation_result(
             "line_boundary_normalized": edit.normalized.line_boundary_normalized,
             "mutation_receipt": receipt,
         });
+        if edit.tool_name == "edit_file" {
+            value["operation"] = json!("replace");
+        }
         if let Some((batch, _)) = atomic {
             value["atomic_batch"] = batch.clone();
         }
@@ -5051,6 +5319,7 @@ bytes[0..5] \"cafe\\n\""
                 ToolSurface::LineRangeInsert,
                 vec!["write_file", "replace_file_lines", "insert_file_lines"],
             ),
+            (ToolSurface::UnifiedLineEdit, vec!["edit_file"]),
             (ToolSurface::ApplyPatch, vec!["write_file", "apply_patch"]),
             (
                 ToolSurface::ApplyPatchChoice,
@@ -5244,6 +5513,162 @@ bytes[0..5] \"cafe\\n\""
         .unwrap();
 
         assert_eq!(std::fs::read_to_string(file).unwrap(), "one\ntwo\nthree");
+    }
+
+    #[tokio::test]
+    async fn unified_line_edit_is_the_only_surface_and_handles_all_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        scope.configure_tool_surface(ToolSurface::UnifiedLineEdit);
+        let tools = coding_tools(&scope);
+        let mutation_names = tools
+            .iter()
+            .map(|tool| tool.descriptor().function.name)
+            .filter(|name| {
+                matches!(
+                    name.as_str(),
+                    "write_file"
+                        | "edit_file"
+                        | "replace_file_lines"
+                        | "insert_file_lines"
+                        | "apply_patch"
+                        | "apply_change_set"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(mutation_names, vec!["edit_file"]);
+
+        let tool = UnifiedLineEditTool {
+            scope: scope.clone(),
+        };
+        tool.edit(&HashMap::from([
+            ("path".to_string(), json!("src/example.rs")),
+            ("operation".to_string(), json!("create")),
+            (
+                "content".to_string(),
+                json!("struct Item {\n    first: usize,\n}\n"),
+            ),
+        ]))
+        .await
+        .unwrap();
+        tool.edit(&HashMap::from([
+            ("path".to_string(), json!("src/example.rs")),
+            ("operation".to_string(), json!("insert_after")),
+            ("line".to_string(), json!(2)),
+            ("content".to_string(), json!("    second: usize,")),
+        ]))
+        .await
+        .unwrap();
+        let result = tool
+            .edit(&HashMap::from([
+                ("path".to_string(), json!("src/example.rs")),
+                ("operation".to_string(), json!("replace")),
+                ("line".to_string(), json!(2)),
+                ("end_line".to_string(), json!(2)),
+                ("content".to_string(), json!("    primary: usize,")),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("src/example.rs")).unwrap(),
+            "struct Item {\n    primary: usize,\n    second: usize,\n}\n"
+        );
+        assert_eq!(result["operation"], json!("replace"));
+        assert!(
+            result["mutation_receipt"]["after_view"]
+                .as_str()
+                .unwrap()
+                .contains("4|}")
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_sibling_operations_share_one_original_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+
+        let results = run_atomic_line_range_batch(
+            &scope,
+            &[
+                AtomicLineRangeBatchCall {
+                    call_index: 0,
+                    tool_name: "edit_file".to_string(),
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("operation".to_string(), json!("insert_after")),
+                        ("line".to_string(), json!(2)),
+                        ("content".to_string(), json!("TWO-AND-A-HALF")),
+                    ]),
+                },
+                AtomicLineRangeBatchCall {
+                    call_index: 1,
+                    tool_name: "edit_file".to_string(),
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("operation".to_string(), json!("replace")),
+                        ("line".to_string(), json!(4)),
+                        ("end_line".to_string(), json!(4)),
+                        ("content".to_string(), json!("FOUR")),
+                    ]),
+                },
+            ],
+        )
+        .await;
+
+        assert!(results.iter().all(|result| result.ok));
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "one\ntwo\nTWO-AND-A-HALF\nthree\nFOUR\nfive\n"
+        );
+        assert_eq!(scope.policy_snapshot().total_write_operations, 1);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.content.contains("operation"))
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_batch_rejects_create_mixed_with_same_path_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let results = run_atomic_line_range_batch(
+            &scope,
+            &[
+                AtomicLineRangeBatchCall {
+                    call_index: 0,
+                    tool_name: "edit_file".to_string(),
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("operation".to_string(), json!("create")),
+                        ("content".to_string(), json!("one\n")),
+                    ]),
+                },
+                AtomicLineRangeBatchCall {
+                    call_index: 1,
+                    tool_name: "edit_file".to_string(),
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("operation".to_string(), json!("insert_after")),
+                        ("line".to_string(), json!(1)),
+                        ("content".to_string(), json!("two")),
+                    ]),
+                },
+            ],
+        )
+        .await;
+
+        assert!(results.iter().all(|result| !result.ok));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.content.contains("create cannot be combined"))
+        );
+        assert!(!temp.path().join("example.txt").exists());
+        assert_eq!(scope.policy_snapshot().total_write_operations, 0);
     }
 
     #[tokio::test]

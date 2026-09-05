@@ -5059,10 +5059,21 @@ async fn run_response_atomic_line_mutation_batches(
 ) -> BTreeMap<usize, ToolCallRunResult> {
     let mut groups = BTreeMap::<String, Vec<(usize, &LlmToolCall)>>::new();
     for (call_index, call) in calls.iter().enumerate() {
-        if !matches!(
+        let is_line_mutation = matches!(
             call.name.as_str(),
             "replace_file_lines" | "insert_file_lines"
-        ) {
+        ) || (call.name == "edit_file"
+            && call
+                .arguments
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|operation| {
+                    matches!(
+                        operation,
+                        "create" | "replace" | "insert_before" | "insert_after"
+                    )
+                }));
+        if !is_line_mutation {
             continue;
         }
         let Some(path) = call
@@ -5090,9 +5101,14 @@ async fn run_response_atomic_line_mutation_batches(
                 })
             })
             .collect::<Vec<_>>();
+        let synthetic_tool_name = if group.iter().all(|(_, call)| call.name == "edit_file") {
+            "edit_file"
+        } else {
+            "replace_file_lines"
+        };
         let synthetic = LlmToolCall {
             id: Some(format!("harness-atomic-line-mutation-{path}")),
-            name: "replace_file_lines".to_string(),
+            name: synthetic_tool_name.to_string(),
             arguments: std::collections::HashMap::from([(
                 "__harness_atomic_batch".to_string(),
                 serde_json::Value::Array(batch_items),
@@ -5868,6 +5884,52 @@ mod tests {
                     ("start_line".to_string(), json!(4)),
                     ("end_line".to_string(), json!(4)),
                     ("replacement".to_string(), json!("FOUR")),
+                ]),
+            },
+        ];
+
+        let results = run_response_atomic_line_mutation_batches(&calls, &tools, "test").await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.values().all(|result| result.ok));
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "one\ntwo\nTWO-AND-A-HALF\nthree\nFOUR\nfive\n"
+        );
+        assert_eq!(scope.policy_snapshot().total_write_operations, 1);
+    }
+
+    #[tokio::test]
+    async fn sibling_unified_edits_share_the_observed_coordinate_space() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("example.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let trace = Arc::new(TraceRecorder::create(&temp.path().join("traces")).unwrap());
+        let scope = ToolScope::new(workspace, trace).unwrap();
+        scope.configure_tool_surface(ToolSurface::UnifiedLineEdit);
+        let tools = coding_tools(&scope);
+        let calls = vec![
+            LlmToolCall {
+                id: Some("insert".to_string()),
+                name: "edit_file".to_string(),
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("example.txt")),
+                    ("operation".to_string(), json!("insert_after")),
+                    ("line".to_string(), json!(2)),
+                    ("content".to_string(), json!("TWO-AND-A-HALF")),
+                ]),
+            },
+            LlmToolCall {
+                id: Some("replace".to_string()),
+                name: "edit_file".to_string(),
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("example.txt")),
+                    ("operation".to_string(), json!("replace")),
+                    ("line".to_string(), json!(4)),
+                    ("end_line".to_string(), json!(4)),
+                    ("content".to_string(), json!("FOUR")),
                 ]),
             },
         ];
