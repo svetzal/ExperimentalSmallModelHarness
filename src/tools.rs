@@ -104,6 +104,34 @@ line-range, line-range-insert, unified-line-edit, apply-patch, apply-patch-choic
     fn mutation_receipts(self) -> bool {
         !matches!(self, Self::Control | Self::NaturalShell)
     }
+
+    pub fn adapt_system_guidance(self, guidance: String) -> String {
+        if self != Self::UnifiedLineEdit {
+            return guidance;
+        }
+        let mut lines = guidance.lines();
+        let mut adapted = Vec::new();
+        if let Some(identity) = lines.next() {
+            adapted.push(identity.to_string());
+        }
+        adapted.push(
+            "Use edit_file as the only way to create or change a file. For additions, choose insert_after or insert_before so the anchor line remains untouched. Choose replace only for existing lines that must be rewritten, and create only for a new path."
+                .to_string(),
+        );
+        adapted.extend(
+            lines
+                .filter(|line| {
+                    !line.contains("write_file")
+                        && !line.contains("unified diff")
+                        && !line.contains("apply_patch")
+                        && !line.contains("patch_file")
+                        && !line.contains("replace_file_lines")
+                        && !line.contains("insert_file_lines")
+                })
+                .map(str::to_string),
+        );
+        adapted.join("\n")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5356,6 +5384,26 @@ bytes[0..5] \"cafe\\n\""
                 .map(String::as_str)
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected_mutation_tools, "surface {surface:?}");
+        }
+    }
+
+    #[test]
+    fn unified_surface_guidance_names_only_the_available_mutation_tool() {
+        let original = crate::profile::default_profile().system_guidance();
+        let adapted = ToolSurface::UnifiedLineEdit.adapt_system_guidance(original);
+
+        assert!(adapted.contains("Use edit_file as the only way to create or change a file."));
+        assert!(adapted.contains("insert_after"));
+        assert!(adapted.contains("insert_before"));
+        for unavailable in [
+            "write_file",
+            "unified diff",
+            "apply_patch",
+            "patch_file",
+            "replace_file_lines",
+            "insert_file_lines",
+        ] {
+            assert!(!adapted.contains(unavailable), "found {unavailable:?}");
         }
     }
 

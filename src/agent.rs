@@ -527,7 +527,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     if let Some((spec, _, _)) = &acceptance_ledger {
         scope.configure_acceptance_ledger(spec.clone())?;
     }
-    let system_prompt = profile.system_guidance();
+    let system_prompt = tool_surface.adapt_system_guidance(profile.system_guidance());
     let tools = tools_for_profile(&scope, profile);
     let repair_tools = tools
         .iter()
