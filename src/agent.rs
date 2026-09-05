@@ -536,6 +536,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 tool.descriptor().function.name.as_str(),
                 "edit_file"
                     | "replace_file_lines"
+                    | "insert_file_lines"
                     | "apply_patch"
                     | "apply_change_set"
                     | "write_file"
@@ -552,6 +553,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 tool.descriptor().function.name.as_str(),
                 "edit_file"
                     | "replace_file_lines"
+                    | "insert_file_lines"
                     | "apply_patch"
                     | "apply_change_set"
                     | "write_file"
@@ -2617,7 +2619,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             }),
         )?;
 
-        let mut atomic_line_range_results = run_response_atomic_line_range_batches(
+        let mut atomic_line_range_results = run_response_atomic_line_mutation_batches(
             &accumulated_tool_calls,
             active_tools,
             &correlation_id,
@@ -3883,6 +3885,7 @@ fn tool_result_reports_mutation(tool_name: &str, content: Option<&str>) -> bool 
         "write_file"
             | "edit_file"
             | "replace_file_lines"
+            | "insert_file_lines"
             | "patch_file"
             | "apply_patch"
             | "apply_change_set"
@@ -3900,8 +3903,8 @@ fn tool_result_reports_mutation(tool_name: &str, content: Option<&str>) -> bool 
         return false;
     }
     match tool_name {
-        "write_file" | "edit_file" | "replace_file_lines" | "patch_file" | "apply_patch"
-        | "apply_change_set" => value
+        "write_file" | "edit_file" | "replace_file_lines" | "insert_file_lines" | "patch_file"
+        | "apply_patch" | "apply_change_set" => value
             .get("content_changed")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true),
@@ -5049,14 +5052,17 @@ async fn run_tool_call(
     }
 }
 
-async fn run_response_atomic_line_range_batches(
+async fn run_response_atomic_line_mutation_batches(
     calls: &[LlmToolCall],
     tools: &[Box<dyn LlmTool>],
     correlation_id: &str,
 ) -> BTreeMap<usize, ToolCallRunResult> {
     let mut groups = BTreeMap::<String, Vec<(usize, &LlmToolCall)>>::new();
     for (call_index, call) in calls.iter().enumerate() {
-        if call.name != "replace_file_lines" {
+        if !matches!(
+            call.name.as_str(),
+            "replace_file_lines" | "insert_file_lines"
+        ) {
             continue;
         }
         let Some(path) = call
@@ -5079,12 +5085,13 @@ async fn run_response_atomic_line_range_batches(
             .map(|(call_index, call)| {
                 serde_json::json!({
                     "call_index": call_index,
+                    "tool_name": call.name,
                     "arguments": call.arguments,
                 })
             })
             .collect::<Vec<_>>();
         let synthetic = LlmToolCall {
-            id: Some(format!("harness-atomic-line-range-{path}")),
+            id: Some(format!("harness-atomic-line-mutation-{path}")),
             name: "replace_file_lines".to_string(),
             arguments: std::collections::HashMap::from([(
                 "__harness_atomic_batch".to_string(),
@@ -5109,7 +5116,7 @@ async fn run_response_atomic_line_range_batches(
                     ToolCallRunResult {
                         ok: false,
                         content: serde_json::json!({
-                            "error": "atomic line-range batch returned an invalid result",
+                            "error": "atomic line-mutation batch returned an invalid result",
                             "batch_error": batch_result.content,
                         })
                         .to_string(),
@@ -5132,7 +5139,7 @@ async fn run_response_atomic_line_range_batches(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let content = item.get("content").cloned().unwrap_or_else(
-                || serde_json::json!({ "error": "atomic line-range result omitted content" }),
+                || serde_json::json!({ "error": "atomic line-mutation result omitted content" }),
             );
             results.insert(
                 call_index,
@@ -5149,7 +5156,7 @@ async fn run_response_atomic_line_range_batches(
                 .or_insert_with(|| ToolCallRunResult {
                     ok: false,
                     content: serde_json::json!({
-                        "error": "atomic line-range batch omitted a call result"
+                        "error": "atomic line-mutation batch omitted a call result"
                     })
                     .to_string(),
                     duration_ms: batch_result.duration_ms,
@@ -5263,7 +5270,7 @@ fn is_meaningful_source_edit(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|path| profile.path_requires_validation_after_write(path)),
         "patch_file" | "apply_patch" | "apply_change_set" => true,
-        "replace_file_lines" => call
+        "replace_file_lines" | "insert_file_lines" => call
             .arguments
             .get("path")
             .and_then(serde_json::Value::as_str)
@@ -5818,7 +5825,7 @@ mod tests {
             },
         ];
 
-        let results = run_response_atomic_line_range_batches(&calls, &tools, "test").await;
+        let results = run_response_atomic_line_mutation_batches(&calls, &tools, "test").await;
 
         assert_eq!(results.len(), 2);
         assert!(results.values().all(|result| result.ok));
@@ -5829,6 +5836,51 @@ mod tests {
         let policy = scope.policy_snapshot();
         assert_eq!(policy.total_tool_calls, 2);
         assert_eq!(policy.total_write_operations, 1);
+    }
+
+    #[tokio::test]
+    async fn sibling_insert_and_replace_calls_share_the_observed_coordinate_space() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("example.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let trace = Arc::new(TraceRecorder::create(&temp.path().join("traces")).unwrap());
+        let scope = ToolScope::new(workspace, trace).unwrap();
+        scope.configure_tool_surface(ToolSurface::LineRangeInsert);
+        let tools = coding_tools(&scope);
+        let calls = vec![
+            LlmToolCall {
+                id: Some("insert".to_string()),
+                name: "insert_file_lines".to_string(),
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("example.txt")),
+                    ("anchor_line".to_string(), json!(2)),
+                    ("position".to_string(), json!("after")),
+                    ("content".to_string(), json!("TWO-AND-A-HALF")),
+                ]),
+            },
+            LlmToolCall {
+                id: Some("replace".to_string()),
+                name: "replace_file_lines".to_string(),
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("example.txt")),
+                    ("start_line".to_string(), json!(4)),
+                    ("end_line".to_string(), json!(4)),
+                    ("replacement".to_string(), json!("FOUR")),
+                ]),
+            },
+        ];
+
+        let results = run_response_atomic_line_mutation_batches(&calls, &tools, "test").await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.values().all(|result| result.ok));
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "one\ntwo\nTWO-AND-A-HALF\nthree\nFOUR\nfive\n"
+        );
+        assert_eq!(scope.policy_snapshot().total_write_operations, 1);
     }
 
     #[test]

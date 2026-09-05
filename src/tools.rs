@@ -50,6 +50,7 @@ pub enum ToolSurface {
     Control,
     Receipts,
     LineRange,
+    LineRangeInsert,
     ApplyPatch,
     ApplyPatchChoice,
     AtomicChangeSet,
@@ -62,6 +63,7 @@ impl ToolSurface {
             "control" => Some(Self::Control),
             "receipts" => Some(Self::Receipts),
             "line-range" => Some(Self::LineRange),
+            "line-range-insert" => Some(Self::LineRangeInsert),
             "apply-patch" => Some(Self::ApplyPatch),
             "apply-patch-choice" => Some(Self::ApplyPatchChoice),
             "atomic-change-set" => Some(Self::AtomicChangeSet),
@@ -78,7 +80,7 @@ impl ToolSurface {
         Self::parse(&value).with_context(|| {
             format!(
                 "invalid {EXPERIMENTAL_TOOL_SURFACE_ENV}={value:?}; expected control, receipts, \
-line-range, apply-patch, apply-patch-choice, atomic-change-set, or natural-shell"
+line-range, line-range-insert, apply-patch, apply-patch-choice, atomic-change-set, or natural-shell"
             )
         })
     }
@@ -88,6 +90,7 @@ line-range, apply-patch, apply-patch-choice, atomic-change-set, or natural-shell
             Self::Control => "control",
             Self::Receipts => "receipts",
             Self::LineRange => "line-range",
+            Self::LineRangeInsert => "line-range-insert",
             Self::ApplyPatch => "apply-patch",
             Self::ApplyPatchChoice => "apply-patch-choice",
             Self::AtomicChangeSet => "atomic-change-set",
@@ -1352,6 +1355,14 @@ pub fn tools_for_profile(scope: &ToolScope, profile: &dyn DomainProfile) -> Vec<
                 ToolSurface::LineRange => tools.push(Box::new(ReplaceFileLinesTool {
                     scope: scope.clone(),
                 })),
+                ToolSurface::LineRangeInsert => {
+                    tools.push(Box::new(ReplaceFileLinesTool {
+                        scope: scope.clone(),
+                    }));
+                    tools.push(Box::new(InsertFileLinesTool {
+                        scope: scope.clone(),
+                    }));
+                }
                 ToolSurface::ApplyPatch => tools.push(Box::new(PatchFileTool {
                     scope: scope.clone(),
                 })),
@@ -2394,6 +2405,7 @@ pub struct ReplaceFileLinesTool {
 #[derive(Debug, Clone)]
 struct AtomicLineRangeBatchCall {
     call_index: usize,
+    tool_name: String,
     arguments: HashMap<String, Value>,
 }
 
@@ -2407,12 +2419,14 @@ struct AtomicLineRangeBatchResult {
 #[derive(Debug)]
 struct PreparedLineRangeEdit {
     call_index: usize,
+    tool_name: String,
     start_line: u64,
     end_line: u64,
     start_index: usize,
     end_index: usize,
     replacement: String,
     normalized: NormalizedReplacement,
+    position: Option<String>,
 }
 
 #[async_trait]
@@ -2430,14 +2444,19 @@ impl LlmTool for ReplaceFileLinesTool {
                         .get("call_index")
                         .and_then(Value::as_u64)
                         .and_then(|value| usize::try_from(value).ok())
-                        .context("atomic line-range batch item omitted call_index")?;
+                        .context("atomic line-mutation batch item omitted call_index")?;
                     let arguments = item
                         .get("arguments")
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok())
-                        .context("atomic line-range batch item omitted arguments")?;
+                        .context("atomic line-mutation batch item omitted arguments")?;
                     Ok(AtomicLineRangeBatchCall {
                         call_index,
+                        tool_name: item
+                            .get("tool_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("replace_file_lines")
+                            .to_string(),
                         arguments,
                     })
                 })
@@ -2497,6 +2516,93 @@ impl LlmTool for ReplaceFileLinesTool {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct InsertFileLinesTool {
+    scope: ToolScope,
+}
+
+#[async_trait]
+impl LlmTool for InsertFileLinesTool {
+    async fn run(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &ToolRunCtx,
+    ) -> mojentic::Result<Value> {
+        self.scope.note_tool_call();
+        let result = self.insert(args).await.map_err(to_mojentic_error);
+        let payload = match &result {
+            Ok(value) => value.clone(),
+            Err(error) => json!({ "error": error.to_string() }),
+        };
+        self.scope
+            .trace_tool_event("tool.insert_file_lines", payload);
+        result
+    }
+
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            r#type: "function".to_string(),
+            function: FunctionDescriptor {
+                name: "insert_file_lines".to_string(),
+                description: "Insert new complete lines immediately before or after one visible anchor line without replacing that line. Use this for additive edits near braces or neighboring fields. The anchor_line is the absolute prefix shown by read_file. Returns the resulting numbered neighborhood."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "anchor_line": { "type": "integer", "minimum": 1 },
+                        "position": { "type": "string", "enum": ["before", "after"] },
+                        "content": {
+                            "type": "string",
+                            "description": "The new line or lines. A missing boundary newline is added when needed."
+                        },
+                        "expected_file_sha256": {
+                            "type": "string",
+                            "description": "Optional hash from the newest file view."
+                        }
+                    },
+                    "required": ["path", "anchor_line", "position", "content"]
+                }),
+            },
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn LlmTool> {
+        Box::new(self.clone())
+    }
+}
+
+impl InsertFileLinesTool {
+    async fn insert(&self, args: &HashMap<String, Value>) -> Result<Value> {
+        let call = AtomicLineRangeBatchCall {
+            call_index: 0,
+            tool_name: "insert_file_lines".to_string(),
+            arguments: args.clone(),
+        };
+        let (path, original, mut edits) =
+            prepare_atomic_line_range_batch(&self.scope, &[call], 1).await?;
+        let edit = edits.pop().context("prepared insertion was missing")?;
+        let mut lines = split_lines_preserving_newlines(&original);
+        lines.splice(
+            edit.start_index..edit.end_index,
+            [edit.normalized.text.clone()],
+        );
+        let content = lines.concat();
+        self.scope.note_write_intent(std::slice::from_ref(&path))?;
+        tokio::fs::write(&path, content.as_bytes())
+            .await
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(line_mutation_result(
+            &self.scope,
+            &path,
+            &original,
+            &content,
+            &edit,
+            None,
+        ))
+    }
+}
+
 impl ReplaceFileLinesTool {
     async fn replace(&self, args: &HashMap<String, Value>) -> Result<Value> {
         let path_arg = required_str(args, "path")?;
@@ -2550,7 +2656,7 @@ async fn run_atomic_line_range_batch(
     for _ in calls {
         scope.note_tool_call();
     }
-    let prepared = prepare_atomic_line_range_batch(scope, calls).await;
+    let prepared = prepare_atomic_line_range_batch(scope, calls, 2).await;
     let (path, original, edits) = match prepared {
         Ok(value) => value,
         Err(error) => return atomic_line_range_batch_errors(scope, calls, &error.to_string()),
@@ -2592,27 +2698,20 @@ async fn run_atomic_line_range_batch(
         "application_order_by_call_index": application_order,
         "mutation_epoch": mutation_epoch,
     });
-    scope.trace_tool_event(
-        "tool.replace_file_lines.atomic_batch",
-        batch_payload.clone(),
-    );
+    scope.trace_tool_event("tool.line_mutation.atomic_batch", batch_payload.clone());
 
     edits
         .into_iter()
         .map(|edit| {
-            let value = json!({
-                "path": scope.relative_display(&path),
-                "start_line": edit.start_line,
-                "end_line": edit.end_line,
-                "bytes_before": original.len(),
-                "bytes_after": content.len(),
-                "requested_replacement_bytes": edit.replacement.len(),
-                "normalized_replacement_bytes": edit.normalized.text.len(),
-                "line_boundary_normalized": edit.normalized.line_boundary_normalized,
-                "atomic_batch": batch_payload,
-                "mutation_receipt": receipt,
-            });
-            scope.trace_tool_event("tool.replace_file_lines", value.clone());
+            let value = line_mutation_result(
+                scope,
+                &path,
+                &original,
+                &content,
+                &edit,
+                Some((&batch_payload, &receipt)),
+            );
+            scope.trace_tool_event(&format!("tool.{}", edit.tool_name), value.clone());
             AtomicLineRangeBatchResult {
                 call_index: edit.call_index,
                 ok: true,
@@ -2625,9 +2724,10 @@ async fn run_atomic_line_range_batch(
 async fn prepare_atomic_line_range_batch(
     scope: &ToolScope,
     calls: &[AtomicLineRangeBatchCall],
+    minimum_calls: usize,
 ) -> Result<(PathBuf, String, Vec<PreparedLineRangeEdit>)> {
-    if calls.len() < 2 {
-        bail!("atomic line-range batches require at least two calls");
+    if calls.len() < minimum_calls {
+        bail!("line-mutation batch requires at least {minimum_calls} calls");
     }
     let path_arg = calls
         .first()
@@ -2638,7 +2738,7 @@ async fn prepare_atomic_line_range_batch(
         .iter()
         .any(|call| call.arguments.get("path").and_then(Value::as_str) != Some(path_arg))
     {
-        bail!("atomic line-range batch calls must target one file");
+        bail!("atomic line-mutation batch calls must target one file");
     }
     let path = scope.resolve_existing_or_new(path_arg)?;
     scope.check_write(&path)?;
@@ -2651,25 +2751,75 @@ async fn prepare_atomic_line_range_batch(
     let mut edits = Vec::with_capacity(calls.len());
     for call in calls {
         verify_optional_file_hash(&call.arguments, &original)?;
-        let start_line = required_u64(&call.arguments, "start_line")?;
-        let end_line = required_u64(&call.arguments, "end_line")?;
-        let replacement = call
-            .arguments
-            .get("replacement")
-            .and_then(Value::as_str)
-            .context("missing required string argument \"replacement\"")?
-            .to_string();
-        let (start_index, end_index, selected) =
-            selected_line_range(&original, start_line, end_line, call.call_index)?;
-        edits.push(PreparedLineRangeEdit {
-            call_index: call.call_index,
-            start_line,
-            end_line,
-            start_index,
-            end_index,
-            normalized: line_range_replacement(&selected, &replacement),
-            replacement,
-        });
+        match call.tool_name.as_str() {
+            "replace_file_lines" => {
+                let start_line = required_u64(&call.arguments, "start_line")?;
+                let end_line = required_u64(&call.arguments, "end_line")?;
+                let replacement = call
+                    .arguments
+                    .get("replacement")
+                    .and_then(Value::as_str)
+                    .context("missing required string argument \"replacement\"")?
+                    .to_string();
+                let (start_index, end_index, selected) =
+                    selected_line_range(&original, start_line, end_line, call.call_index)?;
+                edits.push(PreparedLineRangeEdit {
+                    call_index: call.call_index,
+                    tool_name: call.tool_name.clone(),
+                    start_line,
+                    end_line,
+                    start_index,
+                    end_index,
+                    normalized: line_range_replacement(&selected, &replacement),
+                    replacement,
+                    position: None,
+                });
+            }
+            "insert_file_lines" => {
+                let anchor_line = required_u64(&call.arguments, "anchor_line")?;
+                let position = required_str(&call.arguments, "position")?;
+                if !matches!(position, "before" | "after") {
+                    bail!("position must be \"before\" or \"after\"");
+                }
+                let insertion = call
+                    .arguments
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .context("missing required string argument \"content\"")?
+                    .to_string();
+                if insertion.is_empty() {
+                    bail!("insert_file_lines content must not be empty");
+                }
+                let lines = split_lines_preserving_newlines(&original);
+                let anchor_index = usize::try_from(anchor_line.saturating_sub(1))
+                    .context("anchor_line does not fit this platform")?;
+                if anchor_index >= lines.len() {
+                    bail!(
+                        "insert_file_lines anchor_line {anchor_line} exceeds file length {}",
+                        lines.len()
+                    );
+                }
+                let insertion_index = if position == "before" {
+                    anchor_index
+                } else {
+                    anchor_index + 1
+                };
+                let normalized =
+                    line_range_insertion(&original, &lines, insertion_index, &insertion);
+                edits.push(PreparedLineRangeEdit {
+                    call_index: call.call_index,
+                    tool_name: call.tool_name.clone(),
+                    start_line: anchor_line,
+                    end_line: anchor_line,
+                    start_index: insertion_index,
+                    end_index: insertion_index,
+                    replacement: insertion,
+                    normalized,
+                    position: Some(position.to_string()),
+                });
+            }
+            other => bail!("unsupported atomic line-mutation tool {other:?}"),
+        }
     }
     let mut ranges = edits
         .iter()
@@ -2679,9 +2829,9 @@ async fn prepare_atomic_line_range_batch(
     for pair in ranges.windows(2) {
         let left = pair[0];
         let right = pair[1];
-        if right.0 < left.1 {
+        if line_mutation_ranges_overlap(left.0, left.1, right.0, right.1) {
             bail!(
-                "atomic line-range batch has overlapping calls {} and {}; no mutation occurred",
+                "atomic line-mutation batch has overlapping calls {} and {}; no mutation occurred",
                 left.2,
                 right.2
             );
@@ -2690,14 +2840,30 @@ async fn prepare_atomic_line_range_batch(
     Ok((path, original, edits))
 }
 
+fn line_mutation_ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
+    let left_is_insertion = left_start == left_end;
+    let right_is_insertion = right_start == right_end;
+    match (left_is_insertion, right_is_insertion) {
+        (true, true) => left_start == right_start,
+        (true, false) => left_start >= right_start && left_start < right_end,
+        (false, true) => right_start >= left_start && right_start < left_end,
+        (false, false) => left_start < right_end && right_start < left_end,
+    }
+}
+
 fn atomic_line_range_batch_errors(
     scope: &ToolScope,
     calls: &[AtomicLineRangeBatchCall],
     error: &str,
 ) -> Vec<AtomicLineRangeBatchResult> {
-    let message = format!("atomic line-range batch rejected: {error}");
+    let message = format!("atomic line-mutation batch rejected: {error}");
     scope.trace_tool_event(
-        "tool.replace_file_lines.atomic_batch",
+        "tool.line_mutation.atomic_batch",
         json!({
             "batch_size": calls.len(),
             "committed": false,
@@ -2708,7 +2874,7 @@ fn atomic_line_range_batch_errors(
         .iter()
         .map(|call| {
             let value = json!({ "error": message, "atomic_batch": true });
-            scope.trace_tool_event("tool.replace_file_lines", value.clone());
+            scope.trace_tool_event(&format!("tool.{}", call.tool_name), value.clone());
             AtomicLineRangeBatchResult {
                 call_index: call.call_index,
                 ok: false,
@@ -2716,6 +2882,83 @@ fn atomic_line_range_batch_errors(
             }
         })
         .collect()
+}
+
+fn line_range_insertion(
+    original: &str,
+    lines: &[String],
+    insertion_index: usize,
+    insertion: &str,
+) -> NormalizedReplacement {
+    let needs_prefix = insertion_index == lines.len()
+        && !original.is_empty()
+        && !original.ends_with('\n')
+        && !insertion.starts_with('\n');
+    let needs_suffix = insertion_index < lines.len() && !insertion.ends_with('\n');
+    let mut text = String::new();
+    if needs_prefix {
+        text.push('\n');
+    }
+    text.push_str(insertion);
+    if needs_suffix {
+        text.push('\n');
+    }
+    NormalizedReplacement {
+        text,
+        line_boundary_normalized: needs_prefix || needs_suffix,
+    }
+}
+
+fn line_mutation_result(
+    scope: &ToolScope,
+    path: &Path,
+    original: &str,
+    content: &str,
+    edit: &PreparedLineRangeEdit,
+    atomic: Option<(&Value, &Value)>,
+) -> Value {
+    let receipt = atomic
+        .map(|(_, receipt)| (*receipt).clone())
+        .unwrap_or_else(|| {
+            mutation_receipt(
+                Some(original),
+                content,
+                scope.runtime_state_snapshot().mutation_epoch,
+            )
+        });
+    if edit.tool_name == "insert_file_lines" {
+        let mut value = json!({
+            "path": scope.relative_display(path),
+            "anchor_line": edit.start_line,
+            "position": edit.position,
+            "bytes_before": original.len(),
+            "bytes_after": content.len(),
+            "requested_content_bytes": edit.replacement.len(),
+            "normalized_content_bytes": edit.normalized.text.len(),
+            "line_boundary_normalized": edit.normalized.line_boundary_normalized,
+            "mutation_receipt": receipt,
+        });
+        if let Some((batch, _)) = atomic {
+            value["atomic_batch"] = batch.clone();
+        }
+        value
+    } else {
+        let mut value = json!({
+            "path": scope.relative_display(path),
+            "start_line": edit.start_line,
+            "end_line": edit.end_line,
+            "bytes_before": original.len(),
+            "bytes_after": content.len(),
+            "requested_replacement_bytes": edit.replacement.len(),
+            "normalized_replacement_bytes": edit.normalized.text.len(),
+            "line_boundary_normalized": edit.normalized.line_boundary_normalized,
+            "mutation_receipt": receipt,
+        });
+        if let Some((batch, _)) = atomic {
+            value["atomic_batch"] = batch.clone();
+        }
+        value
+    }
 }
 
 fn required_u64(args: &HashMap<String, Value>, key: &str) -> Result<u64> {
@@ -4804,6 +5047,10 @@ bytes[0..5] \"cafe\\n\""
                 ToolSurface::LineRange,
                 vec!["write_file", "replace_file_lines"],
             ),
+            (
+                ToolSurface::LineRangeInsert,
+                vec!["write_file", "replace_file_lines", "insert_file_lines"],
+            ),
             (ToolSurface::ApplyPatch, vec!["write_file", "apply_patch"]),
             (
                 ToolSurface::ApplyPatchChoice,
@@ -4828,6 +5075,7 @@ bytes[0..5] \"cafe\\n\""
                         "write_file"
                             | "edit_file"
                             | "replace_file_lines"
+                            | "insert_file_lines"
                             | "apply_patch"
                             | "apply_change_set"
                     )
@@ -4946,6 +5194,146 @@ bytes[0..5] \"cafe\\n\""
     }
 
     #[tokio::test]
+    async fn insert_file_lines_preserves_the_anchor_and_line_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.rs");
+        std::fs::write(&file, "struct Item {\n    first: usize,\n}\n").unwrap();
+        let tool = InsertFileLinesTool { scope };
+
+        let result = tool
+            .insert(&HashMap::from([
+                ("path".to_string(), json!("example.rs")),
+                ("anchor_line".to_string(), json!(2)),
+                ("position".to_string(), json!("after")),
+                ("content".to_string(), json!("    second: usize,")),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "struct Item {\n    first: usize,\n    second: usize,\n}\n"
+        );
+        assert_eq!(result["anchor_line"], json!(2));
+        assert_eq!(result["position"], json!("after"));
+        assert_eq!(result["line_boundary_normalized"], json!(true));
+        assert!(
+            result["mutation_receipt"]["after_view"]
+                .as_str()
+                .unwrap()
+                .contains("3|    second: usize,")
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_file_lines_after_unterminated_eof_adds_the_missing_separator() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.txt");
+        std::fs::write(&file, "one\ntwo").unwrap();
+        let tool = InsertFileLinesTool { scope };
+
+        tool.insert(&HashMap::from([
+            ("path".to_string(), json!("example.txt")),
+            ("anchor_line".to_string(), json!(2)),
+            ("position".to_string(), json!("after")),
+            ("content".to_string(), json!("three")),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "one\ntwo\nthree");
+    }
+
+    #[tokio::test]
+    async fn mixed_insert_and_replace_batch_share_one_original_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+
+        let results = run_atomic_line_range_batch(
+            &scope,
+            &[
+                AtomicLineRangeBatchCall {
+                    call_index: 0,
+                    tool_name: "insert_file_lines".to_string(),
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("anchor_line".to_string(), json!(2)),
+                        ("position".to_string(), json!("after")),
+                        ("content".to_string(), json!("TWO-AND-A-HALF")),
+                    ]),
+                },
+                AtomicLineRangeBatchCall {
+                    call_index: 1,
+                    tool_name: "replace_file_lines".to_string(),
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("start_line".to_string(), json!(4)),
+                        ("end_line".to_string(), json!(4)),
+                        ("replacement".to_string(), json!("FOUR")),
+                    ]),
+                },
+            ],
+        )
+        .await;
+
+        assert!(results.iter().all(|result| result.ok));
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "one\ntwo\nTWO-AND-A-HALF\nthree\nFOUR\nfive\n"
+        );
+        assert_eq!(scope.policy_snapshot().total_write_operations, 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_rejects_insertion_inside_replaced_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.txt");
+        let original = "one\ntwo\nthree\nfour\n";
+        std::fs::write(&file, original).unwrap();
+
+        let results = run_atomic_line_range_batch(
+            &scope,
+            &[
+                AtomicLineRangeBatchCall {
+                    call_index: 0,
+                    tool_name: "replace_file_lines".to_string(),
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("start_line".to_string(), json!(2)),
+                        ("end_line".to_string(), json!(3)),
+                        ("replacement".to_string(), json!("middle")),
+                    ]),
+                },
+                AtomicLineRangeBatchCall {
+                    call_index: 1,
+                    tool_name: "insert_file_lines".to_string(),
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("anchor_line".to_string(), json!(2)),
+                        ("position".to_string(), json!("before")),
+                        ("content".to_string(), json!("inserted")),
+                    ]),
+                },
+            ],
+        )
+        .await;
+
+        assert!(results.iter().all(|result| !result.ok));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.content.contains("overlapping"))
+        );
+        assert_eq!(std::fs::read_to_string(file).unwrap(), original);
+        assert_eq!(scope.policy_snapshot().total_write_operations, 0);
+    }
+
+    #[tokio::test]
     async fn atomic_line_range_batch_uses_one_shared_coordinate_space() {
         let temp = tempfile::tempdir().unwrap();
         let scope = scope(&temp);
@@ -4957,6 +5345,7 @@ bytes[0..5] \"cafe\\n\""
             &[
                 AtomicLineRangeBatchCall {
                     call_index: 0,
+                    tool_name: "replace_file_lines".to_string(),
                     arguments: HashMap::from([
                         ("path".to_string(), json!("example.txt")),
                         ("start_line".to_string(), json!(2)),
@@ -4966,6 +5355,7 @@ bytes[0..5] \"cafe\\n\""
                 },
                 AtomicLineRangeBatchCall {
                     call_index: 1,
+                    tool_name: "replace_file_lines".to_string(),
                     arguments: HashMap::from([
                         ("path".to_string(), json!("example.txt")),
                         ("start_line".to_string(), json!(6)),
@@ -4986,7 +5376,7 @@ bytes[0..5] \"cafe\\n\""
         assert_eq!(policy.total_tool_calls, 2);
         assert_eq!(policy.total_write_operations, 1);
         let content = std::fs::read_to_string(scope.trace.path()).unwrap();
-        assert!(content.contains("tool.replace_file_lines.atomic_batch"));
+        assert!(content.contains("tool.line_mutation.atomic_batch"));
         assert!(content.contains("shared_pre_mutation_snapshot"));
     }
 
@@ -5003,6 +5393,7 @@ bytes[0..5] \"cafe\\n\""
             &[
                 AtomicLineRangeBatchCall {
                     call_index: 0,
+                    tool_name: "replace_file_lines".to_string(),
                     arguments: HashMap::from([
                         ("path".to_string(), json!("example.txt")),
                         ("start_line".to_string(), json!(2)),
@@ -5012,6 +5403,7 @@ bytes[0..5] \"cafe\\n\""
                 },
                 AtomicLineRangeBatchCall {
                     call_index: 1,
+                    tool_name: "replace_file_lines".to_string(),
                     arguments: HashMap::from([
                         ("path".to_string(), json!("example.txt")),
                         ("start_line".to_string(), json!(3)),
@@ -5046,6 +5438,7 @@ bytes[0..5] \"cafe\\n\""
         let calls = [
             AtomicLineRangeBatchCall {
                 call_index: 0,
+                tool_name: "replace_file_lines".to_string(),
                 arguments: HashMap::from([
                     ("path".to_string(), json!("example.txt")),
                     ("start_line".to_string(), json!(1)),
@@ -5056,6 +5449,7 @@ bytes[0..5] \"cafe\\n\""
             },
             AtomicLineRangeBatchCall {
                 call_index: 1,
+                tool_name: "replace_file_lines".to_string(),
                 arguments: HashMap::from([
                     ("path".to_string(), json!("example.txt")),
                     ("start_line".to_string(), json!(3)),
