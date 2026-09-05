@@ -115,7 +115,7 @@ pub(crate) fn system_prompt() -> String {
         "Shell commands run from the generated project root by default.",
         "Work in small steps. Verify with deterministic shell commands before claiming completion.",
         "Create Cargo.toml, src/lib.rs, and other generated source at the tool root unless the task says otherwise.",
-        "Create a project-appropriate .gitignore unless the task explicitly forbids additional files.",
+        "Ensure a project-appropriate .gitignore exists unless the task explicitly forbids it. If one already exists, leave it unchanged unless the task requires an update.",
         "Ignore generated build, dependency, cache, and virtual-environment directories such as target/, build/, dist/, node_modules/, .venv/, and __pycache__/. Do not list or inspect ignored paths unless explicitly needed.",
         "Use timeout_secs 1800 for first cargo build, cargo test, or similarly expensive validation probes.",
         "After a validation failure, repair narrowly: cite the failing command and failure text, inspect only relevant code, prefer edit_file for focused existing-source repairs, then rerun validation.",
@@ -135,7 +135,7 @@ pub(crate) fn run_prompt(goal: &str) -> String {
          Required harness behavior:\n\
          - You are already operating inside the generated project's workspace directory.\n\
          - Inspect the project root first.\n\
-         - Create a project-appropriate .gitignore early unless this task explicitly forbids additional files.\n\
+         - Ensure a project-appropriate .gitignore exists unless this task explicitly forbids it. If one already exists, leave it unchanged unless the task requires an update.\n\
          - Build or update the Rust project at the current tool root, not in a nested workspace/ directory.\n\
          - Run at least one deterministic validation command.\n\
          - Leave generated project files at the tool root and use DONE only after validation."
