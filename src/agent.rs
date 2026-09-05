@@ -2617,8 +2617,18 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             }),
         )?;
 
-        for call in &accumulated_tool_calls {
-            let tool_result = run_tool_call(call, active_tools, &correlation_id).await;
+        let mut atomic_line_range_results = run_response_atomic_line_range_batches(
+            &accumulated_tool_calls,
+            active_tools,
+            &correlation_id,
+        )
+        .await;
+        let mut recorded_atomic_batch_mutations = std::collections::BTreeSet::new();
+        for (call_index, call) in accumulated_tool_calls.iter().enumerate() {
+            let tool_result = match atomic_line_range_results.remove(&call_index) {
+                Some(result) => result,
+                None => run_tool_call(call, active_tools, &correlation_id).await,
+            };
             let tool_message = LlmMessage {
                 role: MessageRole::Tool,
                 content: Some(tool_result.content.clone()),
@@ -2653,7 +2663,11 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             }
             if is_meaningful_source_edit(call, &tool_result, profile) {
                 requested_validation_pending_after_write = true;
-                requested_validation_ledger.note_source_mutation();
+                let should_record_mutation = atomic_line_range_batch_identity(&tool_result)
+                    .is_none_or(|identity| recorded_atomic_batch_mutations.insert(identity));
+                if should_record_mutation {
+                    requested_validation_ledger.note_source_mutation();
+                }
             }
             let requested_validation_observation =
                 requested_validation_ledger.observe_tool_result(&tool_result);
@@ -5035,6 +5049,116 @@ async fn run_tool_call(
     }
 }
 
+async fn run_response_atomic_line_range_batches(
+    calls: &[LlmToolCall],
+    tools: &[Box<dyn LlmTool>],
+    correlation_id: &str,
+) -> BTreeMap<usize, ToolCallRunResult> {
+    let mut groups = BTreeMap::<String, Vec<(usize, &LlmToolCall)>>::new();
+    for (call_index, call) in calls.iter().enumerate() {
+        if call.name != "replace_file_lines" {
+            continue;
+        }
+        let Some(path) = call
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        groups
+            .entry(path.to_string())
+            .or_default()
+            .push((call_index, call));
+    }
+
+    let mut results = BTreeMap::new();
+    for (path, group) in groups.into_iter().filter(|(_, group)| group.len() > 1) {
+        let batch_items = group
+            .iter()
+            .map(|(call_index, call)| {
+                serde_json::json!({
+                    "call_index": call_index,
+                    "arguments": call.arguments,
+                })
+            })
+            .collect::<Vec<_>>();
+        let synthetic = LlmToolCall {
+            id: Some(format!("harness-atomic-line-range-{path}")),
+            name: "replace_file_lines".to_string(),
+            arguments: std::collections::HashMap::from([(
+                "__harness_atomic_batch".to_string(),
+                serde_json::Value::Array(batch_items),
+            )]),
+        };
+        let batch_result = run_tool_call(&synthetic, tools, correlation_id).await;
+        let parsed = batch_result
+            .ok
+            .then(|| serde_json::from_str::<serde_json::Value>(&batch_result.content).ok())
+            .flatten()
+            .and_then(|value| {
+                value
+                    .get("results")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+            });
+        let Some(items) = parsed else {
+            for (call_index, _) in group {
+                results.insert(
+                    call_index,
+                    ToolCallRunResult {
+                        ok: false,
+                        content: serde_json::json!({
+                            "error": "atomic line-range batch returned an invalid result",
+                            "batch_error": batch_result.content,
+                        })
+                        .to_string(),
+                        duration_ms: batch_result.duration_ms,
+                    },
+                );
+            }
+            continue;
+        };
+        for item in items {
+            let Some(call_index) = item
+                .get("call_index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+            else {
+                continue;
+            };
+            let ok = item
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let content = item.get("content").cloned().unwrap_or_else(
+                || serde_json::json!({ "error": "atomic line-range result omitted content" }),
+            );
+            results.insert(
+                call_index,
+                ToolCallRunResult {
+                    ok,
+                    content: content.to_string(),
+                    duration_ms: batch_result.duration_ms,
+                },
+            );
+        }
+        for (call_index, _) in group {
+            results
+                .entry(call_index)
+                .or_insert_with(|| ToolCallRunResult {
+                    ok: false,
+                    content: serde_json::json!({
+                        "error": "atomic line-range batch omitted a call result"
+                    })
+                    .to_string(),
+                    duration_ms: batch_result.duration_ms,
+                });
+        }
+    }
+    results
+}
+
 fn inspection_loop_failure_summary(decision: &InspectionLoopDecision) -> String {
     format!(
         "pre-validation inspection loop detected: {} repeated {} times before a source edit or validation probe",
@@ -5151,6 +5275,17 @@ fn is_meaningful_source_edit(
             .is_some_and(|path| profile.path_requires_validation_after_write(path)),
         _ => false,
     }
+}
+
+fn atomic_line_range_batch_identity(result: &ToolCallRunResult) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(&result.content).ok()?;
+    let batch = value.get("atomic_batch")?.as_object()?;
+    Some(format!(
+        "{}:{}:{}",
+        batch.get("path")?.as_str()?,
+        batch.get("after_sha256")?.as_str()?,
+        batch.get("mutation_epoch")?.as_u64()?,
+    ))
 }
 
 fn is_validation_probe_result(result: &ToolCallRunResult) -> bool {
@@ -5647,6 +5782,53 @@ mod tests {
     #[test]
     fn default_repair_exit_thinking_tokens_uses_bounded_retry_threshold() {
         assert_eq!(default_repair_exit_thinking_tokens(), 16_384);
+    }
+
+    #[tokio::test]
+    async fn sibling_line_range_calls_share_the_observed_coordinate_space() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("example.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\nsix\nseven\n").unwrap();
+        let trace = Arc::new(TraceRecorder::create(&temp.path().join("traces")).unwrap());
+        let scope = ToolScope::new(workspace, trace).unwrap();
+        scope.configure_tool_surface(ToolSurface::LineRange);
+        let tools = coding_tools(&scope);
+        let calls = vec![
+            LlmToolCall {
+                id: Some("first".to_string()),
+                name: "replace_file_lines".to_string(),
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("example.txt")),
+                    ("start_line".to_string(), json!(2)),
+                    ("end_line".to_string(), json!(2)),
+                    ("replacement".to_string(), json!("TWO-A\nTWO-B")),
+                ]),
+            },
+            LlmToolCall {
+                id: Some("second".to_string()),
+                name: "replace_file_lines".to_string(),
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("example.txt")),
+                    ("start_line".to_string(), json!(6)),
+                    ("end_line".to_string(), json!(6)),
+                    ("replacement".to_string(), json!("SIX")),
+                ]),
+            },
+        ];
+
+        let results = run_response_atomic_line_range_batches(&calls, &tools, "test").await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.values().all(|result| result.ok));
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "one\nTWO-A\nTWO-B\nthree\nfour\nfive\nSIX\nseven\n"
+        );
+        let policy = scope.policy_snapshot();
+        assert_eq!(policy.total_tool_calls, 2);
+        assert_eq!(policy.total_write_operations, 1);
     }
 
     #[test]

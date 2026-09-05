@@ -2391,6 +2391,30 @@ pub struct ReplaceFileLinesTool {
     scope: ToolScope,
 }
 
+#[derive(Debug, Clone)]
+struct AtomicLineRangeBatchCall {
+    call_index: usize,
+    arguments: HashMap<String, Value>,
+}
+
+#[derive(Debug)]
+struct AtomicLineRangeBatchResult {
+    call_index: usize,
+    ok: bool,
+    content: String,
+}
+
+#[derive(Debug)]
+struct PreparedLineRangeEdit {
+    call_index: usize,
+    start_line: u64,
+    end_line: u64,
+    start_index: usize,
+    end_index: usize,
+    replacement: String,
+    normalized: NormalizedReplacement,
+}
+
 #[async_trait]
 impl LlmTool for ReplaceFileLinesTool {
     async fn run(
@@ -2398,6 +2422,40 @@ impl LlmTool for ReplaceFileLinesTool {
         args: &HashMap<String, Value>,
         _ctx: &ToolRunCtx,
     ) -> mojentic::Result<Value> {
+        if let Some(batch) = args.get("__harness_atomic_batch").and_then(Value::as_array) {
+            let calls = batch
+                .iter()
+                .map(|item| {
+                    let call_index = item
+                        .get("call_index")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .context("atomic line-range batch item omitted call_index")?;
+                    let arguments = item
+                        .get("arguments")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .context("atomic line-range batch item omitted arguments")?;
+                    Ok(AtomicLineRangeBatchCall {
+                        call_index,
+                        arguments,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+                .map_err(to_mojentic_error)?;
+            let results = run_atomic_line_range_batch(&self.scope, &calls).await;
+            return Ok(json!({
+                "atomic_batch": true,
+                "results": results.into_iter().map(|result| {
+                    json!({
+                        "call_index": result.call_index,
+                        "ok": result.ok,
+                        "content": serde_json::from_str::<Value>(&result.content)
+                            .unwrap_or_else(|_| json!({ "error": result.content })),
+                    })
+                }).collect::<Vec<_>>(),
+            }));
+        }
         self.scope.note_tool_call();
         let result = self.replace(args).await.map_err(to_mojentic_error);
         let payload = match &result {
@@ -2483,6 +2541,181 @@ impl ReplaceFileLinesTool {
             ),
         }))
     }
+}
+
+async fn run_atomic_line_range_batch(
+    scope: &ToolScope,
+    calls: &[AtomicLineRangeBatchCall],
+) -> Vec<AtomicLineRangeBatchResult> {
+    for _ in calls {
+        scope.note_tool_call();
+    }
+    let prepared = prepare_atomic_line_range_batch(scope, calls).await;
+    let (path, original, edits) = match prepared {
+        Ok(value) => value,
+        Err(error) => return atomic_line_range_batch_errors(scope, calls, &error.to_string()),
+    };
+    let original_sha256 = format!("{:x}", Sha256::digest(original.as_bytes()));
+    let mut ordered = edits.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|edit| std::cmp::Reverse(edit.start_index));
+    let mut lines = split_lines_preserving_newlines(&original);
+    for edit in &ordered {
+        lines.splice(
+            edit.start_index..edit.end_index,
+            [edit.normalized.text.clone()],
+        );
+    }
+    let content = lines.concat();
+    if let Err(error) = scope.note_write_intent(std::slice::from_ref(&path)) {
+        return atomic_line_range_batch_errors(scope, calls, &error.to_string());
+    }
+    if let Err(error) = tokio::fs::write(&path, content.as_bytes())
+        .await
+        .with_context(|| format!("writing {}", path.display()))
+    {
+        return atomic_line_range_batch_errors(scope, calls, &error.to_string());
+    }
+    let mutation_epoch = scope.runtime_state_snapshot().mutation_epoch;
+    let receipt = mutation_receipt(Some(&original), &content, mutation_epoch);
+    let after_sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let application_order = ordered
+        .iter()
+        .map(|edit| edit.call_index)
+        .collect::<Vec<_>>();
+    let batch_payload = json!({
+        "path": scope.relative_display(&path),
+        "batch_size": edits.len(),
+        "coordinate_space": "shared_pre_mutation_snapshot",
+        "commit_count": 1,
+        "original_sha256": original_sha256,
+        "after_sha256": after_sha256,
+        "application_order_by_call_index": application_order,
+        "mutation_epoch": mutation_epoch,
+    });
+    scope.trace_tool_event(
+        "tool.replace_file_lines.atomic_batch",
+        batch_payload.clone(),
+    );
+
+    edits
+        .into_iter()
+        .map(|edit| {
+            let value = json!({
+                "path": scope.relative_display(&path),
+                "start_line": edit.start_line,
+                "end_line": edit.end_line,
+                "bytes_before": original.len(),
+                "bytes_after": content.len(),
+                "requested_replacement_bytes": edit.replacement.len(),
+                "normalized_replacement_bytes": edit.normalized.text.len(),
+                "line_boundary_normalized": edit.normalized.line_boundary_normalized,
+                "atomic_batch": batch_payload,
+                "mutation_receipt": receipt,
+            });
+            scope.trace_tool_event("tool.replace_file_lines", value.clone());
+            AtomicLineRangeBatchResult {
+                call_index: edit.call_index,
+                ok: true,
+                content: value.to_string(),
+            }
+        })
+        .collect()
+}
+
+async fn prepare_atomic_line_range_batch(
+    scope: &ToolScope,
+    calls: &[AtomicLineRangeBatchCall],
+) -> Result<(PathBuf, String, Vec<PreparedLineRangeEdit>)> {
+    if calls.len() < 2 {
+        bail!("atomic line-range batches require at least two calls");
+    }
+    let path_arg = calls
+        .first()
+        .and_then(|call| call.arguments.get("path"))
+        .and_then(Value::as_str)
+        .context("missing required string argument \"path\"")?;
+    if calls
+        .iter()
+        .any(|call| call.arguments.get("path").and_then(Value::as_str) != Some(path_arg))
+    {
+        bail!("atomic line-range batch calls must target one file");
+    }
+    let path = scope.resolve_existing_or_new(path_arg)?;
+    scope.check_write(&path)?;
+    if !path.is_file() {
+        bail!("replace_file_lines can only edit an existing file: {path_arg}");
+    }
+    let original = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mut edits = Vec::with_capacity(calls.len());
+    for call in calls {
+        verify_optional_file_hash(&call.arguments, &original)?;
+        let start_line = required_u64(&call.arguments, "start_line")?;
+        let end_line = required_u64(&call.arguments, "end_line")?;
+        let replacement = call
+            .arguments
+            .get("replacement")
+            .and_then(Value::as_str)
+            .context("missing required string argument \"replacement\"")?
+            .to_string();
+        let (start_index, end_index, selected) =
+            selected_line_range(&original, start_line, end_line, call.call_index)?;
+        edits.push(PreparedLineRangeEdit {
+            call_index: call.call_index,
+            start_line,
+            end_line,
+            start_index,
+            end_index,
+            normalized: line_range_replacement(&selected, &replacement),
+            replacement,
+        });
+    }
+    let mut ranges = edits
+        .iter()
+        .map(|edit| (edit.start_index, edit.end_index, edit.call_index))
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| range.0);
+    for pair in ranges.windows(2) {
+        let left = pair[0];
+        let right = pair[1];
+        if right.0 < left.1 {
+            bail!(
+                "atomic line-range batch has overlapping calls {} and {}; no mutation occurred",
+                left.2,
+                right.2
+            );
+        }
+    }
+    Ok((path, original, edits))
+}
+
+fn atomic_line_range_batch_errors(
+    scope: &ToolScope,
+    calls: &[AtomicLineRangeBatchCall],
+    error: &str,
+) -> Vec<AtomicLineRangeBatchResult> {
+    let message = format!("atomic line-range batch rejected: {error}");
+    scope.trace_tool_event(
+        "tool.replace_file_lines.atomic_batch",
+        json!({
+            "batch_size": calls.len(),
+            "committed": false,
+            "error": message,
+        }),
+    );
+    calls
+        .iter()
+        .map(|call| {
+            let value = json!({ "error": message, "atomic_batch": true });
+            scope.trace_tool_event("tool.replace_file_lines", value.clone());
+            AtomicLineRangeBatchResult {
+                call_index: call.call_index,
+                ok: false,
+                content: value.to_string(),
+            }
+        })
+        .collect()
 }
 
 fn required_u64(args: &HashMap<String, Value>, key: &str) -> Result<u64> {
@@ -4710,6 +4943,137 @@ bytes[0..5] \"cafe\\n\""
             .unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "TWO");
         assert_eq!(delete_result["line_boundary_normalized"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn atomic_line_range_batch_uses_one_shared_coordinate_space() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\nsix\nseven\n").unwrap();
+
+        let results = run_atomic_line_range_batch(
+            &scope,
+            &[
+                AtomicLineRangeBatchCall {
+                    call_index: 0,
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("start_line".to_string(), json!(2)),
+                        ("end_line".to_string(), json!(2)),
+                        ("replacement".to_string(), json!("TWO-A\nTWO-B")),
+                    ]),
+                },
+                AtomicLineRangeBatchCall {
+                    call_index: 1,
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("start_line".to_string(), json!(6)),
+                        ("end_line".to_string(), json!(6)),
+                        ("replacement".to_string(), json!("SIX")),
+                    ]),
+                },
+            ],
+        )
+        .await;
+
+        assert!(results.iter().all(|result| result.ok));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "one\nTWO-A\nTWO-B\nthree\nfour\nfive\nSIX\nseven\n"
+        );
+        let policy = scope.policy_snapshot();
+        assert_eq!(policy.total_tool_calls, 2);
+        assert_eq!(policy.total_write_operations, 1);
+        let content = std::fs::read_to_string(scope.trace.path()).unwrap();
+        assert!(content.contains("tool.replace_file_lines.atomic_batch"));
+        assert!(content.contains("shared_pre_mutation_snapshot"));
+    }
+
+    #[tokio::test]
+    async fn atomic_line_range_batch_rejects_overlap_without_mutating() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.txt");
+        let original = "one\ntwo\nthree\nfour\n";
+        std::fs::write(&file, original).unwrap();
+
+        let results = run_atomic_line_range_batch(
+            &scope,
+            &[
+                AtomicLineRangeBatchCall {
+                    call_index: 0,
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("start_line".to_string(), json!(2)),
+                        ("end_line".to_string(), json!(3)),
+                        ("replacement".to_string(), json!("middle")),
+                    ]),
+                },
+                AtomicLineRangeBatchCall {
+                    call_index: 1,
+                    arguments: HashMap::from([
+                        ("path".to_string(), json!("example.txt")),
+                        ("start_line".to_string(), json!(3)),
+                        ("end_line".to_string(), json!(4)),
+                        ("replacement".to_string(), json!("tail")),
+                    ]),
+                },
+            ],
+        )
+        .await;
+
+        assert!(results.iter().all(|result| !result.ok));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.content.contains("overlapping"))
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let policy = scope.policy_snapshot();
+        assert_eq!(policy.total_tool_calls, 2);
+        assert_eq!(policy.total_write_operations, 0);
+    }
+
+    #[tokio::test]
+    async fn atomic_line_range_batch_rejects_stale_hash_without_mutating() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = scope(&temp);
+        let file = temp.path().join("example.txt");
+        let original = "one\ntwo\nthree\n";
+        std::fs::write(&file, original).unwrap();
+
+        let calls = [
+            AtomicLineRangeBatchCall {
+                call_index: 0,
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("example.txt")),
+                    ("start_line".to_string(), json!(1)),
+                    ("end_line".to_string(), json!(1)),
+                    ("replacement".to_string(), json!("ONE")),
+                    ("expected_file_sha256".to_string(), json!("stale")),
+                ]),
+            },
+            AtomicLineRangeBatchCall {
+                call_index: 1,
+                arguments: HashMap::from([
+                    ("path".to_string(), json!("example.txt")),
+                    ("start_line".to_string(), json!(3)),
+                    ("end_line".to_string(), json!(3)),
+                    ("replacement".to_string(), json!("THREE")),
+                ]),
+            },
+        ];
+        let results = run_atomic_line_range_batch(&scope, &calls).await;
+
+        assert!(results.iter().all(|result| !result.ok));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.content.contains("stale"))
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        assert_eq!(scope.policy_snapshot().total_write_operations, 0);
     }
 
     #[tokio::test]
