@@ -10,7 +10,6 @@ use crate::tools::{
 use crate::trace::TraceRecorder;
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use mojentic::MojenticError;
 use mojentic::llm::gateway::{ReasoningEffort, ResponseFormat, StreamChunk, StreamMetrics};
 use mojentic::llm::gateways::OllamaGateway;
 use mojentic::llm::models::{LlmMessage, LlmToolCall, MessageRole};
@@ -69,7 +68,7 @@ pub struct AgentRunConfig {
     pub contract_file: Option<PathBuf>,
     pub model: String,
     pub max_iterations: usize,
-    pub max_tool_iterations: usize,
+    pub max_model_interactions: usize,
     pub context_window_tokens: Option<usize>,
     pub packet_type: String,
     pub expected_output_tokens: usize,
@@ -101,7 +100,7 @@ pub struct AgentRunSummary {
     pub trace_file: PathBuf,
     pub model: String,
     pub max_iterations: usize,
-    pub max_tool_iterations: usize,
+    pub max_model_interactions: usize,
     pub context_window_tokens: Option<usize>,
     pub packet_type: String,
     pub expected_output_tokens: usize,
@@ -262,7 +261,7 @@ pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
 }
 
 fn agent_completion_config(
-    max_tool_iterations: usize,
+    max_model_interactions: usize,
     num_predict: Option<usize>,
     context_window_tokens: Option<usize>,
 ) -> Result<CompletionConfig> {
@@ -272,7 +271,7 @@ fn agent_completion_config(
         .context("num_predict exceeds i32 range")?;
     let mut completion_config = CompletionConfig {
         temperature: 0.2,
-        max_tool_iterations,
+        max_tool_iterations: max_model_interactions,
         num_predict,
         ..Default::default()
     };
@@ -317,7 +316,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     };
     let contract_budgets = crate::contract::Budgets {
         max_iterations: config.max_iterations,
-        max_tool_iterations: config.max_tool_iterations,
+        max_model_interactions: config.max_model_interactions,
         context_window_tokens: config.context_window_tokens,
         max_thinking_only_tokens: config.max_thinking_only_tokens,
         repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
@@ -351,7 +350,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "goal_file": goal_file,
             "model": config.model,
             "max_iterations": config.max_iterations,
-            "max_tool_iterations": config.max_tool_iterations,
+            "max_model_interactions": config.max_model_interactions,
             "context_window_tokens": config.context_window_tokens,
             "packet_type": config.packet_type,
             "expected_output_tokens": config.expected_output_tokens,
@@ -611,7 +610,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         LlmMessage::user(worker_message),
     ];
     let completion_config = agent_completion_config(
-        config.max_tool_iterations,
+        config.max_model_interactions,
         config.num_predict,
         config.context_window_tokens,
     )?;
@@ -1319,7 +1318,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         trace_file: trace.path().to_path_buf(),
         model: config.model,
         max_iterations: config.max_iterations,
-        max_tool_iterations: config.max_tool_iterations,
+        max_model_interactions: config.max_model_interactions,
         context_window_tokens: config.context_window_tokens,
         packet_type: config.packet_type,
         expected_output_tokens: config.expected_output_tokens,
@@ -1958,7 +1957,7 @@ struct RepairDepthDecision {
     utilization: Option<f64>,
     pressure_band: &'static str,
     message_count: usize,
-    max_tool_iterations: usize,
+    max_model_interactions: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -2035,10 +2034,10 @@ async fn stream_response<G: LlmGateway + ?Sized>(
 
     for depth in 0..=completion_config.max_tool_iterations {
         if depth >= completion_config.max_tool_iterations {
-            return Err(MojenticError::MaxToolIterationsExceeded {
-                limit: completion_config.max_tool_iterations,
-            }
-            .into());
+            anyhow::bail!(
+                "Maximum model interactions exceeded: limit {}",
+                completion_config.max_tool_iterations
+            );
         }
 
         let active_tools = if final_response_only_after_validation.is_some() {
@@ -2853,7 +2852,7 @@ fn repair_depth_decision(
         utilization: ledger.utilization,
         pressure_band: ledger.pressure_band,
         message_count: ledger.message_count,
-        max_tool_iterations: ledger.max_tool_iterations,
+        max_model_interactions: ledger.max_model_interactions,
     })
 }
 
@@ -2876,7 +2875,7 @@ struct ContextAssemblyLedger {
     previous_call_total_chars: Option<usize>,
     delta_chars_from_previous_call: Option<isize>,
     completion_temperature: f32,
-    max_tool_iterations: usize,
+    max_model_interactions: usize,
     assembly_policy: &'static str,
     transcript_policy: TranscriptPolicy,
 }
@@ -3130,7 +3129,7 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
                 "top_k": completion_config.top_k,
                 "response_format": response_format,
                 "reasoning_effort": completion_config.reasoning_effort,
-                "max_tool_iterations": completion_config.max_tool_iterations,
+                "max_model_interactions": completion_config.max_tool_iterations,
             },
             "harness_limits": {
                 "max_thinking_only_tokens": max_thinking_only_tokens,
@@ -3219,7 +3218,7 @@ fn context_assembly_ledger(input: ContextAssemblyInput<'_>) -> ContextAssemblyLe
         previous_call_total_chars: input.previous_call_total_chars,
         delta_chars_from_previous_call,
         completion_temperature: input.completion_config.temperature,
-        max_tool_iterations: input.completion_config.max_tool_iterations,
+        max_model_interactions: input.completion_config.max_tool_iterations,
         assembly_policy: input.transcript_policy.as_str(),
         transcript_policy: input.transcript_policy,
     }
@@ -8540,7 +8539,7 @@ mod tests {
             contract_file: None,
             model: "qwen3.6:27b-coding-mxfp8".to_string(),
             max_iterations: 10,
-            max_tool_iterations: 50,
+            max_model_interactions: 75,
             context_window_tokens: Some(131_072),
             packet_type: "multi-file-patch".to_string(),
             expected_output_tokens: 4_096,
@@ -10001,7 +10000,7 @@ mod tests {
                     contract_file: None,
                     model: "fake-model".to_string(),
                     max_iterations,
-                    max_tool_iterations: 10,
+                    max_model_interactions: 10,
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
@@ -10037,7 +10036,7 @@ mod tests {
                     contract_file: None,
                     model: "fake-model".to_string(),
                     max_iterations,
-                    max_tool_iterations: 10,
+                    max_model_interactions: 10,
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
@@ -10073,7 +10072,7 @@ mod tests {
                     contract_file: None,
                     model: "fake-model".to_string(),
                     max_iterations,
-                    max_tool_iterations: 10,
+                    max_model_interactions: 10,
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
@@ -10134,7 +10133,7 @@ mod tests {
                     contract_file: Some(PathBuf::from("contract.json")),
                     model: "fake-model".to_string(),
                     max_iterations,
-                    max_tool_iterations: 10,
+                    max_model_interactions: 10,
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
@@ -10169,7 +10168,7 @@ mod tests {
                     contract_file: None,
                     model: "fake-model".to_string(),
                     max_iterations,
-                    max_tool_iterations: 10,
+                    max_model_interactions: 10,
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
@@ -10204,7 +10203,7 @@ mod tests {
                     contract_file: None,
                     model: "fake-model".to_string(),
                     max_iterations,
-                    max_tool_iterations: 10,
+                    max_model_interactions: 10,
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
@@ -10235,7 +10234,7 @@ mod tests {
                     contract_file: None,
                     model: "worker-model".to_string(),
                     max_iterations: 1,
-                    max_tool_iterations: 10,
+                    max_model_interactions: 10,
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,

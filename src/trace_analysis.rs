@@ -17,7 +17,7 @@ pub struct TraceAnalysis {
     pub assembly_policy: Option<String>,
     pub transcript_policy: Option<String>,
     pub context_window_tokens: Option<usize>,
-    pub max_tool_iterations: Option<usize>,
+    pub max_model_interactions: Option<usize>,
     pub packet_type: Option<String>,
     pub expected_output_tokens: Option<usize>,
     pub semantic_advisory_call_count: usize,
@@ -842,7 +842,8 @@ fn apply_run_started(analysis: &mut TraceAnalysis, payload: &Value) {
     analysis.goal_file = value_string(payload, "goal_file");
     analysis.tool_root = value_string(payload, "tool_root");
     analysis.context_window_tokens = value_usize(payload, "context_window_tokens");
-    analysis.max_tool_iterations = value_usize(payload, "max_tool_iterations");
+    analysis.max_model_interactions = value_usize(payload, "max_model_interactions")
+        .or_else(|| value_usize(payload, "max_tool_iterations"));
     analysis.assembly_policy = value_string(payload, "assembly_policy");
     analysis.transcript_policy = value_string(payload, "transcript_policy");
     analysis.packet_type = value_string(payload, "packet_type");

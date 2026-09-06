@@ -221,7 +221,7 @@ pub fn legacy_trace_events(event: &RuntimeEvent) -> Vec<LegacyTraceEvent> {
 /// Emitted once per run with the resolved run configuration and captured
 /// [`crate::provenance::HarnessSourceState`]. Payload fields consumed by the
 /// analyzer: `model`, `goal_file`, `tool_root`, `context_window_tokens`,
-/// `max_tool_iterations`, `assembly_policy`, `transcript_policy`,
+/// `max_model_interactions`, `assembly_policy`, `transcript_policy`,
 /// `packet_type`, `expected_output_tokens`, `harness_source_state`.
 pub const RUN_STARTED: &str = "run.started";
 

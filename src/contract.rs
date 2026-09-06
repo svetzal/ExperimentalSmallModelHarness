@@ -161,7 +161,8 @@ pub struct EvidenceInvalidation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
     pub max_iterations: usize,
-    pub max_tool_iterations: usize,
+    #[serde(alias = "max_tool_iterations")]
+    pub max_model_interactions: usize,
     pub context_window_tokens: Option<usize>,
     pub max_thinking_only_tokens: usize,
     pub repair_exit_thinking_tokens: usize,
@@ -174,7 +175,7 @@ impl Default for Budgets {
     fn default() -> Self {
         Self {
             max_iterations: 10,
-            max_tool_iterations: 50,
+            max_model_interactions: 75,
             context_window_tokens: None,
             max_thinking_only_tokens: 4_096,
             repair_exit_thinking_tokens: 16_384,
@@ -483,8 +484,8 @@ fn validate_explicit_contract(
         if budgets.max_iterations == 0 {
             bail!("explicit contract: budgets.max_iterations must be greater than zero");
         }
-        if budgets.max_tool_iterations == 0 {
-            bail!("explicit contract: budgets.max_tool_iterations must be greater than zero");
+        if budgets.max_model_interactions == 0 {
+            bail!("explicit contract: budgets.max_model_interactions must be greater than zero");
         }
     }
 
@@ -806,7 +807,7 @@ mod tests {
             "probes": [],
             "budgets": {
                 "max_iterations": 0,
-                "max_tool_iterations": 50,
+                "max_model_interactions": 75,
                 "context_window_tokens": null,
                 "max_thinking_only_tokens": 4096,
                 "repair_exit_thinking_tokens": 16384

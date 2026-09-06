@@ -62,9 +62,9 @@ struct RunArgs {
     #[arg(long, default_value_t = 10)]
     max_iterations: usize,
 
-    /// Maximum model-requested tool calls per model turn.
-    #[arg(long, default_value_t = 50)]
-    max_tool_iterations: usize,
+    /// Maximum model interaction cycles per agent turn.
+    #[arg(long, alias = "max-tool-iterations", default_value_t = 75)]
+    max_model_interactions: usize,
 
     /// Model context window in tokens for provider requests and utilization traces.
     /// Defaults to 262144 for qwen3.6:27b-coding-mxfp8 and to the provider otherwise.
@@ -165,7 +165,7 @@ impl RunArgs {
             contract_file: self.contract,
             model: self.model,
             max_iterations: self.max_iterations,
-            max_tool_iterations: self.max_tool_iterations,
+            max_model_interactions: self.max_model_interactions,
             context_window_tokens,
             packet_type: self.packet_type,
             expected_output_tokens,
@@ -186,6 +186,32 @@ impl RunArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_interaction_limit_defaults_to_seventy_five() {
+        let cli = Cli::try_parse_from(["harness", "run", "--experiment", "."]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.max_model_interactions, 75);
+    }
+
+    #[test]
+    fn deprecated_tool_iteration_flag_remains_an_alias() {
+        let cli = Cli::try_parse_from([
+            "harness",
+            "run",
+            "--experiment",
+            ".",
+            "--max-tool-iterations",
+            "61",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.max_model_interactions, 61);
+    }
 
     #[test]
     fn qwen36_27b_coding_uses_advertised_context_window() {
