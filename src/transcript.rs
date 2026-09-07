@@ -444,14 +444,29 @@ fn parse_session(path: &Path) -> Result<Option<Session>> {
 
 fn read_records(path: &Path) -> Result<Vec<TraceRecord>> {
     let file = File::open(path).with_context(|| format!("opening trace {}", path.display()))?;
+    let mut reader = BufReader::new(file);
     let mut records = Vec::new();
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.with_context(|| format!("reading {}", path.display()))?;
+    let mut line_index = 0;
+    loop {
+        let mut line = String::new();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_index += 1;
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("decoding {} line {}", path.display(), line_index + 1))?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) if !line.ends_with('\n') => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("decoding {} line {}", path.display(), line_index));
+            }
+        };
         records.push(TraceRecord {
             timestamp: value
                 .get("timestamp")
@@ -871,5 +886,35 @@ mod tests {
                 .to_string()
                 .contains("unsupported transcript evidence schema")
         );
+    }
+
+    #[test]
+    fn ignores_an_incomplete_final_trace_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run.jsonl");
+        std::fs::write(
+            &trace,
+            concat!(
+                "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"kind\":\"run.started\",\"payload\":{}}\n",
+                "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"kind\":\"llm.stream.progress\"",
+            ),
+        )
+        .unwrap();
+
+        let records = read_records(&trace).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, "run.started");
+    }
+
+    #[test]
+    fn rejects_a_malformed_complete_trace_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run.jsonl");
+        std::fs::write(&trace, "{not-json}\n").unwrap();
+
+        let error = read_records(&trace).unwrap_err();
+
+        assert!(error.to_string().contains("line 1"));
     }
 }
