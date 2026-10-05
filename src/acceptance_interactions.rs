@@ -11,7 +11,7 @@ use crate::semantic_advisory::{
 use crate::trace::TraceRecorder;
 use anyhow::{Result, anyhow, bail};
 use mojentic::llm::LlmGateway;
-use mojentic::llm::gateways::OllamaGateway;
+use mojentic::llm::gateways::OmlxGateway;
 use mojentic::llm::models::LlmMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -161,7 +161,7 @@ pub async fn plan_acceptance_interactions(
     max_scenarios: usize,
     max_output_tokens: usize,
 ) -> Result<AcceptanceInteractionPlanningSummary> {
-    let gateway = OllamaGateway::new();
+    let gateway = OmlxGateway::new();
     plan_acceptance_interactions_with_gateway(
         &gateway,
         model,
@@ -282,7 +282,7 @@ pub async fn author_interaction_evidence(
     trace_dir: &Path,
     max_output_tokens: usize,
 ) -> Result<AcceptanceInteractionEvidenceSummary> {
-    let gateway = OllamaGateway::new();
+    let gateway = OmlxGateway::new();
     author_interaction_evidence_with_gateway(
         &gateway,
         model,
@@ -980,6 +980,7 @@ mod tests {
                 .pop_front()
                 .expect("scripted interaction proposal");
             Ok(LlmGatewayResponse {
+                evidence: Default::default(),
                 content: Some(serde_json::to_string(&proposal).unwrap()),
                 object: None,
                 tool_calls: Vec::new(),

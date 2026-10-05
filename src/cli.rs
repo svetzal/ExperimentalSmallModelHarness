@@ -18,13 +18,23 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-const DEFAULT_MODEL: &str = "qwen3.6:27b-coding-mxfp8";
-const QWEN36_27B_CODING_CONTEXT_TOKENS: usize = 262_144;
+const DEFAULT_MODEL: &str = "Qwen3.8-27B-MLX-8bit";
 
 fn model_context_window_tokens(model: &str) -> Option<usize> {
-    match model.strip_prefix("ollama/").unwrap_or(model) {
-        DEFAULT_MODEL => Some(QWEN36_27B_CODING_CONTEXT_TOKENS),
+    match model {
+        DEFAULT_MODEL => Some(262_144),
         _ => None,
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<mojentic::llm::gateway::ReasoningEffort, String> {
+    use mojentic::llm::gateway::ReasoningEffort;
+    match value {
+        "disabled" => Ok(ReasoningEffort::Disabled),
+        "low" => Ok(ReasoningEffort::Low),
+        "medium" => Ok(ReasoningEffort::Medium),
+        "high" => Ok(ReasoningEffort::High),
+        _ => Err("expected disabled, low, medium, or high; omit for the model default".into()),
     }
 }
 
@@ -54,7 +64,7 @@ struct RunArgs {
     #[arg(long)]
     contract: Option<PathBuf>,
 
-    /// Ollama model name.
+    /// oMLX model ID from /v1/models.
     #[arg(long, default_value = DEFAULT_MODEL)]
     model: String,
 
@@ -66,8 +76,8 @@ struct RunArgs {
     #[arg(long, alias = "max-tool-iterations", default_value_t = 75)]
     max_model_interactions: usize,
 
-    /// Model context window in tokens for provider requests and utilization traces.
-    /// Defaults to 262144 for qwen3.6:27b-coding-mxfp8 and to the provider otherwise.
+    /// Context window used for harness accounting; configure the actual limit in oMLX.
+    /// Defaults to 262144 for Qwen3.8-27B-MLX-8bit and Mojentic accounting otherwise.
     #[arg(long)]
     context_window_tokens: Option<usize>,
 
@@ -79,11 +89,16 @@ struct RunArgs {
     #[arg(long)]
     expected_output_tokens: Option<usize>,
 
-    /// Override Ollama num_predict / maximum generated tokens.
-    #[arg(long)]
-    num_predict: Option<usize>,
+    /// Maximum generated tokens per request, including reasoning (default: 16384).
+    #[arg(long, visible_alias = "num-predict")]
+    max_tokens: Option<usize>,
 
-    /// Max reasoning-only tokens in one LLM call before an action-only handoff. Defaults to max(expected output, 25% of num_predict); 0 disables.
+    /// Worker reasoning effort: disabled, low, medium, high. Omit for the model default.
+    /// Named levels depend on the model's chat template; advisory calls keep their defaults.
+    #[arg(long, value_parser = parse_reasoning_effort)]
+    reasoning_effort: Option<mojentic::llm::gateway::ReasoningEffort>,
+
+    /// Max reasoning-only tokens in one LLM call before an action-only handoff. Defaults to max(expected output, 25% of max_tokens); 0 disables.
     #[arg(long)]
     max_thinking_only_tokens: Option<usize>,
 
@@ -129,6 +144,9 @@ struct RunArgs {
 
 impl RunArgs {
     fn into_config(self) -> Result<AgentRunConfig> {
+        if self.max_tokens == Some(0) {
+            bail!("--max-tokens must be greater than zero");
+        }
         let transcript_policy =
             TranscriptPolicy::parse(&self.transcript_policy).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -142,7 +160,7 @@ impl RunArgs {
             .expected_output_tokens
             .unwrap_or_else(|| default_expected_output_tokens(&self.packet_type));
         let max_thinking_only_tokens = self.max_thinking_only_tokens.unwrap_or_else(|| {
-            default_max_thinking_only_tokens(expected_output_tokens, self.num_predict)
+            default_max_thinking_only_tokens(expected_output_tokens, self.max_tokens)
         });
         let repair_exit_thinking_tokens = self
             .repair_exit_thinking_tokens
@@ -169,7 +187,8 @@ impl RunArgs {
             context_window_tokens,
             packet_type: self.packet_type,
             expected_output_tokens,
-            num_predict: self.num_predict,
+            max_tokens: self.max_tokens,
+            reasoning_effort: self.reasoning_effort,
             max_thinking_only_tokens,
             repair_exit_thinking_tokens,
             repair_handoff_policy,
@@ -186,6 +205,54 @@ impl RunArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_budget_alias_and_reasoning_effort_reach_worker_config() {
+        for flag in ["--max-tokens", "--num-predict"] {
+            let cli = Cli::try_parse_from([
+                "harness",
+                "run",
+                "--experiment",
+                ".",
+                flag,
+                "32768",
+                "--reasoning-effort",
+                "low",
+            ])
+            .unwrap();
+            let Command::Run(args) = cli.command else {
+                panic!("expected run")
+            };
+            let config = args.into_config().unwrap();
+            assert_eq!(config.max_tokens, Some(32768));
+            assert_eq!(config.max_thinking_only_tokens, 8192);
+            assert_eq!(
+                config.reasoning_effort,
+                Some(mojentic::llm::gateway::ReasoningEffort::Low)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_effort_and_zero_budget_are_rejected() {
+        assert!(
+            Cli::try_parse_from([
+                "harness",
+                "run",
+                "--experiment",
+                ".",
+                "--reasoning-effort",
+                "extreme",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from(["harness", "run", "--experiment", ".", "--max-tokens", "0"])
+            .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run")
+        };
+        assert!(args.into_config().is_err());
+    }
 
     #[test]
     fn model_interaction_limit_defaults_to_seventy_five() {
@@ -214,15 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen36_27b_coding_uses_advertised_context_window() {
+    fn omlx_qwen_uses_advertised_context_window() {
         assert_eq!(
-            model_context_window_tokens("qwen3.6:27b-coding-mxfp8"),
+            model_context_window_tokens("Qwen3.8-27B-MLX-8bit"),
             Some(262_144)
         );
-        assert_eq!(
-            model_context_window_tokens("ollama/qwen3.6:27b-coding-mxfp8"),
-            Some(262_144)
-        );
+        assert_eq!(model_context_window_tokens("unknown-omlx-model"), None);
     }
 
     #[test]
@@ -323,7 +387,7 @@ enum Command {
         #[arg(long)]
         trace_dir: PathBuf,
 
-        /// Ollama model name.
+        /// oMLX model ID from /v1/models.
         #[arg(long, default_value = DEFAULT_MODEL)]
         model: String,
 
@@ -355,7 +419,7 @@ enum Command {
         #[arg(long)]
         trace_dir: PathBuf,
 
-        /// Ollama model name.
+        /// oMLX model ID from /v1/models.
         #[arg(long, default_value = DEFAULT_MODEL)]
         model: String,
 
@@ -391,7 +455,7 @@ enum Command {
         #[arg(long)]
         trace_dir: PathBuf,
 
-        /// Ollama model name.
+        /// oMLX model ID from /v1/models.
         #[arg(long, default_value = DEFAULT_MODEL)]
         model: String,
 

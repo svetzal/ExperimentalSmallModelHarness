@@ -31,8 +31,57 @@ interfaces may change as experiments reveal better boundaries.
 ## Requirements
 
 - Rust with Cargo and support for the 2024 edition
-- A local Ollama-compatible model runner
-- Network access for Cargo to fetch the revision-pinned Mojentic Rust dependency
+- An oMLX server with a Qwen model installed
+- Network access for Cargo to fetch Mojentic 2.1 from crates.io
+
+## oMLX configuration
+
+Worker, planning, and semantic advisory calls use Mojentic's `OmlxGateway`.
+Configure the connection with environment variables:
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `OMLX_HOST` | Server URL without `/v1` | `http://localhost:8000` |
+| `OMLX_API_KEY` | Bearer token, when the server requires authentication | Unset |
+| `OMLX_TIMEOUT` | Timeout for non-streaming calls, in milliseconds | `600000` |
+
+The gateway adds `/v1` to the URL. Streaming requests have no gateway-wide
+response timeout. The harness retains authority over stream patience and stops.
+
+The default model is `Qwen3.8-27B-MLX-8bit`. Use `--model` to select another
+installed model ID from `/v1/models`. The local server advertised this default
+model with a 262144-token context window during migration.
+
+For `run` and `run-sequential`:
+
+- `--max-tokens` limits generated tokens per request, including reasoning.
+  The default is 16384. Zero is invalid. `--num-predict` remains a compatibility
+  alias; it now sets the oMLX output budget.
+- `--reasoning-effort disabled|low|medium|high` selects worker reasoning behavior.
+  Omit it to retain the model default. `disabled` sends `enable_thinking: false`.
+  Named levels pass through as `reasoning_effort`; their effect depends on the
+  model's chat template. Advisory calls retain their model defaults.
+- `--context-window-tokens` controls harness context accounting and compaction.
+  Configure the actual context limit in oMLX. The gateway does not send
+  Ollama's `num_ctx` or `num_predict` parameters.
+- Thinking-only and repair caps remain separate harness controls. The
+  `constrained-action-only` repair retry can override worker effort to `disabled`.
+
+Provider snapshots include the requested completion settings and the mapped
+oMLX controls. Run summaries use `max_tokens` in place of `num_predict`.
+The summary records the requested budget; provider snapshots record its
+resolved value. Credentials are not part of these records.
+
+Mojentic 2.1's tool-capable oMLX stream exposes content, reasoning, and tool
+calls. It does not expose token timing metrics or intermediate tool fragments.
+The harness retains its fallback patience projection and local process/GPU
+checks. Model residency remains unknown, and Ollama throughput samples are
+excluded. Performance and reasoning-level effectiveness need separate measured
+runs; this migration makes no performance claim.
+
+The dependency uses `mojentic = "2.1"`. `Cargo.lock` records the resolved release
+for reproducible builds. Run `cargo update -p mojentic` to adopt a compatible
+release, then run the checks below.
 
 ## Build and Test
 
@@ -74,7 +123,7 @@ catalog:
 cargo run -- run \
   --experiment ../Experiments/GenerationN \
   --initial-context-catalog context-catalog.json \
-  --semantic-advisor-model qwen3.6:27b-coding-mxfp8
+  --semantic-advisor-model Qwen3.8-27B-MLX-8bit
 ```
 
 Catalog records have one harness-enforced disposition:
@@ -211,7 +260,7 @@ can be compared on one pinned binary.
 
 The `constrained-action-only` variant keeps that first bounded repair request.
 If the request reaches its repair thinking cap without an action, the following
-request uses Ollama's native `think=false` control, retains the authoritative
+request uses oMLX's native `enable_thinking=false` control, retains the authoritative
 failure packet and restricted repair tools, and explicitly states that the
 interrupted hidden reasoning was not retained. The native action-only request is
 reserved for this post-validation repair boundary. Before source mutation,
@@ -219,7 +268,7 @@ ordinary reasoning and tool use remain interleaved; hidden-only no-action turns
 receive bounded continuation guidance rather than a forced native mode switch.
 The action-only provider snapshot records `reasoning_effort: disabled`,
 `thinking_disabled: true`, and the effective cap source `provider_disabled`.
-The ordinary `constrained` variant still retries with thinking enabled.
+The ordinary `constrained` variant retains the configured worker reasoning effort.
 
 Every `llm.provider_request.assembled` snapshot records the harness-side
 thinking limits that govern that request. The `harness_limits` object includes

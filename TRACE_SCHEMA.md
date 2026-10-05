@@ -47,6 +47,12 @@ has constrained the call to a final response without tools. `completion`
 captures all completion fields supplied to the gateway, including reasoning
 effort and response format.
 
+oMLX snapshots also identify `provider: "omlx"` and include `provider_controls`.
+These controls show the mapped output budget and reasoning settings. Null
+reasoning controls mean the gateway omits those parameters. The context-window
+source is `server_model_configuration`: `completion.num_ctx` is used for harness
+accounting, while oMLX controls the actual context limit. Credentials are omitted.
+
 The event is written after deterministic context and repair-depth checks and
 immediately before `complete_stream`. A rejected call therefore has a ledger
 but no provider-request snapshot. A provider call that was actually attempted

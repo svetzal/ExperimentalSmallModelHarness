@@ -11,7 +11,7 @@ use crate::trace::TraceRecorder;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use mojentic::llm::gateway::{ReasoningEffort, ResponseFormat, StreamChunk, StreamMetrics};
-use mojentic::llm::gateways::OllamaGateway;
+use mojentic::llm::gateways::OmlxGateway;
 use mojentic::llm::models::{LlmMessage, LlmToolCall, MessageRole};
 use mojentic::llm::tools::{LlmTool, ToolRunCtx};
 use mojentic::llm::{CompletionConfig, LlmGateway};
@@ -72,7 +72,8 @@ pub struct AgentRunConfig {
     pub context_window_tokens: Option<usize>,
     pub packet_type: String,
     pub expected_output_tokens: usize,
-    pub num_predict: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub max_thinking_only_tokens: usize,
     pub repair_exit_thinking_tokens: usize,
     pub repair_handoff_policy: RepairHandoffPolicy,
@@ -104,7 +105,8 @@ pub struct AgentRunSummary {
     pub context_window_tokens: Option<usize>,
     pub packet_type: String,
     pub expected_output_tokens: usize,
-    pub num_predict: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub max_thinking_only_tokens: usize,
     pub repair_exit_thinking_tokens: usize,
     pub repair_handoff_policy: RepairHandoffPolicy,
@@ -240,9 +242,9 @@ pub fn default_expected_output_tokens(packet_type: &str) -> usize {
 
 pub fn default_max_thinking_only_tokens(
     expected_output_tokens: usize,
-    num_predict: Option<usize>,
+    max_tokens: Option<usize>,
 ) -> usize {
-    num_predict
+    max_tokens
         .filter(|tokens| *tokens > 0)
         .map(|tokens| tokens.div_ceil(4).max(expected_output_tokens))
         .unwrap_or(expected_output_tokens)
@@ -253,7 +255,7 @@ pub fn default_repair_exit_thinking_tokens() -> usize {
 }
 
 pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
-    let gateway = OllamaGateway::new();
+    let gateway = OmlxGateway::new();
     let tool_root = PathBuf::from(".")
         .canonicalize()
         .context("canonicalizing harness cwd")?;
@@ -262,17 +264,19 @@ pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
 
 fn agent_completion_config(
     max_model_interactions: usize,
-    num_predict: Option<usize>,
+    max_tokens: Option<usize>,
     context_window_tokens: Option<usize>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<CompletionConfig> {
-    let num_predict = num_predict
-        .map(i32::try_from)
-        .transpose()
-        .context("num_predict exceeds i32 range")?;
+    let max_tokens = max_tokens.unwrap_or(CompletionConfig::default().max_tokens);
+    if max_tokens == 0 {
+        anyhow::bail!("max_tokens must be greater than zero");
+    }
     let mut completion_config = CompletionConfig {
         temperature: 0.2,
         max_tool_iterations: max_model_interactions,
-        num_predict,
+        max_tokens,
+        reasoning_effort,
         ..Default::default()
     };
     if let Some(context_window_tokens) = context_window_tokens {
@@ -286,6 +290,12 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     gateway: &G,
     tool_root: PathBuf,
 ) -> Result<AgentRunSummary> {
+    let completion_config = agent_completion_config(
+        config.max_model_interactions,
+        config.max_tokens,
+        config.context_window_tokens,
+        config.reasoning_effort,
+    )?;
     let experiment_dir = config
         .experiment_dir
         .canonicalize()
@@ -354,7 +364,9 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "context_window_tokens": config.context_window_tokens,
             "packet_type": config.packet_type,
             "expected_output_tokens": config.expected_output_tokens,
-            "num_predict": config.num_predict,
+            "provider": "omlx",
+            "max_tokens": config.max_tokens,
+            "reasoning_effort": config.reasoning_effort,
             "max_thinking_only_tokens": config.max_thinking_only_tokens,
             "repair_exit_thinking_tokens": config.repair_exit_thinking_tokens,
             "repair_handoff_policy": config.repair_handoff_policy,
@@ -609,11 +621,6 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         LlmMessage::system(system_prompt),
         LlmMessage::user(worker_message),
     ];
-    let completion_config = agent_completion_config(
-        config.max_model_interactions,
-        config.num_predict,
-        config.context_window_tokens,
-    )?;
 
     let mut final_summary = String::new();
     let mut final_response_only_next_turn = false;
@@ -1322,7 +1329,8 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         context_window_tokens: config.context_window_tokens,
         packet_type: config.packet_type,
         expected_output_tokens: config.expected_output_tokens,
-        num_predict: config.num_predict,
+        max_tokens: config.max_tokens,
+        reasoning_effort: config.reasoning_effort,
         max_thinking_only_tokens: config.max_thinking_only_tokens,
         repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
         repair_handoff_policy: config.repair_handoff_policy,
@@ -3115,6 +3123,13 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
         crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
         serde_json::json!({
             "schema_version": "provider_request.v1",
+            "provider": "omlx",
+            "provider_controls": {
+                "max_tokens": completion_config.max_tokens,
+                "enable_thinking": (completion_config.reasoning_effort == Some(ReasoningEffort::Disabled)).then_some(false),
+                "reasoning_effort": completion_config.reasoning_effort.filter(|effort| *effort != ReasoningEffort::Disabled),
+                "context_window_source": "server_model_configuration",
+            },
             "turn": turn,
             "llm_call_depth": llm_call_depth,
             "model": model,
@@ -4606,9 +4621,17 @@ fn progress_status_interval() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_PROGRESS_STATUS_INTERVAL_SECONDS))
 }
 
-async fn sample_runner_activity(model: &str) -> RunnerActivitySample {
-    let mut sample = sample_ollama_activity(model).await;
-    sample.process_active = sample_process_active().await;
+async fn sample_runner_activity(_model: &str) -> RunnerActivitySample {
+    let mut sample = RunnerActivitySample {
+        source: "omlx process".to_string(),
+        process_active: sample_process_active().await,
+        model_loaded: None,
+        accelerator_resident: None,
+        accelerator_label: None,
+        gpu_utilization_percent: None,
+        raw_summary: None,
+        error: None,
+    };
     if sample.gpu_utilization_percent.is_none() {
         if let Some(utilization) = sample_nvidia_gpu_utilization().await {
             sample.source.push_str("+nvidia-smi");
@@ -4627,36 +4650,8 @@ async fn sample_runner_activity(model: &str) -> RunnerActivitySample {
     sample
 }
 
-async fn sample_ollama_activity(model: &str) -> RunnerActivitySample {
-    match command_output("ollama", &["ps"]).await {
-        Ok(output) => {
-            let parsed = parse_ollama_ps(model, &output);
-            RunnerActivitySample {
-                source: "ollama ps".to_string(),
-                process_active: None,
-                model_loaded: Some(parsed.model_loaded),
-                accelerator_resident: parsed.accelerator_resident,
-                accelerator_label: parsed.accelerator_label,
-                gpu_utilization_percent: None,
-                raw_summary: parsed.raw_summary,
-                error: None,
-            }
-        }
-        Err(error) => RunnerActivitySample {
-            source: "ollama ps".to_string(),
-            process_active: None,
-            model_loaded: None,
-            accelerator_resident: None,
-            accelerator_label: None,
-            gpu_utilization_percent: None,
-            raw_summary: None,
-            error: Some(error),
-        },
-    }
-}
-
 async fn sample_process_active() -> Option<bool> {
-    command_output("pgrep", &["-fl", "ollama"])
+    command_output("pgrep", &["-fl", "omlx"])
         .await
         .ok()
         .map(|output| !output.trim().is_empty())
@@ -4728,58 +4723,6 @@ async fn command_output_with_timeout(
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err(format!("{program} timed out after {timeout_seconds}s")),
     }
-}
-
-#[derive(Debug, Clone)]
-struct ParsedOllamaPs {
-    model_loaded: bool,
-    accelerator_resident: Option<bool>,
-    accelerator_label: Option<String>,
-    raw_summary: Option<String>,
-}
-
-fn parse_ollama_ps(model: &str, output: &str) -> ParsedOllamaPs {
-    let model_line = output.lines().find(|line| {
-        line.split_whitespace()
-            .next()
-            .is_some_and(|name| name == model || name.starts_with(model))
-    });
-    let Some(line) = model_line else {
-        return ParsedOllamaPs {
-            model_loaded: false,
-            accelerator_resident: Some(false),
-            accelerator_label: None,
-            raw_summary: None,
-        };
-    };
-
-    let uppercase = line.to_ascii_uppercase();
-    let accelerator_resident = Some(uppercase.contains("GPU") || uppercase.contains("NPU"));
-    ParsedOllamaPs {
-        model_loaded: true,
-        accelerator_resident,
-        accelerator_label: processor_label_from_ollama_line(line),
-        raw_summary: Some(line.to_string()),
-    }
-}
-
-fn processor_label_from_ollama_line(line: &str) -> Option<String> {
-    let uppercase = line.to_ascii_uppercase();
-    if uppercase.contains("GPU") || uppercase.contains("NPU") {
-        return line
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .windows(2)
-            .find(|window| {
-                window[0].ends_with('%')
-                    && matches!(window[1].to_ascii_uppercase().as_str(), "GPU" | "NPU")
-            })
-            .map(|window| format!("{} {}", window[0], window[1]));
-    }
-    if uppercase.contains("CPU") {
-        return Some("CPU".to_string());
-    }
-    None
 }
 
 fn parse_first_percent_for_keyword(output: &str, keyword: &str) -> Option<f64> {
@@ -4887,7 +4830,7 @@ fn load_matching_throughput_samples(
         .filter_map(|line| serde_json::from_str::<ThroughputSample>(line).ok())
         .filter(|sample| {
             sample.model == model
-                && sample.provider == "ollama"
+                && sample.provider == "omlx"
                 && sample.host_signature == host_signature
                 && sample.context_band == context_band
         })
@@ -7953,18 +7896,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_ollama_gpu_residency() {
-        let parsed = parse_ollama_ps(
-            "qwen3.6:27b-coding-mxfp8",
-            "NAME ID SIZE PROCESSOR UNTIL\nqwen3.6:27b-coding-mxfp8 abc 27 GB 100% GPU 4 minutes from now\n",
-        );
-
-        assert!(parsed.model_loaded);
-        assert_eq!(parsed.accelerator_resident, Some(true));
-        assert_eq!(parsed.accelerator_label.as_deref(), Some("100% GPU"));
-    }
-
-    #[test]
     fn parses_macmon_gpu_usage_fraction_as_percent() {
         let output = r#"{"gpu_usage":[338,0.08696959912776947],"gpu_power":0.4}"#;
 
@@ -7983,21 +7914,29 @@ mod tests {
     }
 
     #[test]
-    fn agent_completion_config_preserves_provider_default_when_context_is_omitted() {
+    fn agent_completion_config_defaults_to_bounded_output_and_model_reasoning() {
         let provider_default = CompletionConfig::default().num_ctx;
 
-        let config = agent_completion_config(7, None, None).unwrap();
+        let config = agent_completion_config(7, None, None, None).unwrap();
 
         assert_eq!(config.num_ctx, provider_default);
         assert_eq!(config.max_tool_iterations, 7);
+        assert_eq!(config.max_tokens, 16_384);
+        assert!(config.num_predict.is_none());
+        assert!(config.reasoning_effort.is_none());
+        assert!(agent_completion_config(7, Some(0), None, None).is_err());
     }
 
     #[test]
-    fn agent_completion_config_applies_the_configured_provider_context() {
-        let config = agent_completion_config(7, Some(16_384), Some(131_072)).unwrap();
+    fn agent_completion_config_applies_context_accounting_and_worker_controls() {
+        let config =
+            agent_completion_config(7, Some(16_384), Some(131_072), Some(ReasoningEffort::Low))
+                .unwrap();
 
         assert_eq!(config.num_ctx, 131_072);
-        assert_eq!(config.num_predict, Some(16_384));
+        assert_eq!(config.max_tokens, 16_384);
+        assert!(config.num_predict.is_none());
+        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::Low));
     }
 
     #[tokio::test]
@@ -8543,7 +8482,8 @@ mod tests {
             context_window_tokens: Some(131_072),
             packet_type: "multi-file-patch".to_string(),
             expected_output_tokens: 4_096,
-            num_predict: None,
+            max_tokens: None,
+            reasoning_effort: None,
             max_thinking_only_tokens: 4_096,
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -10004,7 +9944,8 @@ mod tests {
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
-                    num_predict: None,
+                    max_tokens: None,
+                    reasoning_effort: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -10040,7 +9981,8 @@ mod tests {
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
-                    num_predict: None,
+                    max_tokens: None,
+                    reasoning_effort: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -10076,7 +10018,8 @@ mod tests {
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
-                    num_predict: None,
+                    max_tokens: None,
+                    reasoning_effort: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -10137,7 +10080,8 @@ mod tests {
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
-                    num_predict: None,
+                    max_tokens: None,
+                    reasoning_effort: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens,
                     repair_handoff_policy,
@@ -10172,7 +10116,8 @@ mod tests {
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
-                    num_predict: None,
+                    max_tokens: None,
+                    reasoning_effort: None,
                     max_thinking_only_tokens: usize::MAX,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -10207,7 +10152,8 @@ mod tests {
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
-                    num_predict: None,
+                    max_tokens: None,
+                    reasoning_effort: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::ConstrainedActionOnly,
@@ -10238,7 +10184,8 @@ mod tests {
                     context_window_tokens: Some(131_072),
                     packet_type: "narrow-patch".to_string(),
                     expected_output_tokens: 2_048,
-                    num_predict: None,
+                    max_tokens: None,
+                    reasoning_effort: None,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -10390,6 +10337,7 @@ mod tests {
                 .pop_front()
                 .expect("unexpected structured-output call");
             Ok(LlmGatewayResponse {
+                evidence: Default::default(),
                 content: Some(serde_json::to_string(&proposal).unwrap()),
                 object: None,
                 tool_calls: Vec::new(),

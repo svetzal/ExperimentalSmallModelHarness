@@ -11,7 +11,7 @@ use crate::semantic_advisory::{
 use crate::trace::TraceRecorder;
 use anyhow::{Result, anyhow, bail};
 use mojentic::llm::LlmGateway;
-use mojentic::llm::gateways::OllamaGateway;
+use mojentic::llm::gateways::OmlxGateway;
 use mojentic::llm::models::LlmMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -88,7 +88,7 @@ pub async fn plan_acceptance(
     max_items: usize,
     max_output_tokens: usize,
 ) -> Result<AcceptancePlanningSummary> {
-    let gateway = OllamaGateway::new();
+    let gateway = OmlxGateway::new();
     plan_acceptance_with_gateway(
         &gateway,
         model,
@@ -481,6 +481,7 @@ mod tests {
                 .pop_front()
                 .expect("scripted planning proposal");
             Ok(LlmGatewayResponse {
+                evidence: Default::default(),
                 content: Some(serde_json::to_string(&proposal).unwrap()),
                 object: None,
                 tool_calls: Vec::new(),

@@ -128,13 +128,10 @@ pub async fn request_semantic_advisory<G: LlmGateway + ?Sized>(
         }),
     )?;
 
-    let num_predict = i32::try_from(request.max_output_tokens)
-        .context("semantic advisory max_output_tokens exceeds i32 range")?;
     let started = Instant::now();
     let completion_config = CompletionConfig {
         temperature: request.temperature,
         max_tokens: request.max_output_tokens,
-        num_predict: Some(num_predict),
         max_tool_iterations: 0,
         response_format: Some(ResponseFormat::JsonObject {
             schema: Some(request.response_schema.clone()),
