@@ -348,3 +348,37 @@ management files or unrelated repository context.
 ## License
 
 Licensed under the MIT License. See [`LICENSE`](LICENSE).
+
+## Controlled provider diagnostics
+
+The `provider_benchmark` example exercises both Mojentic gateways without the
+adaptive coding policy. It provides a long-prefix reuse probe and a sequential
+receipt-tool session. It saves exact requests, per-call timings and native
+Harness traces. Reasoning is disabled and each response is capped at 128 tokens.
+
+Build with `cargo build --release --locked --example provider_benchmark`, then
+run `target/release/examples/provider_benchmark CONFIG.json` under the workspace
+memory/ownership guard. Example configuration:
+
+```json
+{
+  "provider": "omlx",
+  "model": "Qwen3.8-27B-MLX-8bit",
+  "workload": "tool_chain",
+  "nonce": "unique-session-id",
+  "output": "/absolute/path/to/new-output-directory",
+  "prefix_lines": 256,
+  "rounds": 24
+}
+```
+
+Use `prefix` for unchanged, suffix-changed and early-changed prefix probes.
+Use `ollama` with its model ID to select the other gateway. Host/authentication
+settings come from the gateways' environment variables. The output directory
+must not already exist. The receipt tool has no shell or file access.
+
+Generation38 contains the guarded orchestration, raw capture, mock wire tests
+and analysis. Cache counters have provider-specific meanings; gateway action
+latency is not automatically server prefill time. Unload between sessions does
+not clear persistent caches. A semantic failure is recorded in result.json;
+process success alone does not mean the task passed.
