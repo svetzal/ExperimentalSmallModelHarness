@@ -11,7 +11,7 @@ use crate::trace::TraceRecorder;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use mojentic::llm::gateway::{ReasoningEffort, ResponseFormat, StreamChunk, StreamMetrics};
-use mojentic::llm::gateways::OmlxGateway;
+use mojentic::llm::gateways::{OllamaGateway, OmlxGateway};
 use mojentic::llm::models::{LlmMessage, LlmToolCall, MessageRole};
 use mojentic::llm::tools::{LlmTool, ToolRunCtx};
 use mojentic::llm::{CompletionConfig, LlmGateway};
@@ -58,8 +58,34 @@ const RESPONSE_TOOL_CALL_ARGUMENT_MAX_CHARS: usize = 4_096;
 const ACCEPTANCE_LEDGER_ADVISORY_OUTPUT_TOKENS: usize = 4_096;
 const REASONING_CHECKPOINT_PREFIX: &str = "[harness-reasoning-checkpoint]";
 
+/// Local provider selection; model capabilities remain explicit in Mojentic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Omlx,
+    Ollama,
+}
+
+impl Provider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Omlx => "omlx",
+            Self::Ollama => "ollama",
+        }
+    }
+
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::Omlx => "Qwen3.8-27B-MLX-8bit",
+            Self::Ollama => "qwen3.8:27b-mxfp8",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
+    pub provider: Provider,
     pub experiment_dir: PathBuf,
     /// Optional trace destination outside the tool-visible experiment root.
     /// Defaults to `<experiment_dir>/traces` for backward compatibility.
@@ -97,6 +123,7 @@ pub struct AgentRunConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentRunSummary {
+    pub provider: Provider,
     pub experiment_dir: PathBuf,
     pub tool_root: PathBuf,
     pub goal_file: PathBuf,
@@ -259,11 +286,14 @@ pub fn default_repair_exit_thinking_tokens() -> usize {
 }
 
 pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
-    let gateway = OmlxGateway::new();
+    let gateway: Box<dyn LlmGateway> = match config.provider {
+        Provider::Omlx => Box::new(OmlxGateway::new()),
+        Provider::Ollama => Box::new(OllamaGateway::new()),
+    };
     let tool_root = PathBuf::from(".")
         .canonicalize()
         .context("canonicalizing harness cwd")?;
-    run_agent_with_gateway(config, &gateway, tool_root).await
+    run_agent_with_gateway(config, gateway.as_ref(), tool_root).await
 }
 
 fn agent_completion_config(
@@ -371,7 +401,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "context_window_tokens": config.context_window_tokens,
             "packet_type": config.packet_type,
             "expected_output_tokens": config.expected_output_tokens,
-            "provider": "omlx",
+            "provider": config.provider,
             "max_tokens": config.max_tokens,
             "reasoning_effort": config.reasoning_effort,
             "reasoning_profile": config.reasoning_profile,
@@ -713,6 +743,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             }),
         )?;
         let turn_result = match stream_response(StreamResponseRequest {
+            provider: config.provider,
             gateway,
             model: &config.model,
             messages: &messages,
@@ -1321,6 +1352,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     scope.observe_runtime(crate::runtime::RuntimeEvent::RunFinished);
 
     let summary = AgentRunSummary {
+        provider: config.provider,
         experiment_dir,
         tool_root,
         goal_file,
@@ -1863,6 +1895,7 @@ fn canonicalize_goal(experiment_dir: &Path, goal_file: &Path) -> Result<PathBuf>
 }
 
 struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
+    provider: Provider,
     gateway: &'a G,
     model: &'a str,
     messages: &'a [LlmMessage],
@@ -1983,6 +2016,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
     request: StreamResponseRequest<'_, G>,
 ) -> Result<StreamResponseResult> {
     let StreamResponseRequest {
+        provider,
         gateway,
         model,
         messages,
@@ -2101,6 +2135,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         }
         let projection = progress_projection_override.clone().unwrap_or_else(|| {
             model_progress_projection(
+                provider,
                 model,
                 expected_output_tokens,
                 ledger.pressure_band,
@@ -2156,6 +2191,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             automatic_interrupt: false,
         })?;
         trace_provider_request(ProviderRequestTraceInput {
+            provider,
             trace,
             model,
             turn,
@@ -2186,7 +2222,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     let runner_activity = if let Some(sample) = &runner_activity_override {
                         sample.clone()
                     } else {
-                        sample_runner_activity(model).await
+                        sample_runner_activity(provider).await
                     };
                     latest_progress_state = classify_model_progress(
                         latest_progress_state,
@@ -3096,6 +3132,7 @@ struct ContextAssemblyInput<'a> {
 }
 
 struct ProviderRequestTraceInput<'a> {
+    provider: Provider,
     trace: &'a TraceRecorder,
     model: &'a str,
     turn: usize,
@@ -3110,6 +3147,7 @@ struct ProviderRequestTraceInput<'a> {
 
 fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
     let ProviderRequestTraceInput {
+        provider,
         trace,
         model,
         turn,
@@ -3146,17 +3184,33 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
         crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
         serde_json::json!({
             "schema_version": "provider_request.v1",
-            "provider": "omlx",
-            "provider_controls": {
-                "max_tokens": completion_config.max_tokens,
-                "enable_thinking": match completion_config.reasoning_effort {
-                    Some(ReasoningEffort::Disabled) => Some(false),
-                    Some(ReasoningEffort::Enabled) => Some(true),
-                    _ => None,
-                },
-                "reasoning_effort": completion_config.reasoning_effort.filter(|effort| !matches!(effort, ReasoningEffort::Disabled | ReasoningEffort::Enabled)),
-                "chat_template_kwargs": completion_config.preserve_reasoning.then(|| serde_json::json!({"preserve_thinking": true})),
-                "context_window_source": "server_model_configuration",
+            "provider": provider,
+            "provider_controls": match provider {
+                Provider::Omlx => serde_json::json!({
+                    "max_tokens": completion_config.max_tokens,
+                    "enable_thinking": match completion_config.reasoning_effort {
+                        Some(ReasoningEffort::Disabled) => Some(false),
+                        Some(ReasoningEffort::Enabled) => Some(true),
+                        _ => None,
+                    },
+                    "reasoning_effort": completion_config.reasoning_effort.filter(|effort| !matches!(effort, ReasoningEffort::Disabled | ReasoningEffort::Enabled)),
+                    "chat_template_kwargs": completion_config.preserve_reasoning.then(|| serde_json::json!({"preserve_thinking": true})),
+                    "context_window_source": "server_model_configuration",
+                }),
+                Provider::Ollama => serde_json::json!({
+                    "num_predict": match completion_config.num_predict {
+                        Some(n) if n > 0 => serde_json::json!(n),
+                        None => serde_json::json!(completion_config.max_tokens),
+                        _ => serde_json::Value::Null,
+                    },
+                    "num_ctx": completion_config.num_ctx,
+                    "think": match completion_config.reasoning_effort {
+                        Some(ReasoningEffort::Disabled) => serde_json::json!(false),
+                        Some(ReasoningEffort::Enabled) => serde_json::json!(true),
+                        effort => serde_json::json!(effort),
+                    },
+                    "context_window_source": "request_options",
+                }),
             },
             "turn": turn,
             "llm_call_depth": llm_call_depth,
@@ -3270,12 +3324,14 @@ fn context_assembly_ledger(input: ContextAssemblyInput<'_>) -> ContextAssemblyLe
 }
 
 fn model_progress_projection(
+    provider: Provider,
     model: &str,
     expected_output_tokens: usize,
     context_band: &str,
     throughput_registry_path: &Path,
 ) -> ModelProgressProjection {
-    let samples = load_matching_throughput_samples(throughput_registry_path, model, context_band);
+    let samples =
+        load_matching_throughput_samples(throughput_registry_path, provider, model, context_band);
     let conservative_tokens_per_second = percentile(
         samples
             .iter()
@@ -4664,10 +4720,10 @@ fn progress_status_interval() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_PROGRESS_STATUS_INTERVAL_SECONDS))
 }
 
-async fn sample_runner_activity(_model: &str) -> RunnerActivitySample {
+async fn sample_runner_activity(provider: Provider) -> RunnerActivitySample {
     let mut sample = RunnerActivitySample {
-        source: "omlx process".to_string(),
-        process_active: sample_process_active().await,
+        source: format!("{} process", provider.as_str()),
+        process_active: sample_process_active(provider).await,
         model_loaded: None,
         accelerator_resident: None,
         accelerator_label: None,
@@ -4693,11 +4749,20 @@ async fn sample_runner_activity(_model: &str) -> RunnerActivitySample {
     sample
 }
 
-async fn sample_process_active() -> Option<bool> {
-    command_output("pgrep", &["-fl", "omlx"])
-        .await
-        .ok()
-        .map(|output| !output.trim().is_empty())
+async fn sample_process_active(provider: Provider) -> Option<bool> {
+    command_output(
+        "pgrep",
+        &[
+            "-fl",
+            match provider {
+                Provider::Omlx => "omlx",
+                Provider::Ollama => "ollama runner",
+            },
+        ],
+    )
+    .await
+    .ok()
+    .map(|output| !output.trim().is_empty())
 }
 
 async fn sample_nvidia_gpu_utilization() -> Option<f64> {
@@ -4861,6 +4926,7 @@ fn append_throughput_sample(path: &Path, sample: &ThroughputSample) -> Result<()
 
 fn load_matching_throughput_samples(
     path: &Path,
+    provider: Provider,
     model: &str,
     context_band: &str,
 ) -> Vec<ThroughputSample> {
@@ -4873,7 +4939,7 @@ fn load_matching_throughput_samples(
         .filter_map(|line| serde_json::from_str::<ThroughputSample>(line).ok())
         .filter(|sample| {
             sample.model == model
-                && sample.provider == "omlx"
+                && sample.provider == provider.as_str()
                 && sample.host_signature == host_signature
                 && sample.context_band == context_band
         })
@@ -5769,6 +5835,36 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn throughput_lookup_isolates_providers_even_for_the_same_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("throughput.jsonl");
+        for (provider, speed) in [("omlx", 10.0), ("ollama", 20.0)] {
+            let sample = ThroughputSample {
+                timestamp: chrono::Utc::now(),
+                model: "same-model".into(),
+                provider: provider.into(),
+                host_signature: host_signature(),
+                context_band: "green".into(),
+                packet_type: "narrow-patch".into(),
+                expected_output_tokens: 128,
+                turn: 1,
+                llm_call_depth: 1,
+                prompt_eval_count: None,
+                prompt_eval_duration_ns: None,
+                eval_count: 20,
+                eval_duration_ns: 1_000_000_000,
+                tokens_per_second: speed,
+            };
+            append_throughput_sample(&path, &sample).unwrap();
+        }
+        for (provider, speed) in [(Provider::Omlx, 10.0), (Provider::Ollama, 20.0)] {
+            let samples = load_matching_throughput_samples(&path, provider, "same-model", "green");
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].tokens_per_second, speed);
+        }
+    }
 
     #[test]
     fn estimates_tokens_with_ceil_division() {
@@ -6827,6 +6923,7 @@ mod tests {
             .event("llm.context_assembly.ledger", &baseline_ledger)
             .unwrap();
         trace_provider_request(ProviderRequestTraceInput {
+            provider: Provider::Omlx,
             trace: &replay_trace,
             model: "deterministic-context-replay",
             turn: 1,
@@ -6858,6 +6955,7 @@ mod tests {
             .event("llm.context_assembly.ledger", &retained_ledger)
             .unwrap();
         trace_provider_request(ProviderRequestTraceInput {
+            provider: Provider::Omlx,
             trace: &replay_trace,
             model: "deterministic-context-replay",
             turn: 1,
@@ -7382,6 +7480,7 @@ mod tests {
             ..Default::default()
         };
         let error = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &NeverYieldGateway,
             model: "fake-stalled-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7453,6 +7552,7 @@ mod tests {
         ]);
 
         let error = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7504,6 +7604,7 @@ mod tests {
         ))]]);
 
         let error = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7550,6 +7651,7 @@ mod tests {
         )]]);
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7604,6 +7706,7 @@ mod tests {
         ]]);
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7661,6 +7764,7 @@ mod tests {
         ]]);
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7709,6 +7813,7 @@ mod tests {
         )]]);
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7775,6 +7880,7 @@ mod tests {
         let gateway = ScriptedGateway::new(vec![progress_frames]);
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7833,6 +7939,7 @@ mod tests {
         );
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7890,6 +7997,7 @@ mod tests {
         )]]);
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -7950,6 +8058,7 @@ mod tests {
         ]);
 
         let error = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &[LlmMessage::system("system"), LlmMessage::user("task")],
@@ -8051,6 +8160,7 @@ mod tests {
         };
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &messages,
@@ -8138,6 +8248,7 @@ mod tests {
         let messages = vec![LlmMessage::system("system"), LlmMessage::user("task")];
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &messages,
@@ -8192,6 +8303,7 @@ mod tests {
         let messages = vec![LlmMessage::system("system"), LlmMessage::user("task")];
 
         let result = stream_response(StreamResponseRequest {
+            provider: Provider::Omlx,
             gateway: &gateway,
             model: "fake-model",
             messages: &messages,
@@ -8570,6 +8682,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
         let config = AgentRunConfig {
+            provider: Provider::Omlx,
             experiment_dir: temp.path().join("experiment"),
             trace_dir: None,
             goal_file: PathBuf::from("task.md"),
@@ -10034,6 +10147,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
                     goal_file: PathBuf::from("task.md"),
@@ -10073,6 +10187,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
                     goal_file: PathBuf::from("task.md"),
@@ -10112,6 +10227,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir,
                     goal_file: PathBuf::from("task.md"),
@@ -10176,6 +10292,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
                     goal_file: PathBuf::from("task.md"),
@@ -10214,6 +10331,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
                     goal_file: PathBuf::from("task.md"),
@@ -10252,6 +10370,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
                     goal_file: PathBuf::from("task.md"),
@@ -10286,6 +10405,7 @@ mod tests {
         async fn run_with_initial_context(&self, gateway: &ScriptedGateway) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
                     goal_file: PathBuf::from("task.md"),

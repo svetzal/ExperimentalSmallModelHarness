@@ -31,16 +31,19 @@ interfaces may change as experiments reveal better boundaries.
 ## Requirements
 
 - Rust with Cargo and support for the 2024 edition
-- An oMLX server with a Qwen model installed
-- Network access for Cargo to fetch Mojentic 2.1 from crates.io
+- An oMLX or Ollama server with a Qwen model installed
+- Network access for Cargo to fetch the Git-pinned Mojentic prototype
 
-## oMLX configuration
+## Provider configuration
 
-Worker, planning, and semantic advisory calls use Mojentic's `OmlxGateway`.
-Configure the connection with environment variables:
+`run` and `run-sequential` accept `--provider omlx|ollama` (default: omlx).
+The selected gateway handles the worker and its in-run semantic advisories.
+Standalone planning commands still use oMLX. Configure connections with
+environment variables:
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
+| `OLLAMA_HOST` | Ollama server URL | `http://localhost:11434` |
 | `OMLX_HOST` | Server URL without `/v1` | `http://localhost:8000` |
 | `OMLX_API_KEY` | Bearer token, when the server requires authentication | Unset |
 | `OMLX_TIMEOUT` | Timeout for non-streaming calls, in milliseconds | `600000` |
@@ -48,7 +51,8 @@ Configure the connection with environment variables:
 The gateway adds `/v1` to the URL. Streaming requests have no gateway-wide
 response timeout. The harness retains authority over stream patience and stops.
 
-The default model is `Qwen3.8-27B-MLX-8bit`. Use `--model` to select another
+The default model is `Qwen3.8-27B-MLX-8bit` for oMLX or
+`qwen3.8:27b-mxfp8` for Ollama. Use `--model` to select another
 installed model ID from `/v1/models`. The local server advertised this default
 model with a 262144-token context window during migration.
 
@@ -56,28 +60,31 @@ For `run` and `run-sequential`:
 
 - `--max-tokens` limits generated tokens per request, including reasoning.
   The default is 16384. Zero is invalid. `--num-predict` remains a compatibility
-  alias; it now sets the oMLX output budget.
+  alias. The budget maps to oMLX `max_tokens` or Ollama `options.num_predict`.
 - `--reasoning-effort disabled|enabled|low|medium|high|xhigh` selects worker
   reasoning behavior.
-  Omit it to retain the model default. `disabled` sends `enable_thinking: false`.
-  Named levels pass through as `reasoning_effort`; their effect depends on the
+  Omit it to retain the model default. On oMLX, `disabled` sends
+  `enable_thinking: false` and named levels use `reasoning_effort`. On Ollama,
+  disabled/enabled send boolean `think` and named levels send string `think`.
+  Their effect depends on the
   model's chat template. Advisory calls retain their model defaults.
 - `--context-window-tokens` controls harness context accounting and compaction.
-  Configure the actual context limit in oMLX. The gateway does not send
-  Ollama's `num_ctx` or `num_predict` parameters.
+  Ollama also receives `options.num_ctx`. Configure the actual oMLX limit on
+  the server; its gateway does not send Ollama-specific parameters.
 - Thinking-only and repair caps remain separate harness controls. The
   `constrained-action-only` repair retry can override worker effort to `disabled`.
 
 Provider snapshots include the requested completion settings and the mapped
-oMLX controls. Run summaries use `max_tokens` in place of `num_predict`.
+provider controls. Run summaries use `max_tokens` in place of `num_predict`.
 The summary records the requested budget; provider snapshots record its
 resolved value. Credentials are not part of these records.
 
 Mojentic 2.1's tool-capable oMLX stream exposes content, reasoning, and tool
 calls. It does not expose token timing metrics or intermediate tool fragments.
 The harness retains its fallback patience projection and local process/GPU
-checks. Model residency remains unknown, and Ollama throughput samples are
-excluded. Performance and reasoning-level effectiveness need separate measured
+checks. Model residency remains unknown. Throughput history is filtered by
+selected provider, model, host and context band; runner checks use that provider.
+Performance and reasoning-level effectiveness need separate measured
 runs; this migration makes no performance claim.
 
 ### Native reasoning prototype
@@ -291,7 +298,8 @@ can be compared on one pinned binary.
 
 The `constrained-action-only` variant keeps that first bounded repair request.
 If the request reaches its repair thinking cap without an action, the following
-request uses oMLX's native `enable_thinking=false` control, retains the authoritative
+request uses native `enable_thinking=false` (oMLX) or `think=false` (Ollama),
+retains the authoritative
 failure packet and restricted repair tools, and explicitly states that the
 interrupted hidden reasoning was not retained. The native action-only request is
 reserved for this post-validation repair boundary. Before source mutation,

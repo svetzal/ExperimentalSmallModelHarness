@@ -124,6 +124,7 @@ fn run_cli_options(
     command
         .current_dir(&workspace)
         .env("OMLX_HOST", host)
+        .env("OLLAMA_HOST", host)
         .env("OMLX_API_KEY", "test-key")
         .args(["run", "--experiment"])
         .arg(temp.path())
@@ -139,7 +140,13 @@ fn run_cli_options(
         String::from_utf8_lossy(&output.stderr)
     );
     let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(summary["final_summary"], "DONE");
+    assert!(
+        summary["final_summary"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|line| line.trim() == "DONE")
+    );
     (temp, summary)
 }
 
@@ -438,4 +445,76 @@ fn qwen_profile_rejects_high_before_connecting() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported by profile qwen3.8"));
+}
+
+#[test]
+fn ollama_worker_preserves_native_reasoning_and_records_provider_controls() {
+    for preserve in [false, true] {
+        let reply = |message: Value| {
+            format!(
+                "{}\n{}\n",
+                json!({"message": message, "done": false}),
+                json!({"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"})
+            )
+        };
+        let (host, server) = mock_provider_server(
+            vec![
+                reply(
+                    json!({"role":"assistant","content":"Inspecting.","thinking":"NATIVE_SENTINEL","tool_calls":[{"function":{"name":"list_tree","arguments":{}}}]}),
+                ),
+                reply(json!({"role":"assistant","content":"DONE"})),
+            ],
+            "/api/chat",
+            false,
+        );
+        let mut options = vec!["--provider", "ollama", "--reasoning-profile", "qwen3.8"];
+        if preserve {
+            options.push("--preserve-reasoning");
+        }
+        let (_temp, summary) = run_cli_options(&host, Some("medium"), "--max-tokens", &options);
+        let requests = server.join().unwrap();
+        assert_eq!(summary["provider"], "ollama");
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(request["model"], "qwen3.8:27b-mxfp8");
+            assert_eq!(request["think"], "medium");
+            assert_eq!(request["options"]["num_predict"], 8192);
+            assert_eq!(request["options"]["num_ctx"], 262144);
+            assert!(request.get("enable_thinking").is_none());
+        }
+        let assistants: Vec<_> = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .collect();
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(
+            assistants[0]["thinking"],
+            if preserve {
+                json!("NATIVE_SENTINEL")
+            } else {
+                Value::Null
+            }
+        );
+        let events: Vec<Value> = std::fs::read_to_string(summary["trace_file"].as_str().unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let snapshots: Vec<_> = events
+            .iter()
+            .filter(|e| e["kind"] == "llm.provider_request.assembled")
+            .collect();
+        assert_eq!(snapshots.len(), 2);
+        for snapshot in snapshots {
+            assert_eq!(snapshot["payload"]["provider"], "ollama");
+            assert_eq!(snapshot["payload"]["provider_controls"]["think"], "medium");
+            assert_eq!(
+                snapshot["payload"]["provider_controls"]["num_predict"],
+                8192
+            );
+            assert_eq!(snapshot["payload"]["provider_controls"]["num_ctx"], 262144);
+        }
+    }
 }

@@ -6,8 +6,9 @@ use crate::acceptance_plan::{
     AcceptancePlan, DEFAULT_MAX_PLAN_ITEMS, DEFAULT_MAX_PLAN_OUTPUT_TOKENS, plan_acceptance,
 };
 use crate::agent::{
-    AgentRunConfig, RepairHandoffPolicy, TranscriptPolicy, default_expected_output_tokens,
-    default_max_thinking_only_tokens, default_repair_exit_thinking_tokens, run_agent,
+    AgentRunConfig, Provider, RepairHandoffPolicy, TranscriptPolicy,
+    default_expected_output_tokens, default_max_thinking_only_tokens,
+    default_repair_exit_thinking_tokens, run_agent,
 };
 use crate::baseline::{load_matrix_baseline, summarize_matrix};
 use crate::contract::{Budgets, ContractSource, resolve_contract};
@@ -22,7 +23,7 @@ const DEFAULT_MODEL: &str = "Qwen3.8-27B-MLX-8bit";
 
 fn model_context_window_tokens(model: &str) -> Option<usize> {
     match model {
-        DEFAULT_MODEL => Some(262_144),
+        DEFAULT_MODEL | "qwen3.8:27b-mxfp8" => Some(262_144),
         _ => None,
     }
 }
@@ -69,9 +70,13 @@ struct RunArgs {
     #[arg(long)]
     contract: Option<PathBuf>,
 
-    /// oMLX model ID from /v1/models.
-    #[arg(long, default_value = DEFAULT_MODEL)]
-    model: String,
+    /// Local inference provider. Uses OMLX_HOST or OLLAMA_HOST.
+    #[arg(long, value_enum, default_value = "omlx")]
+    provider: Provider,
+
+    /// Provider model ID. Defaults to Qwen3.8-27B-MLX-8bit (oMLX) or qwen3.8:27b-mxfp8 (Ollama).
+    #[arg(long)]
+    model: Option<String>,
 
     /// Maximum Mojentic iterative-solver turns.
     #[arg(long, default_value_t = 10)]
@@ -81,7 +86,7 @@ struct RunArgs {
     #[arg(long, alias = "max-tool-iterations", default_value_t = 75)]
     max_model_interactions: usize,
 
-    /// Context window used for harness accounting; configure the actual limit in oMLX.
+    /// Context window for harness accounting and Ollama num_ctx; configure the actual oMLX limit on the server.
     /// Defaults to 262144 for Qwen3.8-27B-MLX-8bit and Mojentic accounting otherwise.
     #[arg(long)]
     context_window_tokens: Option<usize>,
@@ -186,15 +191,19 @@ impl RunArgs {
                     self.repair_handoff_policy
                 )
             })?;
+        let model = self
+            .model
+            .unwrap_or_else(|| self.provider.default_model().to_string());
         let context_window_tokens = self
             .context_window_tokens
-            .or_else(|| model_context_window_tokens(&self.model));
+            .or_else(|| model_context_window_tokens(&model));
         Ok(AgentRunConfig {
+            provider: self.provider,
             experiment_dir: self.experiment,
             trace_dir: self.trace_dir,
             goal_file: self.goal,
             contract_file: self.contract,
-            model: self.model,
+            model,
             max_iterations: self.max_iterations,
             max_model_interactions: self.max_model_interactions,
             context_window_tokens,
@@ -223,6 +232,53 @@ impl RunArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_defaults_and_explicit_model_are_resolved_together() {
+        for (provider, model) in [
+            ("omlx", "Qwen3.8-27B-MLX-8bit"),
+            ("ollama", "qwen3.8:27b-mxfp8"),
+        ] {
+            for override_model in [None, Some("custom-model")] {
+                let mut args = vec![
+                    "harness",
+                    "run",
+                    "--experiment",
+                    ".",
+                    "--provider",
+                    provider,
+                ];
+                if let Some(name) = override_model {
+                    args.extend(["--model", name]);
+                }
+                let Command::Run(args) = Cli::try_parse_from(args).unwrap().command else {
+                    panic!("run")
+                };
+                let config = args.into_config().unwrap();
+                assert_eq!(config.provider.as_str(), provider);
+                assert_eq!(config.model, override_model.unwrap_or(model));
+                assert_eq!(
+                    config.context_window_tokens,
+                    if override_model.is_none() {
+                        Some(262144)
+                    } else {
+                        None
+                    }
+                );
+            }
+        }
+        assert!(
+            Cli::try_parse_from([
+                "harness",
+                "run",
+                "--experiment",
+                ".",
+                "--provider",
+                "unknown"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn output_budget_alias_and_reasoning_effort_reach_worker_config() {
