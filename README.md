@@ -79,6 +79,31 @@ checks. Model residency remains unknown, and Ollama throughput samples are
 excluded. Performance and reasoning-level effectiveness need separate measured
 runs; this migration makes no performance claim.
 
+### Known reasoning compatibility limits in Mojentic 2.1
+
+Receiving reasoning in the stream does not preserve it in the next request.
+Mojentic 2.1's `LlmMessage` cannot represent assistant `reasoning_content` or
+`thinking`. The worker records streamed reasoning in traces, but ordinary
+assistant history omits it. The bounded checkpoint feature below is a separate
+user-message continuation aid; it is not native reasoning preservation.
+
+The installed Qwen3.8 template accepts `low`, `medium`, and `xhigh`. It rejects
+`high`, although the CLI and Mojentic enum accept that value; the enum cannot
+represent `xhigh`. Omitting effort uses the server/model default, not an explicit
+cross-provider setting. The installed oMLX template defaults to `xhigh` without
+overrides; the preserved Ollama model metadata advertises `medium`.
+
+Mojentic 2.1's Ollama gateway also maps all named effort levels to `think: true`.
+An Ollama low/medium/high comparison through that gateway does not vary the
+requested level. The current production worker uses oMLX; this Ollama limitation
+affects the diagnostic gateway and any future worker integration using it.
+
+`tests/omlx_gateway.rs` characterizes these gaps through the actual CLI, message
+type, and mock HTTP endpoints. Update those characterization assertions when
+the dependency gains support; they describe current limitations, not desired
+behavior. Generation39's offline rendering fixtures check Qwen's template
+separately. No performance conclusion follows from these compatibility tests.
+
 The dependency uses `mojentic = "2.1"`. `Cargo.lock` records the resolved release
 for reproducible builds. Run `cargo update -p mojentic` to adopt a compatible
 release, then run the checks below.

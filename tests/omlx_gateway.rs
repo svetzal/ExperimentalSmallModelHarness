@@ -1,4 +1,4 @@
-//! Exercise the production CLI and Mojentic oMLX transport without loading a model.
+//! Exercise production transports without loading a model, including known Mojentic 2.1 gaps.
 
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -46,6 +46,14 @@ fn read_request(stream: &mut TcpStream) -> (String, Value) {
 }
 
 fn mock_server(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<Value>>) {
+    mock_provider_server(responses, "/v1/chat/completions", true)
+}
+
+fn mock_provider_server(
+    responses: Vec<String>,
+    route: &'static str,
+    require_api_key: bool,
+) -> (String, std::thread::JoinHandle<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let host = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
@@ -57,19 +65,21 @@ fn mock_server(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<V
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "no oMLX request arrived");
+                        assert!(Instant::now() < deadline, "no provider request arrived");
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     Err(error) => panic!("accept failed: {error}"),
                 }
             };
             let (headers, request) = read_request(&mut stream);
-            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
-            assert!(
-                headers
-                    .to_ascii_lowercase()
-                    .contains("authorization: bearer test-key")
-            );
+            assert!(headers.starts_with(&format!("POST {route} HTTP/1.1")));
+            if require_api_key {
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer test-key")
+                );
+            }
             requests.push(request);
             let content_type = if body.starts_with("data:") {
                 "text/event-stream"
@@ -163,7 +173,7 @@ fn worker_effort_and_token_budgets_reach_omlx_on_the_wire() {
 }
 
 #[test]
-fn omlx_reasoning_and_tool_results_survive_the_next_request() {
+fn omlx_tool_results_survive_but_native_reasoning_is_only_traced() {
     let tool_response = format!(
         "data: {}\n\ndata: [DONE]\n\n",
         json!({
@@ -185,8 +195,80 @@ fn omlx_reasoning_and_tool_results_survive_the_next_request() {
             .iter()
             .any(|message| message["role"] == "tool" && message["tool_call_id"] == "inspect-1")
     );
+    // Characterize the current gap, not the desired continuity contract. Mojentic
+    // 2.1 has no assistant reasoning field; update this test when support lands.
+    assert!(
+        !serde_json::to_string(messages)
+            .unwrap()
+            .contains("Inspect the workspace.")
+    );
+    assert!(messages.iter().all(|message| {
+        message.get("reasoning_content").is_none() && message.get("thinking").is_none()
+    }));
     let trace = std::fs::read_to_string(summary["trace_file"].as_str().unwrap()).unwrap();
     assert!(trace.contains("\"kind\":\"llm.stream.thinking\""));
+    assert!(trace.contains("Inspect the workspace."));
+}
+
+#[tokio::test]
+async fn mojentic_21_ollama_named_efforts_collapse_to_boolean_on_the_wire() {
+    use mojentic::llm::gateway::{CompletionConfig, LlmGateway, ReasoningEffort};
+    use mojentic::llm::gateways::{OllamaConfig, OllamaGateway};
+    use mojentic::llm::models::LlmMessage;
+
+    // This dependency limitation makes a low/medium/high Ollama experiment
+    // uninterpretable until the gateway preserves the requested level.
+    for effort in [
+        None,
+        Some(ReasoningEffort::Disabled),
+        Some(ReasoningEffort::Low),
+        Some(ReasoningEffort::Medium),
+        Some(ReasoningEffort::High),
+    ] {
+        let response = json!({"message": {"role": "assistant", "content": "DONE"}, "done": true});
+        let (host, server) = mock_provider_server(vec![response.to_string()], "/api/chat", false);
+        let gateway = OllamaGateway::with_config(OllamaConfig {
+            host,
+            timeout: Some(Duration::from_secs(10)),
+            headers: Default::default(),
+        });
+        gateway
+            .complete(
+                "test-qwen",
+                &[LlmMessage::user("Finish.")],
+                None,
+                &CompletionConfig {
+                    reasoning_effort: effort,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests[0].get("think"),
+            effort
+                .map(|level| json!(level != ReasoningEffort::Disabled))
+                .as_ref()
+        );
+    }
+}
+
+#[test]
+fn mojentic_21_cannot_represent_native_reasoning_history_or_xhigh() {
+    use mojentic::llm::gateway::ReasoningEffort;
+    use mojentic::llm::models::LlmMessage;
+
+    let message: LlmMessage = serde_json::from_value(json!({
+        "role": "assistant", "content": "Visible answer",
+        "reasoning_content": "Reasoning sentinel", "thinking": "Reasoning sentinel"
+    }))
+    .unwrap();
+    let serialized = serde_json::to_value(message).unwrap();
+    assert_eq!(serialized["content"], "Visible answer");
+    assert!(serialized.get("reasoning_content").is_none());
+    assert!(serialized.get("thinking").is_none());
+    assert!(serde_json::from_value::<ReasoningEffort>(json!("xhigh")).is_err());
 }
 
 #[tokio::test]
