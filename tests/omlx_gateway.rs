@@ -1,4 +1,4 @@
-//! Exercise production transports without loading a model, including known Mojentic 2.1 gaps.
+//! Exercise production transports and native reasoning continuity without loading a model.
 
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -103,6 +103,15 @@ fn final_response() -> String {
 }
 
 fn run_cli(host: &str, effort: Option<&str>, budget_flag: &str) -> (tempfile::TempDir, Value) {
+    run_cli_options(host, effort, budget_flag, &[])
+}
+
+fn run_cli_options(
+    host: &str,
+    effort: Option<&str>,
+    budget_flag: &str,
+    options: &[&str],
+) -> (tempfile::TempDir, Value) {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -122,6 +131,7 @@ fn run_cli(host: &str, effort: Option<&str>, budget_flag: &str) -> (tempfile::Te
     if let Some(effort) = effort {
         command.args(["--reasoning-effort", effort]);
     }
+    command.args(options);
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -141,6 +151,7 @@ fn worker_effort_and_token_budgets_reach_omlx_on_the_wire() {
         Some("low"),
         Some("medium"),
         Some("high"),
+        Some("xhigh"),
     ] {
         let (host, server) = mock_server(vec![final_response()]);
         let (_temp, summary) = run_cli(&host, effort, "--max-tokens");
@@ -195,8 +206,7 @@ fn omlx_tool_results_survive_but_native_reasoning_is_only_traced() {
             .iter()
             .any(|message| message["role"] == "tool" && message["tool_call_id"] == "inspect-1")
     );
-    // Characterize the current gap, not the desired continuity contract. Mojentic
-    // 2.1 has no assistant reasoning field; update this test when support lands.
+    // Retention remains off by default, independently of reasoning effort.
     assert!(
         !serde_json::to_string(messages)
             .unwrap()
@@ -211,19 +221,20 @@ fn omlx_tool_results_survive_but_native_reasoning_is_only_traced() {
 }
 
 #[tokio::test]
-async fn mojentic_21_ollama_named_efforts_collapse_to_boolean_on_the_wire() {
+async fn ollama_named_efforts_reach_the_wire_without_collapsing() {
     use mojentic::llm::gateway::{CompletionConfig, LlmGateway, ReasoningEffort};
     use mojentic::llm::gateways::{OllamaConfig, OllamaGateway};
     use mojentic::llm::models::LlmMessage;
 
-    // This dependency limitation makes a low/medium/high Ollama experiment
-    // uninterpretable until the gateway preserves the requested level.
+    // Named effort and boolean enablement have distinct wire representations.
     for effort in [
         None,
         Some(ReasoningEffort::Disabled),
         Some(ReasoningEffort::Low),
         Some(ReasoningEffort::Medium),
         Some(ReasoningEffort::High),
+        Some(ReasoningEffort::XHigh),
+        Some(ReasoningEffort::Enabled),
     ] {
         let response = json!({"message": {"role": "assistant", "content": "DONE"}, "done": true});
         let (host, server) = mock_provider_server(vec![response.to_string()], "/api/chat", false);
@@ -248,27 +259,34 @@ async fn mojentic_21_ollama_named_efforts_collapse_to_boolean_on_the_wire() {
         assert_eq!(
             requests[0].get("think"),
             effort
-                .map(|level| json!(level != ReasoningEffort::Disabled))
+                .map(|level| match level {
+                    ReasoningEffort::Disabled => json!(false),
+                    ReasoningEffort::Enabled => json!(true),
+                    named => json!(named),
+                })
                 .as_ref()
         );
     }
 }
 
 #[test]
-fn mojentic_21_cannot_represent_native_reasoning_history_or_xhigh() {
+fn native_reasoning_history_and_xhigh_round_trip() {
     use mojentic::llm::gateway::ReasoningEffort;
     use mojentic::llm::models::LlmMessage;
 
     let message: LlmMessage = serde_json::from_value(json!({
         "role": "assistant", "content": "Visible answer",
-        "reasoning_content": "Reasoning sentinel", "thinking": "Reasoning sentinel"
+        "reasoning_content": "Reasoning sentinel"
     }))
     .unwrap();
     let serialized = serde_json::to_value(message).unwrap();
     assert_eq!(serialized["content"], "Visible answer");
-    assert!(serialized.get("reasoning_content").is_none());
+    assert_eq!(serialized["reasoning_content"], "Reasoning sentinel");
     assert!(serialized.get("thinking").is_none());
-    assert!(serde_json::from_value::<ReasoningEffort>(json!("xhigh")).is_err());
+    assert_eq!(
+        serde_json::from_value::<ReasoningEffort>(json!("xhigh")).unwrap(),
+        ReasoningEffort::XHigh
+    );
 }
 
 #[tokio::test]
@@ -307,4 +325,117 @@ async fn structured_advisories_use_omlx_output_budgets() {
     assert!(requests[0].get("num_predict").is_none());
     assert!(requests[0].get("reasoning_effort").is_none());
     assert!(requests[0].get("tools").is_none());
+}
+
+#[test]
+fn native_reasoning_survives_tools_outer_turns_and_context_accounting() {
+    let first = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{
+        "reasoning_content":"FIRST_REASONING_SENTINEL", "content":"Inspecting now.",
+        "tool_calls":[{"index":0,"id":"inspect-1","type":"function","function":{"name":"list_tree","arguments":"{}"}}]
+    },"finish_reason":"tool_calls"}]})
+    );
+    let second = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{
+        "reasoning_content":"SECOND_REASONING_SENTINEL", "content":"The inspection is complete; one more step."
+    },"finish_reason":"stop"}]})
+    );
+    let (host, server) = mock_server(vec![first, second, final_response()]);
+    let (_temp, summary) = run_cli_options(
+        &host,
+        Some("medium"),
+        "--max-tokens",
+        &[
+            "--preserve-reasoning",
+            "--reasoning-profile",
+            "qwen3.8",
+            "--transcript-policy",
+            "full-transcript",
+        ],
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0]["chat_template_kwargs"]["preserve_thinking"],
+        true
+    );
+    assert_eq!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap()["reasoning_content"],
+        "FIRST_REASONING_SENTINEL"
+    );
+    let assistants: Vec<_> = requests[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        2,
+        "no aggregate assistant duplicate across outer turns"
+    );
+    assert_eq!(
+        assistants[1]["reasoning_content"],
+        "SECOND_REASONING_SENTINEL"
+    );
+    let trace = std::fs::read_to_string(summary["trace_file"].as_str().unwrap()).unwrap();
+    assert!(trace.contains("\"reasoning_chars\":24"));
+    assert!(trace.contains("\"preserve_reasoning\":true"));
+    assert!(trace.contains("qwen3.8"));
+    assert_eq!(summary["preserve_reasoning"], true);
+}
+
+#[test]
+fn capped_partial_reasoning_is_not_retained_as_completed_native_history() {
+    let first = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{
+        "reasoning_content":"PARTIAL_REASONING_SENTINEL that exceeds the protective cap"
+    },"finish_reason":"stop"}]})
+    );
+    let (host, server) = mock_server(vec![first, final_response()]);
+    let (_temp, summary) = run_cli_options(
+        &host,
+        Some("medium"),
+        "--max-tokens",
+        &["--preserve-reasoning", "--max-thinking-only-tokens", "1"],
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests[1]["messages"]
+            .to_string()
+            .contains("PARTIAL_REASONING_SENTINEL")
+    );
+    let trace = std::fs::read_to_string(summary["trace_file"].as_str().unwrap()).unwrap();
+    assert!(trace.contains("PARTIAL_REASONING_SENTINEL"));
+    assert!(trace.contains("llm.thinking_only_stream.action_transitioned"));
+}
+
+#[test]
+fn qwen_profile_rejects_high_before_connecting() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("task.md"), "Finish with DONE.").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_adaptive-agent-harness"))
+        .current_dir(temp.path())
+        .env("OMLX_HOST", "http://127.0.0.1:1")
+        .args(["run", "--experiment"])
+        .arg(temp.path())
+        .args([
+            "--reasoning-profile",
+            "qwen3.8",
+            "--reasoning-effort",
+            "high",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported by profile qwen3.8"));
 }

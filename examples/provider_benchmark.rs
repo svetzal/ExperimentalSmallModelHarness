@@ -27,6 +27,27 @@ struct Config {
     output: PathBuf,
     prefix_lines: usize,
     rounds: usize,
+    #[serde(default = "disabled_reasoning")]
+    reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    reasoning_profile: Option<mojentic::llm::ReasoningProfile>,
+    #[serde(default)]
+    preserve_reasoning: bool,
+    #[serde(default = "default_output_cap")]
+    max_tokens: usize,
+    #[serde(default)]
+    temperature: f32,
+}
+fn disabled_reasoning() -> Option<ReasoningEffort> {
+    Some(ReasoningEffort::Disabled)
+}
+fn default_output_cap() -> usize {
+    128
+}
+impl Config {
+    fn reasoning_is_allowed(&self, chars: usize) -> bool {
+        self.reasoning_effort != Some(ReasoningEffort::Disabled) || chars == 0
+    }
 }
 
 fn digest(text: &str) -> String {
@@ -100,6 +121,7 @@ struct Reply {
     content: String,
     calls: Vec<LlmToolCall>,
     thinking: usize,
+    reasoning_content: Option<String>,
 }
 impl Probe<'_> {
     async fn call(
@@ -111,13 +133,16 @@ impl Probe<'_> {
         let depth = self.index;
         self.index += 1;
         let config = CompletionConfig {
-            temperature: 0.0,
+            temperature: self.cfg.temperature,
             num_ctx: 262144,
-            max_tokens: 128,
-            num_predict: Some(128),
-            reasoning_effort: Some(ReasoningEffort::Disabled),
+            max_tokens: self.cfg.max_tokens,
+            num_predict: Some(self.cfg.max_tokens as i32),
+            reasoning_effort: self.cfg.reasoning_effort,
+            reasoning_profile: self.cfg.reasoning_profile.clone(),
+            preserve_reasoning: self.cfg.preserve_reasoning,
             ..Default::default()
         };
+        config.validate_reasoning()?;
         let serialized = serde_json::to_string(messages)?;
         self.trace.event("llm.context_assembly.ledger",json!({"turn":1,"llm_call_depth":depth,
             "assembly_policy":"controlled_append_only","message_count":messages.len(),
@@ -126,12 +151,13 @@ impl Probe<'_> {
         self.trace.event("llm.provider_request.assembled",json!({"turn":1,"llm_call_depth":depth,
             "provider":self.cfg.provider,"model":self.cfg.model,"messages":messages,
             "tools":tools.iter().map(|t| t.descriptor()).collect::<Vec<_>>(),
-            "completion":{"num_ctx":262144,"max_tokens":128,"num_predict":128,"temperature":0.0,"reasoning_effort":"disabled"}}))?;
+            "completion":{"num_ctx":262144,"max_tokens":config.max_tokens,"num_predict":config.num_predict,"temperature":config.temperature,"reasoning_effort":config.reasoning_effort,"reasoning_profile":config.reasoning_profile,"preserve_reasoning":config.preserve_reasoning}}))?;
         self.previous = serialized;
         let start = Instant::now();
         let mut first = None;
         let mut content = String::new();
         let mut thinking = 0;
+        let mut reasoning_content = String::new();
         let mut calls = Vec::new();
         let mut metrics = Vec::new();
         let mut stream = self.gateway.complete_stream(
@@ -151,6 +177,9 @@ impl Probe<'_> {
                 }
                 StreamChunk::Thinking(s) => {
                     thinking += s.chars().count();
+                    if self.cfg.preserve_reasoning {
+                        reasoning_content += &s;
+                    }
                     self.trace.event("llm.stream.thinking",json!({"turn":1,"llm_call_depth":depth,"text":s,"chars":s.chars().count(),"truncated":false}))?;
                 }
                 StreamChunk::ToolCalls(c) => {
@@ -182,6 +211,7 @@ impl Probe<'_> {
             content,
             calls,
             thinking,
+            reasoning_content: (!reasoning_content.is_empty()).then_some(reasoning_content),
         })
     }
 }
@@ -211,7 +241,7 @@ async fn run(cfg: &Config, trace: &TraceRecorder) -> Result<Value> {
         )
         .await?;
     ensure!(
-        warmup.thinking == 0,
+        cfg.reasoning_is_allowed(warmup.thinking),
         "Provider ignored disabled reasoning during warmup"
     );
     if cfg.workload == "prefix" {
@@ -235,7 +265,7 @@ async fn run(cfg: &Config, trace: &TraceRecorder) -> Result<Value> {
                 )),
             ];
             let reply = p.call(phase, &messages, &[]).await?;
-            checks.push(json!({"phase":phase,"correct":reply.content.trim()=="READY" && reply.calls.is_empty() && reply.thinking==0}));
+            checks.push(json!({"phase":phase,"correct":reply.content.trim()=="READY" && reply.calls.is_empty() && cfg.reasoning_is_allowed(reply.thinking)}));
         }
         Ok(
             json!({"status":"finished","checks":checks,"passed":checks.iter().all(|x|x["correct"]==true)}),
@@ -263,9 +293,12 @@ async fn run(cfg: &Config, trace: &TraceRecorder) -> Result<Value> {
             let state = *advance.state.lock().unwrap();
             if reply.calls.is_empty() {
                 return Ok(json!({"status":"finished","completed_rounds":state,
-                "passed":state==cfg.rounds && reply.content.trim()==format!("DONE {}",receipt(&cfg.nonce,state)) && reply.thinking==0,"final_content":reply.content}));
+                "passed":state==cfg.rounds && reply.content.trim()==format!("DONE {}",receipt(&cfg.nonce,state)) && cfg.reasoning_is_allowed(reply.thinking),"final_content":reply.content}));
             }
-            if reply.thinking > 0 || reply.calls.len() != 1 || reply.calls[0].name != "advance" {
+            if !cfg.reasoning_is_allowed(reply.thinking)
+                || reply.calls.len() != 1
+                || reply.calls[0].name != "advance"
+            {
                 return Ok(
                     json!({"status":"semantic_failure","completed_rounds":state,"passed":false,"reason":"unexpected reasoning or tool batch"}),
                 );
@@ -283,12 +316,14 @@ async fn run(cfg: &Config, trace: &TraceRecorder) -> Result<Value> {
                 content: Some(reply.content),
                 tool_calls: Some(reply.calls.clone()),
                 image_paths: None,
+                reasoning_content: reply.reasoning_content,
             });
             messages.push(LlmMessage {
                 role: MessageRole::Tool,
                 content: Some(serde_json::to_string(&result)?),
                 tool_calls: Some(reply.calls),
                 image_paths: None,
+                reasoning_content: None,
             });
         }
         Ok(json!({"status":"semantic_failure","passed":false,"reason":"call budget exhausted"}))
@@ -301,12 +336,16 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("usage: provider_benchmark CONFIG.json"))?;
     let cfg: Config = serde_json::from_slice(&std::fs::read(path)?)?;
     ensure!(
-        cfg.prefix_lines <= 512 && (1..=32).contains(&cfg.rounds),
+        cfg.prefix_lines <= 512
+            && (1..=32).contains(&cfg.rounds)
+            && (1..=8192).contains(&cfg.max_tokens)
+            && cfg.temperature.is_finite()
+            && cfg.temperature >= 0.0,
         "benchmark bounds exceeded"
     );
     std::fs::create_dir(&cfg.output)?;
     let trace = TraceRecorder::create(&cfg.output.join("traces"))?;
-    trace.event("run.started",json!({"model":cfg.model,"provider":cfg.provider,"benchmark":cfg.workload,"reasoning_effort":"disabled"}))?;
+    trace.event("run.started",json!({"model":cfg.model,"provider":cfg.provider,"benchmark":cfg.workload,"reasoning_effort":cfg.reasoning_effort,"reasoning_profile":cfg.reasoning_profile,"preserve_reasoning":cfg.preserve_reasoning,"max_tokens":cfg.max_tokens,"temperature":cfg.temperature}))?;
     match run(&cfg, &trace).await {
         Ok(result) => {
             trace.event("run.finished", &result)?;

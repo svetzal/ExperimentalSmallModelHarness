@@ -30,11 +30,16 @@ fn model_context_window_tokens(model: &str) -> Option<usize> {
 fn parse_reasoning_effort(value: &str) -> Result<mojentic::llm::gateway::ReasoningEffort, String> {
     use mojentic::llm::gateway::ReasoningEffort;
     match value {
+        "enabled" => Ok(ReasoningEffort::Enabled),
+        "xhigh" => Ok(ReasoningEffort::XHigh),
         "disabled" => Ok(ReasoningEffort::Disabled),
         "low" => Ok(ReasoningEffort::Low),
         "medium" => Ok(ReasoningEffort::Medium),
         "high" => Ok(ReasoningEffort::High),
-        _ => Err("expected disabled, low, medium, or high; omit for the model default".into()),
+        _ => Err(
+            "expected disabled, enabled, low, medium, high, or xhigh; omit for the model default"
+                .into(),
+        ),
     }
 }
 
@@ -93,10 +98,18 @@ struct RunArgs {
     #[arg(long, visible_alias = "num-predict")]
     max_tokens: Option<usize>,
 
-    /// Worker reasoning effort: disabled, low, medium, high. Omit for the model default.
+    /// Worker reasoning effort: disabled, enabled, low, medium, high, xhigh. Omit for the model default.
     /// Named levels depend on the model's chat template; advisory calls keep their defaults.
     #[arg(long, value_parser = parse_reasoning_effort)]
     reasoning_effort: Option<mojentic::llm::gateway::ReasoningEffort>,
+
+    /// Explicit model capability profile; omit to leave validation to the provider.
+    #[arg(long, value_parser = ["qwen3.8"])]
+    reasoning_profile: Option<String>,
+
+    /// Preserve completed native assistant reasoning in history (separate from capped checkpoints).
+    #[arg(long)]
+    preserve_reasoning: bool,
 
     /// Max reasoning-only tokens in one LLM call before an action-only handoff. Defaults to max(expected output, 25% of max_tokens); 0 disables.
     #[arg(long)]
@@ -189,6 +202,11 @@ impl RunArgs {
             expected_output_tokens,
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
+            reasoning_profile: self
+                .reasoning_profile
+                .as_ref()
+                .map(|_| mojentic::llm::ReasoningProfile::qwen3_8()),
+            preserve_reasoning: self.preserve_reasoning,
             max_thinking_only_tokens,
             repair_exit_thinking_tokens,
             repair_handoff_policy,

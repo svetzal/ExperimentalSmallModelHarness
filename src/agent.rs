@@ -74,6 +74,8 @@ pub struct AgentRunConfig {
     pub expected_output_tokens: usize,
     pub max_tokens: Option<usize>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_profile: Option<mojentic::llm::ReasoningProfile>,
+    pub preserve_reasoning: bool,
     pub max_thinking_only_tokens: usize,
     pub repair_exit_thinking_tokens: usize,
     pub repair_handoff_policy: RepairHandoffPolicy,
@@ -107,6 +109,8 @@ pub struct AgentRunSummary {
     pub expected_output_tokens: usize,
     pub max_tokens: Option<usize>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_profile: Option<mojentic::llm::ReasoningProfile>,
+    pub preserve_reasoning: bool,
     pub max_thinking_only_tokens: usize,
     pub repair_exit_thinking_tokens: usize,
     pub repair_handoff_policy: RepairHandoffPolicy,
@@ -290,12 +294,15 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     gateway: &G,
     tool_root: PathBuf,
 ) -> Result<AgentRunSummary> {
-    let completion_config = agent_completion_config(
+    let mut completion_config = agent_completion_config(
         config.max_model_interactions,
         config.max_tokens,
         config.context_window_tokens,
         config.reasoning_effort,
     )?;
+    completion_config.reasoning_profile = config.reasoning_profile.clone();
+    completion_config.preserve_reasoning = config.preserve_reasoning;
+    completion_config.validate_reasoning()?;
     let experiment_dir = config
         .experiment_dir
         .canonicalize()
@@ -367,6 +374,8 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "provider": "omlx",
             "max_tokens": config.max_tokens,
             "reasoning_effort": config.reasoning_effort,
+            "reasoning_profile": config.reasoning_profile,
+            "preserve_reasoning": config.preserve_reasoning,
             "max_thinking_only_tokens": config.max_thinking_only_tokens,
             "repair_exit_thinking_tokens": config.repair_exit_thinking_tokens,
             "repair_handoff_policy": config.repair_handoff_policy,
@@ -932,17 +941,11 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
                 "turn {turn} action-boundary interrupt after hidden reasoning without required source progress or fresh validation"
             );
             trace.event("agent.action_boundary.prompted", &decision.interrupt)?;
-            if !response.trim().is_empty() {
-                messages.push(LlmMessage::assistant(response.clone()));
-            }
             messages.push(LlmMessage::user(action_boundary_interrupt_prompt(decision)));
             continue;
         }
         if authoritative_constrained_handoff {
             authoritative_constrained_repair_active = true;
-            if !response.trim().is_empty() {
-                messages.push(LlmMessage::assistant(response.clone()));
-            }
             let removed_user_messages = prune_superseded_agent_loop_guidance(&mut messages);
             trace.event(
                 "agent.validation.constrained_handoff_context_pruned",
@@ -1201,7 +1204,6 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             continue;
         }
         final_summary = response.clone();
-        messages.push(LlmMessage::assistant(response));
         if policy.validation_required_after_write {
             trace.event(
                 "agent.validation.required_after_edit",
@@ -1331,6 +1333,8 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         expected_output_tokens: config.expected_output_tokens,
         max_tokens: config.max_tokens,
         reasoning_effort: config.reasoning_effort,
+        reasoning_profile: config.reasoning_profile.clone(),
+        preserve_reasoning: config.preserve_reasoning,
         max_thinking_only_tokens: config.max_thinking_only_tokens,
         repair_exit_thinking_tokens: config.repair_exit_thinking_tokens,
         repair_handoff_policy: config.repair_handoff_policy,
@@ -2124,6 +2128,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         )?;
 
         let mut call_content = String::new();
+        let mut call_reasoning = String::new();
+        let mut call_interrupted = false;
         let mut accumulated_tool_calls = Vec::new();
         let started = Instant::now();
         let mut latest_progress_state = ModelProgressState::WaitingForFirstToken;
@@ -2286,6 +2292,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     accumulated_tool_calls = tool_calls;
                 }
                 Ok(StreamChunk::Thinking(thinking)) => {
+                    if completion_config.preserve_reasoning {
+                        call_reasoning.push_str(&thinking);
+                    }
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
                     latest_progress_state = ModelProgressState::Generating;
@@ -2347,6 +2356,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         };
                         trace.event("agent.action_boundary.interrupted", &interrupt)?;
                         action_boundary_interrupted = Some(interrupt);
+                        call_interrupted = true;
                         break;
                     }
                     if max_thinking_only_tokens > 0
@@ -2372,6 +2382,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                                 "next_policy": "action_only_turn",
                             }),
                         )?;
+                        call_interrupted = true;
                         break;
                     }
                     if validation_repair_active
@@ -2399,6 +2410,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                                 "latest_preview": limit_preview(&thinking, 240),
                             }),
                         )?;
+                        call_interrupted = true;
                         break;
                     }
                 }
@@ -2466,6 +2478,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                                 "validation_repair_active": validation_repair_active,
                             }),
                         )?;
+                        call_interrupted = true;
                         break;
                     }
                 }
@@ -2578,6 +2591,12 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         )?;
 
         if accumulated_tool_calls.is_empty() {
+            if !call_interrupted && (!call_content.is_empty() || !call_reasoning.is_empty()) {
+                let mut assistant = LlmMessage::assistant(call_content);
+                assistant.reasoning_content =
+                    (!call_reasoning.is_empty()).then_some(call_reasoning);
+                current_messages.push(assistant);
+            }
             trace.event(
                 "agent.stream.finished",
                 serde_json::json!({
@@ -2610,6 +2629,8 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             content: Some(call_content),
             tool_calls: Some(accumulated_tool_calls.clone()),
             image_paths: None,
+            reasoning_content: (!call_interrupted && !call_reasoning.is_empty())
+                .then_some(call_reasoning),
         };
         let assistant_chars = message_chars(&assistant_message);
         current_messages.push(assistant_message);
@@ -2643,6 +2664,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 content: Some(tool_result.content.clone()),
                 tool_calls: Some(vec![call.clone()]),
                 image_paths: None,
+                reasoning_content: None,
             };
             let tool_message_chars = message_chars(&tool_message);
             current_messages.push(tool_message);
@@ -2900,6 +2922,7 @@ struct ContextComponentLedger {
     role: String,
     inclusion_reason: &'static str,
     content_chars: usize,
+    reasoning_chars: usize,
     tool_call_chars: usize,
     total_chars: usize,
     estimated_tokens: usize,
@@ -3126,8 +3149,13 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
             "provider": "omlx",
             "provider_controls": {
                 "max_tokens": completion_config.max_tokens,
-                "enable_thinking": (completion_config.reasoning_effort == Some(ReasoningEffort::Disabled)).then_some(false),
-                "reasoning_effort": completion_config.reasoning_effort.filter(|effort| *effort != ReasoningEffort::Disabled),
+                "enable_thinking": match completion_config.reasoning_effort {
+                    Some(ReasoningEffort::Disabled) => Some(false),
+                    Some(ReasoningEffort::Enabled) => Some(true),
+                    _ => None,
+                },
+                "reasoning_effort": completion_config.reasoning_effort.filter(|effort| !matches!(effort, ReasoningEffort::Disabled | ReasoningEffort::Enabled)),
+                "chat_template_kwargs": completion_config.preserve_reasoning.then(|| serde_json::json!({"preserve_thinking": true})),
                 "context_window_source": "server_model_configuration",
             },
             "turn": turn,
@@ -3144,6 +3172,8 @@ fn trace_provider_request(input: ProviderRequestTraceInput<'_>) -> Result<()> {
                 "top_k": completion_config.top_k,
                 "response_format": response_format,
                 "reasoning_effort": completion_config.reasoning_effort,
+                "reasoning_profile": completion_config.reasoning_profile,
+                "preserve_reasoning": completion_config.preserve_reasoning,
                 "max_model_interactions": completion_config.max_tool_iterations,
             },
             "harness_limits": {
@@ -3497,6 +3527,10 @@ fn retain_latest_file_observation_epochs(
                     .iter()
                     .map(|ordinal| exchange[*ordinal + 1].clone()),
             );
+        } else if exchange[0].reasoning_content.is_some() {
+            let mut reasoning_turn = exchange[0].clone();
+            reasoning_turn.tool_calls = None;
+            retained.push(reasoning_turn);
         }
         cursor += span;
     }
@@ -3715,6 +3749,13 @@ fn retained_read_exchange(
         .filter(|ordinal| !removed_ordinals.contains(ordinal))
         .collect::<Vec<_>>();
     if retained_ordinals.is_empty() {
+        // The tool payload is projected separately, but its decision reasoning
+        // still belongs to this assistant turn. Do not attach it to synthetic calls.
+        if assistant.reasoning_content.is_some() {
+            let mut reasoning_turn = assistant.clone();
+            reasoning_turn.tool_calls = None;
+            return vec![reasoning_turn];
+        }
         return Vec::new();
     }
     let mut retained_assistant = assistant.clone();
@@ -4296,6 +4337,7 @@ fn consolidated_file_observation_messages(
         ),
         tool_calls: Some(calls.clone()),
         image_paths: None,
+        reasoning_content: None,
     };
     let tools = calls
         .into_iter()
@@ -4305,6 +4347,7 @@ fn consolidated_file_observation_messages(
             content: Some(render_consolidated_file_observation(observation)),
             tool_calls: Some(vec![call]),
             image_paths: None,
+            reasoning_content: None,
         })
         .collect();
     (assistant, tools)
@@ -4863,12 +4906,18 @@ fn component_ledger(index: usize, message: &LlmMessage) -> ContextComponentLedge
         .as_ref()
         .map(|calls| calls.iter().map(|call| call.name.clone()).collect())
         .unwrap_or_default();
-    let total_chars = content_chars + tool_call_chars;
+    let reasoning_chars = message
+        .reasoning_content
+        .as_deref()
+        .unwrap_or_default()
+        .len();
+    let total_chars = content_chars + reasoning_chars + tool_call_chars;
     ContextComponentLedger {
         index,
         role: role_label(message.role).to_string(),
         inclusion_reason: inclusion_reason(index, message),
         content_chars,
+        reasoning_chars,
         tool_call_chars,
         total_chars,
         estimated_tokens: estimate_tokens(total_chars),
@@ -4936,6 +4985,11 @@ fn pressure_band(utilization: Option<f64>) -> &'static str {
 
 fn message_chars(message: &LlmMessage) -> usize {
     message.content.as_deref().unwrap_or_default().len()
+        + message
+            .reasoning_content
+            .as_deref()
+            .unwrap_or_default()
+            .len()
         + message
             .tool_calls
             .as_ref()
@@ -5380,17 +5434,7 @@ fn context_snapshot(
     context_window_tokens: Option<usize>,
     transcript_policy: TranscriptPolicy,
 ) -> serde_json::Value {
-    let message_chars: usize = messages
-        .iter()
-        .map(|message| {
-            message.content.as_deref().unwrap_or_default().len()
-                + message
-                    .tool_calls
-                    .as_ref()
-                    .map(|calls| serde_json::to_string(calls).unwrap_or_default().len())
-                    .unwrap_or_default()
-        })
-        .sum();
+    let message_chars: usize = messages.iter().map(message_chars).sum();
     let tool_descriptor_chars: usize = tools
         .iter()
         .map(|tool| {
@@ -6069,12 +6113,14 @@ mod tests {
                     arguments: std::collections::HashMap::new(),
                 }]),
                 image_paths: None,
+                reasoning_content: None,
             },
             LlmMessage {
                 role: MessageRole::Tool,
                 content: Some("{\"content\":\"file\"}".to_string()),
                 tool_calls: None,
                 image_paths: None,
+                reasoning_content: None,
             },
         ];
         let config = CompletionConfig {
@@ -6138,6 +6184,7 @@ mod tests {
                 content: Some("Let me continue reading the file.".to_string()),
                 tool_calls: Some(vec![call.clone()]),
                 image_paths: None,
+                reasoning_content: None,
             },
             LlmMessage {
                 role: MessageRole::Tool,
@@ -6155,8 +6202,43 @@ mod tests {
                 ),
                 tool_calls: Some(vec![call]),
                 image_paths: None,
+                reasoning_content: None,
             },
         ]
+    }
+
+    #[test]
+    fn canonical_file_projection_retains_each_native_reasoning_turn_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = TraceRecorder::create(temp.path()).unwrap();
+        let mut messages = Vec::new();
+        for id in ["read-1", "read-2"] {
+            let mut exchange = read_exchange(id, "src/main.rs", 1, 1, 1, "fn main() {}", false);
+            exchange[0].reasoning_content = Some(format!("reason-{id}"));
+            messages.extend(exchange);
+        }
+        coalesce_retained_file_observations(&mut messages, &trace, 1, 2, 131_072).unwrap();
+        let reasons: Vec<_> = messages
+            .iter()
+            .filter_map(|m| m.reasoning_content.as_deref())
+            .collect();
+        assert_eq!(reasons, vec!["reason-read-1", "reason-read-2"]);
+        assert!(
+            messages
+                .iter()
+                .filter(|m| m.reasoning_content.is_some())
+                .all(|m| m.tool_calls.is_none())
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.role == MessageRole::Tool)
+                .count(),
+            1
+        );
+        let once = serde_json::to_value(&messages).unwrap();
+        coalesce_retained_file_observations(&mut messages, &trace, 1, 3, 131_072).unwrap();
+        assert_eq!(serde_json::to_value(&messages).unwrap(), once);
     }
 
     #[test]
@@ -6300,6 +6382,7 @@ mod tests {
             content: Some("Inspecting file and status.".to_string()),
             tool_calls: Some(vec![read_call.clone(), shell_call.clone()]),
             image_paths: None,
+            reasoning_content: None,
         }];
         messages.push(LlmMessage {
             role: MessageRole::Tool,
@@ -6317,6 +6400,7 @@ mod tests {
             ),
             tool_calls: Some(vec![read_call]),
             image_paths: None,
+            reasoning_content: None,
         });
         messages.push(LlmMessage {
             role: MessageRole::Tool,
@@ -6330,6 +6414,7 @@ mod tests {
             ),
             tool_calls: Some(vec![shell_call]),
             image_paths: None,
+            reasoning_content: None,
         });
 
         coalesce_retained_file_observations(&mut messages, &trace, 1, 1, 131_072).unwrap();
@@ -6381,6 +6466,7 @@ mod tests {
             content: Some("Checking the workspace.".to_string()),
             tool_calls: Some(vec![shell_call.clone()]),
             image_paths: None,
+            reasoning_content: None,
         });
         messages.push(LlmMessage {
             role: MessageRole::Tool,
@@ -6394,6 +6480,7 @@ mod tests {
             ),
             tool_calls: Some(vec![shell_call]),
             image_paths: None,
+            reasoning_content: None,
         });
         messages.extend(read_exchange(
             "read-2",
@@ -6507,12 +6594,14 @@ mod tests {
             content: Some("Updating the file.".to_string()),
             tool_calls: Some(vec![write_call.clone()]),
             image_paths: None,
+            reasoning_content: None,
         });
         messages.push(LlmMessage {
             role: MessageRole::Tool,
             content: Some(json!({ "content_changed": true }).to_string()),
             tool_calls: Some(vec![write_call]),
             image_paths: None,
+            reasoning_content: None,
         });
         messages.extend(read_exchange(
             "read-after",
@@ -6564,6 +6653,7 @@ mod tests {
             content: Some("Updating the file.".to_string()),
             tool_calls: Some(vec![write_call.clone()]),
             image_paths: None,
+            reasoning_content: None,
         });
         messages.push(LlmMessage {
             role: MessageRole::Tool,
@@ -6576,6 +6666,7 @@ mod tests {
             ),
             tool_calls: Some(vec![write_call]),
             image_paths: None,
+            reasoning_content: None,
         });
         messages.extend(read_exchange(
             "read-after-1",
@@ -6935,6 +7026,7 @@ mod tests {
                     arguments: HashMap::new(),
                 }]),
                 image_paths: None,
+                reasoning_content: None,
             });
         }
 
@@ -7008,6 +7100,7 @@ mod tests {
                 arguments: HashMap::new(),
             }]),
             image_paths: None,
+            reasoning_content: None,
         });
 
         compact_retained_tool_results(
@@ -7046,6 +7139,7 @@ mod tests {
                 arguments: HashMap::new(),
             }]),
             image_paths: None,
+            reasoning_content: None,
         });
         let failed_validation = serde_json::json!({
             "validation_probe": true,
@@ -7063,6 +7157,7 @@ mod tests {
                 arguments: HashMap::new(),
             }]),
             image_paths: None,
+            reasoning_content: None,
         });
         messages.push(LlmMessage {
             role: MessageRole::Tool,
@@ -7073,6 +7168,7 @@ mod tests {
                 arguments: HashMap::new(),
             }]),
             image_paths: None,
+            reasoning_content: None,
         });
 
         compact_retained_tool_results(
@@ -7124,6 +7220,7 @@ mod tests {
                     arguments: HashMap::new(),
                 }]),
                 image_paths: None,
+                reasoning_content: None,
             });
         }
         messages.push(LlmMessage {
@@ -7135,6 +7232,7 @@ mod tests {
                 arguments: HashMap::new(),
             }]),
             image_paths: None,
+            reasoning_content: None,
         });
 
         compact_retained_tool_results(
@@ -8484,6 +8582,8 @@ mod tests {
             expected_output_tokens: 4_096,
             max_tokens: None,
             reasoning_effort: None,
+            reasoning_profile: None,
+            preserve_reasoning: false,
             max_thinking_only_tokens: 4_096,
             repair_exit_thinking_tokens: 16_384,
             repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -9946,6 +10046,8 @@ mod tests {
                     expected_output_tokens: 2_048,
                     max_tokens: None,
                     reasoning_effort: None,
+                    reasoning_profile: None,
+                    preserve_reasoning: false,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -9983,6 +10085,8 @@ mod tests {
                     expected_output_tokens: 2_048,
                     max_tokens: None,
                     reasoning_effort: None,
+                    reasoning_profile: None,
+                    preserve_reasoning: false,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -10020,6 +10124,8 @@ mod tests {
                     expected_output_tokens: 2_048,
                     max_tokens: None,
                     reasoning_effort: None,
+                    reasoning_profile: None,
+                    preserve_reasoning: false,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -10082,6 +10188,8 @@ mod tests {
                     expected_output_tokens: 2_048,
                     max_tokens: None,
                     reasoning_effort: None,
+                    reasoning_profile: None,
+                    preserve_reasoning: false,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens,
                     repair_handoff_policy,
@@ -10118,6 +10226,8 @@ mod tests {
                     expected_output_tokens: 2_048,
                     max_tokens: None,
                     reasoning_effort: None,
+                    reasoning_profile: None,
+                    preserve_reasoning: false,
                     max_thinking_only_tokens: usize::MAX,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,
@@ -10154,6 +10264,8 @@ mod tests {
                     expected_output_tokens: 2_048,
                     max_tokens: None,
                     reasoning_effort: None,
+                    reasoning_profile: None,
+                    preserve_reasoning: false,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::ConstrainedActionOnly,
@@ -10186,6 +10298,8 @@ mod tests {
                     expected_output_tokens: 2_048,
                     max_tokens: None,
                     reasoning_effort: None,
+                    reasoning_profile: None,
+                    preserve_reasoning: false,
                     max_thinking_only_tokens: 2_048,
                     repair_exit_thinking_tokens: 16_384,
                     repair_handoff_policy: RepairHandoffPolicy::TextOnly,

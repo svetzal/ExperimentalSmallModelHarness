@@ -57,7 +57,8 @@ For `run` and `run-sequential`:
 - `--max-tokens` limits generated tokens per request, including reasoning.
   The default is 16384. Zero is invalid. `--num-predict` remains a compatibility
   alias; it now sets the oMLX output budget.
-- `--reasoning-effort disabled|low|medium|high` selects worker reasoning behavior.
+- `--reasoning-effort disabled|enabled|low|medium|high|xhigh` selects worker
+  reasoning behavior.
   Omit it to retain the model default. `disabled` sends `enable_thinking: false`.
   Named levels pass through as `reasoning_effort`; their effect depends on the
   model's chat template. Advisory calls retain their model defaults.
@@ -79,34 +80,39 @@ checks. Model residency remains unknown, and Ollama throughput samples are
 excluded. Performance and reasoning-level effectiveness need separate measured
 runs; this migration makes no performance claim.
 
-### Known reasoning compatibility limits in Mojentic 2.1
+### Native reasoning prototype
 
-Receiving reasoning in the stream does not preserve it in the next request.
-Mojentic 2.1's `LlmMessage` cannot represent assistant `reasoning_content` or
-`thinking`. The worker records streamed reasoning in traces, but ordinary
-assistant history omits it. The bounded checkpoint feature below is a separate
-user-message continuation aid; it is not native reasoning preservation.
+The temporary Git-pinned Mojentic prototype fixes the Generation39 transport
+limitations. It represents native assistant reasoning separately from content,
+keeps named Ollama effort values distinct, and supports xhigh. The lockfile and
+Cargo.toml identify the exact library commit; return to a published dependency
+when the coordinated library increment is released.
 
-The installed Qwen3.8 template accepts `low`, `medium`, and `xhigh`. It rejects
-`high`, although the CLI and Mojentic enum accept that value; the enum cannot
-represent `xhigh`. Omitting effort uses the server/model default, not an explicit
-cross-provider setting. The installed oMLX template defaults to `xhigh` without
-overrides; the preserved Ollama model metadata advertises `medium`.
+Use `--reasoning-profile qwen3.8 --reasoning-effort medium` to validate the model's
+supported controls before HTTP. The profile accepts disabled, low, medium and
+xhigh; high is rejected rather than silently translated. Omitted effort still
+means an unknown provider default. An omitted profile delegates capability
+validation to the server; unknown model names are never matched heuristically.
 
-Mojentic 2.1's Ollama gateway also maps all named effort levels to `think: true`.
-An Ollama low/medium/high comparison through that gateway does not vary the
-requested level. The current production worker uses oMLX; this Ollama limitation
-affects the diagnostic gateway and any future worker integration using it.
+`--preserve-reasoning` opts into native completed-response history. It is off by
+default so retention can be varied independently from effort. The worker keeps
+reasoning with its assistant tool request or final response, includes its size
+in context accounting, and exposes it in exact snapshots and native transcripts.
+File-read consolidation retains reasoning in its original assistant turn while
+projecting the tool evidence separately; it does not attach reasoning to an
+invented tool request. Existing context rewriting policies still apply.
 
-`tests/omlx_gateway.rs` characterizes these gaps through the actual CLI, message
-type, and mock HTTP endpoints. Update those characterization assertions when
-the dependency gains support; they describe current limitations, not desired
-behavior. Generation39's offline rendering fixtures check Qwen's template
-separately. No performance conclusion follows from these compatibility tests.
+Cancelled/capped partial chains remain separate from completed native history;
+`--reasoning-checkpoint-tokens` retains its independent experimental meaning.
+The oMLX gateway requests chat_template_kwargs.preserve_thinking=true when native
+retention is enabled. Forced server settings can override that request, so
+benchmark registration must record server settings too. Sampling, stop budgets,
+and advisory defaults are unchanged by these flags.
 
-The dependency uses `mojentic = "2.1"`. `Cargo.lock` records the resolved release
-for reproducible builds. Run `cargo update -p mojentic` to adopt a compatible
-release, then run the checks below.
+`tests/omlx_gateway.rs` checks production CLI controls and history at mock HTTP
+boundaries. Mojentic also tests both local gateways and broker tool loops.
+These are deterministic compatibility results, not evidence of improved coding
+quality. Generation40 preserves the implementation and validation evidence.
 
 ## Build and Test
 
@@ -379,7 +385,8 @@ Licensed under the MIT License. See [`LICENSE`](LICENSE).
 The `provider_benchmark` example exercises both Mojentic gateways without the
 adaptive coding policy. It provides a long-prefix reuse probe and a sequential
 receipt-tool session. It saves exact requests, per-call timings and native
-Harness traces. Reasoning is disabled and each response is capped at 128 tokens.
+Harness traces. By default, reasoning is disabled and each response is capped
+at 128 tokens, preserving the Generation38 configuration.
 
 Build with `cargo build --release --locked --example provider_benchmark`, then
 run `target/release/examples/provider_benchmark CONFIG.json` under the workspace
@@ -407,3 +414,21 @@ and analysis. Cache counters have provider-specific meanings; gateway action
 latency is not automatically server prefill time. Unload between sessions does
 not clear persistent caches. A semantic failure is recorded in result.json;
 process success alone does not mean the task passed.
+
+The diagnostic config also accepts `reasoning_effort` (default disabled, null
+for provider default), `preserve_reasoning` (default false), `max_tokens`
+(default 128, range 1–8192), `temperature` (default 0), and `reasoning_profile`.
+The profile is a library capability object, for example:
+
+```json
+{
+  "name": "qwen3.8",
+  "supported_efforts": ["disabled", "low", "medium", "xhigh"],
+  "supports_reasoning_history": true
+}
+```
+
+Reasoning is permitted by semantic checks only when the configured effort
+allows it; the same receipt/order/final-answer checks still apply. Current
+production coding runs use oMLX; the controlled diagnostic can select either
+provider. Register changed settings before running a new measured cell.
