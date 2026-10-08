@@ -440,3 +440,18 @@ Reasoning is permitted by semantic checks only when the configured effort
 allows it; the same receipt/order/final-answer checks still apply. Current
 production coding runs use oMLX; the controlled diagnostic can select either
 provider. Register changed settings before running a new measured cell.
+
+### Local benchmark activity counters
+
+`benchmarks/provider_activity.py` interprets the verified oMLX 0.7 status API.
+Its active count includes output collectors for waiting requests. One queued
+request can therefore report both active=1 and waiting=1; these counts must not
+be added or treated as separate clients. Multiple-request evidence is
+`max(active, waiting) > 1`, while idle requires both zero. This helper does not
+establish request ownership or replace model, memory and admission checks.
+Generation42 preserves installed source evidence and the guarded integration.
+Run its deterministic tests with:
+
+```sh
+python3 -m unittest discover -s benchmarks -p 'test_provider_activity.py' -v
+```
