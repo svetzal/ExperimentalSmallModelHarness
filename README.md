@@ -71,8 +71,12 @@ For `run` and `run-sequential`:
 - `--context-window-tokens` controls harness context accounting and compaction.
   Ollama also receives `options.num_ctx`. Configure the actual oMLX limit on
   the server; its gateway does not send Ollama-specific parameters.
-- Thinking-only and repair caps remain separate harness controls. The
+- Thinking-only and repair interruptions are disabled by default. Select the
+  model reasoning effort and measure its reasoning instead. Positive explicit
+  cap values remain available for registered interruption experiments. The
   `constrained-action-only` repair retry can override worker effort to `disabled`.
+- Shell tools use a non-login shell, preserving the inherited PATH and virtual
+  environment. Task tools resolve the same executables as the worker environment.
 
 Provider snapshots include the requested completion settings and the mapped
 provider controls. Run summaries use `max_tokens` in place of `num_predict`.

@@ -116,11 +116,11 @@ struct RunArgs {
     #[arg(long)]
     preserve_reasoning: bool,
 
-    /// Max reasoning-only tokens in one LLM call before an action-only handoff. Defaults to max(expected output, 25% of max_tokens); 0 disables.
+    /// Max reasoning-only tokens in one LLM call before an action-only handoff. Disabled by default; positive values explicitly opt into interruption.
     #[arg(long)]
     max_thinking_only_tokens: Option<usize>,
 
-    /// Post-validation hidden-only reasoning tokens before interrupting and retrying repair. 0 disables.
+    /// Post-validation hidden-only reasoning interruption. Disabled by default; positive values opt in.
     #[arg(long)]
     repair_exit_thinking_tokens: Option<usize>,
 
@@ -299,7 +299,8 @@ mod tests {
             };
             let config = args.into_config().unwrap();
             assert_eq!(config.max_tokens, Some(32768));
-            assert_eq!(config.max_thinking_only_tokens, 8192);
+            assert_eq!(config.max_thinking_only_tokens, 0);
+            assert_eq!(config.repair_exit_thinking_tokens, 0);
             assert_eq!(
                 config.reasoning_effort,
                 Some(mojentic::llm::gateway::ReasoningEffort::Low)

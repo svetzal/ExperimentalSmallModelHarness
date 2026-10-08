@@ -50,7 +50,6 @@ const HIDDEN_ONLY_NO_ACTION_ESCALATION_TURNS: usize = 2;
 const NO_ASSISTANT_CONTENT_OUTPUT_MULTIPLIER: usize = 20;
 const REPAIR_NO_CONTENT_PROGRESS_FRAME_LIMIT: usize = 1_024;
 const MAX_VALIDATION_REPAIR_LLM_CALL_DEPTH: usize = 12;
-const DEFAULT_REPAIR_EXIT_THINKING_TOKENS: usize = 16_384;
 const ACTION_BOUNDARY_INTENT_HIT_LIMIT: usize = 2;
 const ACTION_BOUNDARY_INTENT_BUFFER_CHARS: usize = 4_096;
 const ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS: usize = 512;
@@ -275,14 +274,12 @@ pub fn default_max_thinking_only_tokens(
     expected_output_tokens: usize,
     max_tokens: Option<usize>,
 ) -> usize {
-    max_tokens
-        .filter(|tokens| *tokens > 0)
-        .map(|tokens| tokens.div_ceil(4).max(expected_output_tokens))
-        .unwrap_or(expected_output_tokens)
+    let _ = (expected_output_tokens, max_tokens);
+    0
 }
 
 pub fn default_repair_exit_thinking_tokens() -> usize {
-    DEFAULT_REPAIR_EXIT_THINKING_TOKENS
+    0
 }
 
 pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
@@ -5875,18 +5872,18 @@ mod tests {
     }
 
     #[test]
-    fn default_max_thinking_only_tokens_uses_generation_budget_fraction() {
+    fn reasoning_interruption_defaults_are_disabled() {
         assert_eq!(default_expected_output_tokens("multi-file-edit"), 4_096);
         assert_eq!(default_expected_output_tokens("multi-file-patch"), 4_096);
-        assert_eq!(default_max_thinking_only_tokens(4_096, None), 4_096);
-        assert_eq!(default_max_thinking_only_tokens(4_096, Some(32_768)), 8_192);
-        assert_eq!(default_max_thinking_only_tokens(4_096, Some(8_000)), 4_096);
-        assert_eq!(default_max_thinking_only_tokens(4_096, Some(0)), 4_096);
+        assert_eq!(default_max_thinking_only_tokens(4_096, None), 0);
+        assert_eq!(default_max_thinking_only_tokens(4_096, Some(32_768)), 0);
+        assert_eq!(default_max_thinking_only_tokens(4_096, Some(8_000)), 0);
+        assert_eq!(default_max_thinking_only_tokens(4_096, Some(0)), 0);
     }
 
     #[test]
-    fn default_repair_exit_thinking_tokens_uses_bounded_retry_threshold() {
-        assert_eq!(default_repair_exit_thinking_tokens(), 16_384);
+    fn repair_reasoning_interruption_is_disabled_by_default() {
+        assert_eq!(default_repair_exit_thinking_tokens(), 0);
     }
 
     #[tokio::test]

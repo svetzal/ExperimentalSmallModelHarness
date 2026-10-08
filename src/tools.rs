@@ -3760,7 +3760,7 @@ impl ShellCommandTool {
         let shell_command = format!("(set -o pipefail) 2>/dev/null && set -o pipefail; {command}");
         let mut shell_process = Command::new(shell);
         shell_process
-            .arg("-lc")
+            .arg("-c")
             .arg(&shell_command)
             .current_dir(&cwd)
             .stdout(std::process::Stdio::piped())
@@ -6917,6 +6917,24 @@ bytes[0..5] \"cafe\\n\""
         let result = tool.shell(&args).await.unwrap();
 
         assert_eq!(result["success"], false);
+    }
+
+    #[tokio::test]
+    async fn shell_preserves_inherited_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let tool = ShellCommandTool {
+            scope: scope(&temp),
+        };
+        let expected = std::env::var("PATH").unwrap();
+        let result = tool
+            .shell(&HashMap::from([(
+                "command".to_string(),
+                json!("printf '%s' \"$PATH\""),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], 0);
+        assert_eq!(result["stdout"], expected);
     }
 
     #[test]
