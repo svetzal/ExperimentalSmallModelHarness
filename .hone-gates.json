@@ -1,0 +1,24 @@
+{
+  "gates": [
+    {
+      "name": "format",
+      "command": "cargo fmt --all -- --check",
+      "required": true
+    },
+    {
+      "name": "clippy",
+      "command": "cargo clippy --locked --all-targets --all-features -- -D warnings",
+      "required": true
+    },
+    {
+      "name": "test",
+      "command": "cargo test --locked --all-targets --all-features",
+      "required": true
+    },
+    {
+      "name": "release-build",
+      "command": "cargo build --locked --release --bins",
+      "required": true
+    }
+  ]
+}
