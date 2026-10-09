@@ -33,6 +33,9 @@ tools again, append a retry to partial text, or report exhaustion as success.
 ## Deterministic evidence
 
 Exercise the real public worker path against scripted Ollama and oMLX HTTP servers.
+Use explicit loopback endpoints and synthetic credentials only.
+Clear inherited provider credentials and proxies before each worker starts.
+Do not read the secret store or send a request to a real model endpoint.
 Test 503 then success, Retry-After, persistent 504, ambiguous pending and rejected
 admission, cancellation, partial reasoning/content/tools, keepalive, and permanent
 errors.

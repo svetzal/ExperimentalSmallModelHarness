@@ -1,4 +1,4 @@
-# Adaptive agent harness charter
+# Charter for the adaptive agent harness
 
 ## Purpose
 
