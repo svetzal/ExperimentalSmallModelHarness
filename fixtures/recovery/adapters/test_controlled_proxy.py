@@ -141,7 +141,9 @@ class ProxyTests(unittest.TestCase):
                                     inject="after-tool", receipt_path=receipt)
             endpoint = proxy.start()
             try:
-                inspection = json.dumps({"messages": [{"role": "tool",
+                inspection = json.dumps({"messages": [{"role": "assistant",
+                    "tool_calls": [{"function": {"name": "list_tree", "arguments": {}}}]},
+                    {"role": "tool",
                     "content": '{"entries":[]}', "tool_calls": [{"function":
                     {"name": "list_tree", "arguments": {}}}]}]}).encode()
                 self.assertEqual(self.request(endpoint, inspection)[0], 200)

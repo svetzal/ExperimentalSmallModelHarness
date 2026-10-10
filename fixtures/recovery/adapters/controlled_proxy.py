@@ -119,8 +119,9 @@ class ControlledProxy:
             if message.get("role") != "tool":
                 continue
             attached = [call.get("function", {}) for call in message.get("tool_calls", [])]
-            if message.get("tool_call_id") in calls:
-                attached.append(calls[message["tool_call_id"]])
+            tool_id = message.get("tool_call_id")
+            if tool_id is not None and tool_id in calls:
+                attached.append(calls[tool_id])
             try:
                 result = json.loads(message.get("content", ""))
             except (ValueError, TypeError):
