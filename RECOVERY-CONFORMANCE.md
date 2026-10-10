@@ -397,3 +397,49 @@ inspection under its predeclared interaction bounds. MXFP8 versus MLX affine
 do not identify Generation45's original 504 cause or establish conformance
 across all six Mojentic libraries. All historical stopped benchmarks remain
 unchanged.
+
+## Completed receipt-bound live evidence
+
+The fresh `Experiments/TransientRecovery-2026-10-10-Live03/` registration completed
+six of six real-worker cells on October 10, 2026. The exact registered Harness
+revision was `aecaded0dc6f7dca8b2c5387b704bda09938be45`, Mojentic Rust remained
+`4ca1ed279c02eab37827a1ed07c30e961155ecf3`, and the canonical ops-01 worker hash
+remained `973c5a55f57b388bea04523c0948e8cdac978673fe6badb56c001bbef031209c`.
+Adapter corrections are preserved in `fixtures/recovery/adapters/`; compiled
+worker behavior and opt-in defaults are unchanged.
+
+The adapter binds its trigger to the intended successful completed shell call,
+its exact command/result and independently observed receipt bytes. Inspection
+results do not trigger injection. It supports Ollama's native tool binding
+without IDs and oMLX's explicit call IDs. Invalid intended receipts produce an
+owned permanent refusal before forwarding. Nineteen adapter safety tests and
+three repetitions of all six actual-worker scripted launch cells passed before
+registration. All unchanged required repository gates and unfiltered security
+audit passed; the optional existing license-policy gap remains unsuppressed.
+
+Both providers passed disabled baseline, controlled pre-forward HTTP503 recovery,
+and tool-history recovery. Each history task completed one inspection, one shell
+write and final `DONE`: three logical requests, four wire attempts, one shell
+execution. Its failed and retried completion bodies were identical, retaining
+the completed tool result and native reasoning. Across all six cells, ten
+logical requests used fourteen attempts; four controlled failures were never
+forwarded. All six terminal and unload checks passed. Every exact request was
+correlated with snapshots/ledgers and safe wire captures; Git patches matched
+and reconstructed full workspaces. The combined artifact uses native
+`render-transcript`.
+
+Measured end-to-end seconds for baseline/pre-forward/history were
+24.505/16.754/22.112 on Ollama and 31.517/17.211/101.997 on oMLX. These include
+launch, cleanup and artifact generation. They are single observations, with
+retained caches and MXFP8 versus MLX affine 8-bit, not comparative speed or
+coding-efficacy estimates. Both used Qwen3.8 27B, low effort, retained native
+reasoning, four logical interactions and at most three attempts per request.
+No healthy-generation wall-clock cutoff was introduced.
+
+This supersedes only the previous live-validation gap. The prior stopped
+registrations remain unchanged; a read-only source/request audit established
+that their adapter exception preceded upstream connection construction.
+Controlled recovery does not explain Generation45's original 504 or establish
+six-library parity. Real mid-generation interruption and general provider
+termination proof remain limits: uncertain local ownership still refuses
+further dispatch. Recovery remains disabled by default.
