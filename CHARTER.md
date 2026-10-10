@@ -42,3 +42,12 @@ The detailed research charter and operating evidence remain in
 `~/Work/Sandbox2/CHARTER.md` and `~/Work/Sandbox2/EXPERIMENTAL_METHOD.md`.
 The repository README describes the current runtime and commands.
 `RECOVERY-INTEGRATION-2026-10.md` defines the authorized recovery integration.
+
+## Request recovery evidence
+
+Wire attempts belong to one immutable completion and are separate from semantic
+interactions and tool depth. Admission requires proof for the exact previous
+attempt and encoded request. A syntactically valid provider identifier can still
+echo a credential; filter known active credentials before persistence or admission.
+Credential fragments across transport or semantic boundaries require buffering;
+a redacted capture must never be presented as exact wire evidence.

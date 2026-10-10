@@ -1,165 +1,348 @@
-# Recovery integration evidence
+# Worker request recovery conformance
 
-## Status: prerequisite gap, integration not complete
+## Implementation and evidence identity
 
-The reviewed Mojentic revision is
-`bc8150a381a540e6320cd4fd91a8bbecadb9a735`. Harness starts at
-`86ce284a5cf12f2c506ca4036366166aa179dc11`. This Foundry worktree leaves changes
-uncommitted; it has no new reviewed landed Harness commit. The dependency manifest
-and lockfile remain unchanged.
+The production worker uses reviewed Mojentic
+`4ca1ed279c02eab37827a1ed07c30e961155ecf3` through its existing Ollama and oMLX
+provider paths. Harness base is
+`4854cc8a66ede3dacb0f3d37847ee09b14e16421`. Manifest and lockfile are unchanged.
+Foundry owns independent review and Git finalization. The preserved proof
+records
+source fingerprints and the final release executable hash; it does not claim an
+as-yet-unissued reviewed landed Harness revision.
 
-The reviewed recovery API cannot preserve all existing Ollama worker progress
-behavior. The normal provider emits `StreamChunk::Progress` for every decoded
-frame, including an empty nonterminal frame. Harness consumes those events in
-`src/agent.rs` to refresh observed activity and distinguish tool generation from
-reasoning. That evidence affects stall detection, reasoning interruption and
-frame accounting. Losing it would change existing controls and trace evidence.
+The original prerequisite gap at Mojentic
+`bc8150a381a540e6320cd4fd91a8bbecadb9a735` was missing nonsemantic recovery
+progress and compatibility metrics. It is resolved by the exact reviewed pin.
+`tests/recovery_prerequisites.rs` positively compares legacy, raw recovery and
+compatibility progress/metrics, identities and encoded bodies. Those assertions
+remain intact. There is no absence diagnostic or substitute provider retry loop.
 
-`RecoveryStreamEvent` exposes content, reasoning, tool fragments, completion and
-failure. It has no nonsemantic frame-progress event. Lifecycle observers receive
-progress at transitions, not for each frame while an attempt remains active.
-`WireObserver::Body` exposes HTTP byte chunks, not decoded provider frames. Adding
-another provider parser in Harness would duplicate Mojentic's provider semantics.
-
-The recovery convenience `LlmGateway::complete_stream` adapter also drops metrics.
-The raw recovery API retains terminal usage and timing in the completed response's
-`ResponseEvidence`; a Harness adapter can map those to existing worker metrics.
-**Terminal metrics alone are not a substitute for progress during generation.**
-This finding concerns integration evidence; it does not claim a library runtime
-defect or full library conformance.
-
-The prerequisite is a reviewed library API exposing provider frame progress through
-recovery without weakening semantic interruption or cancellation. The coordinator
-must resolve that upstream and supply the reviewed revision, then own any separate
-manifest/lockfile commit. This task changes neither Mojentic nor the pin. No live
-inference, historical experiment writes, retry loop, agent replay or tool replay
-was performed. Recovery flags and production recovery dispatch remain unimplemented.
-
-## Assertion-bearing diagnostics
-
-`actual_worker_provider_paths_preserve_progress_prerequisites` checks both real
-CLI provider paths, one HTTP request each, native reasoning, tools and token
-settings on wire, and the configured model-interaction limit. It verifies Ollama
-empty-frame progress and terminal metrics and checks credentials are absent from
-artifacts. Its scope is existing behavior with recovery disabled.
-
-`reviewed_recovery_stream_does_not_expose_worker_frame_progress` checks identical
-encoded requests across legacy, raw recovery and convenience APIs, four legacy
-progress frames and one legacy metrics frame. It verifies that raw recovery yields
-reasoning, content and completion only, that terminal usage and timing survive,
-and that the convenience API yields neither progress nor metrics. This is a
-pinned public library diagnostic, not worker recovery conformance.
-
-Both diagnostics use loopback scripted HTTP servers and synthetic data. The worker
-fixture creates a UUID-shaped credential in memory for oMLX and passes it only
-through the subprocess environment. It does not record authorization headers or
-environment values. It clears ambient provider credentials and proxy configuration.
-This checks absence of an unreflected synthetic credential; it **does not** test
-credential echoes, redaction, admission evidence or opt-in capture safety.
-
-Successful runs emit artifact paths. The worker fixture writes `worker.json` with
-the actual executable SHA-256 and, for each provider, `request-1.body`,
-`response.body`, `stdout.json`, `stderr.log`, the main JSONL trace and
-`assertions.json`. The public library diagnostic retains three request bodies,
-the scripted response body and `assertions.json` in its emitted temporary directory.
-Test artifacts remain available for inspection. No headers are captured.
-
-## Repeat against a frozen Linux release worker
-
-Run in the compatible Ubuntu 24.04 Linux container with Python 3 available. Choose
-a new artifact directory outside historical experiments for each invocation:
-
-```sh
-python3 fixtures/recovery/worker_prerequisites.py \
-  --worker /absolute/path/to/adaptive-agent-harness \
-  --artifacts /absolute/path/to/new-prerequisite-artifacts
-```
-
-The fixture accepts the coordinator's exact frozen executable; it does not build
-or substitute another worker. A 30-second subprocess bound protects the scripted
-fixture only. It adds no generation timeout to Harness. The fixture never contacts
-a live model. This invocation repeats baseline diagnostics, **not** the requested
-recovery matrix. `worker.json` records binary identity independently of source HEAD.
-
-To repeat both Rust diagnostics, preserving their emitted artifact paths:
-
-```sh
-foundry capture -- cargo test --locked --test recovery_prerequisites -- --nocapture
-```
-
-## Trace fields and remaining evidence
-
-The existing main trace records `llm.stream.progress` with turn, call depth,
-provider, frame index, terminal state, content/reasoning lengths and tool fragment
-counts. `llm.stream.metrics` records provider-reported token counts, timings and
-throughput. `llm.stream.thinking` records reasoning progress. The diagnostic verifies
-these existing fields; no recovery trace schema has been landed.
-
-The requested logical/attempt IDs, wire accounting, structured final failure,
-admission, retry delays, exhaustion, interruption and cancellation are not yet
-integrated into the main Harness trace or transcript renderer. No conformance is
-claimed for 503 recovery, Retry-After, 504 exhaustion, admission proof, pending
-admission, cancellation, partial semantic output, tool execution once, permanent
-truncated error bodies, capture failure, credential echoes across chunks or
-terminal-only cancellation. CLI stream-drop and paused-consumer behavior are also
-unexercised. Dependency diagnostics do not substitute for these worker-path tests.
-
-## Validation
-
-Full command logs are preserved under `target/recovery-gate-logs/`; the first
-focused test run also has logs under the Foundry tool-log directory. The first
-focused run exposed a fixture error (missing Ollama terminal `done_reason`), which
-was corrected to `stop` before final validation. Gate outcomes and the release
-worker hash are recorded below after the final runs.
-
-The manifest uses Rust 2024 and Tokio. It has no explicit workspace resolver,
-MSRV, default-feature policy, toolchain pin or CI workflows. These settings were
-preserved. An explicit MSRV would help future dependency maintenance, but adding
-one is outside this integration task.
-
-Final results on October 10, 2026:
-
-- Formatting: passed.
-- Locked all-target/all-feature strict Clippy: passed.
-- Locked all-target/all-feature tests: passed, 345 tests; 2 existing tests ignored.
-- Locked release binary build: passed.
-- Locked documentation build without dependencies: passed.
-- Modified Markdown lint: passed.
-- Unfiltered `cargo audit`: passed, 289 dependencies scanned.
-- `cargo deny check`: failed on license requirements. No approved license policy
-  is configured. Advisories, bans and sources passed. No policy was weakened and
-  no advisory was suppressed.
-- Exact release worker prerequisite fixture: passed for Ollama and oMLX.
-
-The release worker SHA-256 is:
+Evidence lives outside the disposable worktree:
 
 ```text
-daf871ce27560c6ce5e026c60a5accc5a98d34abff29898813ca7cdeb9d8fa29
+/home/svetzal/.foundry/operations/harness-key-boundary-evidence-20261010/
 ```
 
-Its bodies, traces and assertion records are under
-`target/recovery-release-prerequisites/`. This hash identifies the baseline worker;
-it is not evidence of an integrated recovery worker.
+`proof.json` mirrors `.foundry/proof.json`; `logs/` contains full command stdout
+and stderr. `release-matrix-final/` records the actual executable identity, fixture
+fingerprint and one `assertions.json` per provider/case, with body, trace,
+capture
+and renderer paths. Earlier failing fixture runs are retained separately.
+Contaminated synthetic
+capture bodies are replaced with a withholding marker and their original SHA-256.
+All HTTP providers are scripted loopback servers. No live model inference or
+experiment-directory writes occur in this implementation task.
 
-Final complete logs within `target/recovery-gate-logs/` have these stems (each has
-`.stdout.log` and `.stderr.log` files):
+## Caller settings
+
+Recovery is opt-in and disabled by default. Wire attempts include the initial
+request; the default maximum is one even when recovery is enabled. Specify two
+or more explicitly to permit resending one immutable encoded completion:
+
+```bash
+adaptive-agent-harness run --experiment /work/new-cell --provider ollama \
+  --recover-requests --recovery-max-attempts 2 \
+  --recovery-base-delay-ms 100 --recovery-delay-ceiling-ms 30000 \
+  --recovery-budget-ms 60000 \
+  --recovery-admission-command /opt/operator/owned-receipt \
+  --recovery-capture-dir /work/private-wire
+```
+
+Wire attempts never consume model interactions, reset tool depth, replay a tool
+or restart an agent. Messages, native reasoning history, tools and generation
+settings remain identical across attempts. Existing reasoning caps, transcript
+policy and budgets remain intact. Recovery budgets begin after failure and
+never impose total-generation timeouts. Retry-After above the delay ceiling or
+remaining budget is refused before dispatch.
+
+Recovery tuning without `--recover-requests`, zero attempts/budget, invalid
+delay
+ordering and admission/capture paths inside the model tool root are rejected
+before HTTP dispatch. `--recovery-retryable-status` optionally selects HTTP
+statuses; permanent 400/401/403 remain permanent even when explicitly selected.
+One-attempt `--recovery-capture-dir` is permitted without enabling recovery.
+Omitting admission rejects ambiguous local resend. SIGINT/SIGTERM cancel
+request,
+admission or backoff and persist terminal evidence before CLI exit.
+
+## Operator admission schema
+
+The executable is supplied by the trusted operator, canonicalized outside the
+model tool root, and invoked directly without a shell. Stdin is JSON:
+
+```json
+{
+  "failure": {
+    "identity": {
+      "logical_request_id": "<UUID>",
+      "attempt_id": "<UUID>",
+      "wire_attempt": 1
+    },
+    "http_status": 503,
+    "provider_request_id": "<validated ID or null>",
+    "progress": {
+      "observed": {},
+      "delivered": {}
+    }
+  },
+  "request_sha256": "<SHA-256 of immutable encoded HTTP body>"
+}
+```
+
+The full safe Mojentic failure includes classification, phase, Retry-After and
+progress counters; private causes, headers and response bodies are excluded.
+The coordinator's owned pre-forward receipt helper must verify its receipt
+before returning this proof on stdout:
+
+```json
+{
+  "decision": "allow",
+  "evidence_kind": "not_forwarded",
+  "previous_attempt_id": "<exact previous UUID>",
+  "logical_request_id": "<exact logical UUID>",
+  "provider_request_id": "<exact input ID or null>",
+  "request_sha256": "<exact input SHA-256>"
+}
+```
+
+`exact_request_terminated` is the alternative evidence kind for an operator with
+proof of exact request termination. Every binding must match. Missing/ambiguous
+proof, plain allow, digest mismatch, nonzero exit, malformed or oversized
+output,
+timeout and credential contamination reject admission. Identifying metadata
+removed by credential filtering also rejects admission. The child has a five
+second bound, a 16 KiB output limit, discarded stderr and kill-on-drop. Pending
+admission never dispatches; cancellation drops and kills only the owned child.
+No unrelated model process is killed or unloaded. The fixture's synthetic helper
+checks bindings only and is not general provider termination support.
+
+## Assertion-bearing worker matrix
+
+`actual_worker_recovery_matrix_both_adapters` invokes
+`fixtures/recovery/worker_conformance.py` with the actual Cargo-built CLI. Each
+case runs independently for Ollama and oMLX:
+
+- `503_success`, `persistent504`: Byte-identical attempts, bounded
+  success/exhaustion, safe terminal history.
+
+- `retry_seconds_inside`, `retry_date_inside`: Retry-After respected within
+  explicit limits.
+
+- `retry_seconds_outside_ceiling`, `retry_date_outside_ceiling`: No resend above
+  delay ceiling.
+
+- `retry_seconds_outside_budget`, `retry_date_outside_budget`: No resend beyond
+  recovery budget.
+
+- `reject`, `plain_allow`, `wrong_digest`, `no_admission`: Ambiguous or unbound
+  proof cannot dispatch.
+
+- `pending`: Finite pending admission, no resend, owned child killed.
+
+- `cancel_request`, `cancel_admission`, `cancel_backoff`: One ordered
+  AttemptFailed then Cancelled, no success/resend.
+
+- `cancel_terminal`, `cancel_terminal_body`: Cancellation wins over
+  terminal-only body arrival; terminal bytes counted.
+
+- `partial_reasoning`, `partial_content`, `partial_tool`: Explicit interruption,
+  accurate observed progress, no completed tool effects.
+
+- `stream_drop_cap`: Existing explicit reasoning cap drops the stream; ordered
+  cancellation and exact partial capture survive worker shutdown.
+
+- `keepalive`: Nonsemantic-only truncation can recover without semantic replay.
+
+- `protocol`: Malformed provider protocol remains permanent.
+
+- `permanent_400`, `permanent_401`, `permanent_403`: Permanent with allowing
+  admission and explicitly selected status.
+
+- `permanent_400_truncated`, `permanent_401_truncated`,
+  `permanent_403_truncated`: Truncated error bodies retain permanent HTTP
+  classification.
+
+- `disabled`, `one_attempt_capture`: Default one attempt; capture independently
+  permitted without recovery.
+
+- `tool_once`: Tool side effect once, tool result/native reasoning retained,
+  depth and interactions preserved.
+
+- `credential_header`: UUID-shaped credential in X-Request-ID removed; admission
+  rejected.
+
+- `credential_raw`: Credential split over raw transport chunks withheld;
+  nonexact capture.
+
+- `credential_semantic`: Credential split across reasoning/content deltas cannot
+  reconstruct in trace or renderer.
+
+- `credential_error`: Arbitrary JSON-escaped credential in a split HTTP error
+  body is withheld and never admitted for resend.
+
+- `capture_failure`: Body-capture refusal after semantic bytes retains observed
+  progress and never retries.
+
+Common assertions cover production tools and generation settings, exact wire
+counts, stable logical IDs, distinct attempt IDs, wire counts per logical
+request,
+provider metrics, capture coverage and native renderer lifecycle cards. Safe
+request/response bodies remain available for repeated coordinator cells;
+credential-contaminated synthetic bodies are intentionally withheld. Every case
+records emitted artifact paths in its assertion file and full fixture stdout.
+`cancel_terminal_body` uses an owned FIFO to pause the HTTP capture hook after
+terminal bytes arrive; SIGTERM is observed before that hook is released. This
+exercises terminal-only cancellation through the public worker surface.
+
+Functional privacy tests additionally cover cross-kind credential prefixes,
+normal UTF-8 payload preservation and metadata key/value redaction. Public API
+progress/metrics equivalence remains covered by the prerequisite tests.
+
+## Credential correction and reproduction
+
+The recovered production source from `55a76a1` already withholds the coordinator's
+partial oMLX tool-argument echo: its capture is nonexact and credential-redacted.
+The original coordinator fixture stops at an outdated terminal assertion because
+Mojentic reports `observer_failed` at the contaminated HTTP boundary. Repeating
+with that outcome accepted passes the original capture-redaction assertion.
+The provisional counterexample and both repeat logs remain in the evidence directory.
+
+A separate public reproduction against that exact recovered release is RED:
+reasoning prefix, harmless content, reasoning suffix succeeds and reconstructs a
+UUID-shaped active credential in reasoning and an exact capture. The correction
+tracks each semantic channel and each tool index/field independently, plus
+cross-field echoes. Unrelated content cannot release a held reasoning prefix.
+Pending text stays ordered until the originating channel disproves its prefix
+or safe completion releases it; interruption discards the held suffix.
+Mojentic's typed `ToolFragment` events are checked without waiting for completed
+calls. JSON string decoding serves credential verification only.
+
+Eight new public cases run through both providers:
+`credential_reasoning_interleaved`, `credential_content_interleaved`,
+`credential_tool_arguments`, `credential_tool_name`, `credential_tool_id`,
+`credential_tool_completed`, `credential_tool_escaped`, and
+`credential_tool_mixed`. Ollama uses object arguments; oMLX uses argument-string
+deltas, including unfinished JSON and escaped string values. Tests first prove
+the scripted body reconstructs the synthetic echo, then reconstruct individual
+semantic channels, tool fields, decoded argument values and raw captures. They
+require nonexact credential-redacted captures, one explicit failure, accurate
+observed prefix/tool progress, no tool execution and no admission or retry.
+HTTP-boundary contamination retains Mojentic's `observer_failed` terminal;
+semantic cancellation can report `cancelled` or `interrupted`. Library observations
+and failure identities are retained without manufacturing unseen fragment counts.
+
+## Capture and trace contract
+
+See `TRACE_SCHEMA.md` for the exact main trace and capture fields. Redacted
+event envelopes explicitly record redaction and nonexactness.
+Lifecycle
+contains identities, phase, observed/delivered semantic counters, safe failures,
+admission, delay and terminal transitions. Final errors retain structured
+history
+before the legacy worker returns an error. The renderer shows lifecycle/failure
+cards and interrupted content/reasoning previews. `llm.recovery.accounting`
+records actual sends separately from interactions and depth; `run.started`
+records explicit recovery settings.
+
+Response buffers stay in memory until terminal privacy checks. JSON/SSE framing
+is inspected only for credential verification, including unconsumed deltas and
+JSON-escaped error strings; Mojentic alone decodes completion semantics and
+controls retries. Known active
+credentials are filtered from metadata, errors and semantic deltas across chunk
+boundaries. Contamination fails closed and withholds the response body, marking
+`credential_redacted: true` and `exact: false`. Normal nonsecret payloads and
+provider metrics/progress are preserved. Headers and authorization configuration
+are never written. If the capture destination fails, the main trace retains
+failure/progress and no complete capture is claimed. Library-delivered counters
+refer to the library API boundary; privacy filtering may withhold those bytes
+from the worker. Pending metadata never claims exact capture.
+
+## Frozen Linux release repetition
+
+Build the ordinary Linux release worker with the pinned dependencies, then let
+the coordinator repeat the complete external fixture against that exact binary:
+
+```bash
+python3 fixtures/recovery/worker_conformance.py \
+  --worker /absolute/path/adaptive-agent-harness \
+  --artifacts /absolute/path/new-scripted-cell
+```
+
+The output directory must be new and outside all historical experiments. The
+fixture clears ambient credentials/proxies, uses synthetic credentials created
+only in memory, fingerprints the worker/fixture and records assertions. Optional
+`--provider ollama` or `--provider omlx` and repeatable `--case NAME` select
+cells.
+No extra toolchain target, static build or live dispatch is required. The Mac
+coordinator uses the exact normal release worker in a compatible Ubuntu 24.04
+Linux container before its separately registered bounded live experiment.
+
+## Decoded argument key/colon regression
+
+Privacy checks scan full assembled decoded strings, including unfinished JSON
+and incomplete escape suffixes. Opening quote offsets identify strings across
+snapshots, so a key awaiting its colon cannot supply a value's prior length.
+Only new decoded characters enter the existing cross-field prefix guards;
+repeated full snapshots are never concatenated as deltas. This guard does not
+interpret completion or retry semantics.
+
+Five additional cases run for each provider: escaped credential contamination
+at the key/colon boundary in truncated, completed, and escape-tail streams, plus
+ordinary argument controls in truncated and completed streams. Ollama uses its
+native argument objects with an HTTP key/colon split; oMLX uses argument-string
+deltas, including an unfinished Unicode escape. Contamination cannot retry or
+execute tools, captures are withheld and nonexact, and progress, terminal state
+and wire accounting remain visible. Controls retain exact captures and completed
+controls retain native tool results and history.
+
+## Validation and truthful limits
+
+Final validation on October 10, 2026:
+
+- All four required gates passed unchanged.
+- Tests: 357 passed, two existing tests ignored; standalone doctests passed.
+- Documentation generation and standalone doctests passed.
+- Unfiltered security audit passed: 289 dependencies scanned.
+- Release fixture: 102 provider cases and seven configuration refusal checks passed.
+- `cargo deny check`: license policy failed; advisories, bans and sources passed.
+
+Final release worker SHA-256:
 
 ```text
-format:      3491683-1791629257745703138
-clippy:      3501602-1791629392252949752
-test:        3501647-1791629392624894340
-release:     3493513-1791629278739035208
-doc:         3501439-1791629380681356768
-audit:       3492475-1791629271329405625
-deny:        3492647-1791629272523272521
-fixture:     3501561-1791629391076695677
-diagnostics: 3499166-1791629323188749184
+c851e5c0b49910a7078f1e548d2fae68eeba328295960e1d1ac4e71c2a25898c
 ```
 
-The Markdown log stem is recorded by the final lint invocation. The first failed
-focused test logs are preserved separately in the Foundry tool-log directory:
+The exact executable is preserved at `worker/adaptive-agent-harness` inside the
+owned evidence directory. `release-assertions.json` indexes every final scripted
+assertion. Gate results, full logs and source fingerprints are in `proof.json`.
 
-```text
-/home/svetzal/.foundry/tool-logs/3486333-1791629206586256313.stdout.log
-/home/svetzal/.foundry/tool-logs/3486333-1791629206586256313.stderr.log
-```
+ Required unchanged gates are formatting, strict locked all-target and
+all-feature Clippy/tests, and locked release bins build. Documentation, standalone
+doctests and unfiltered security audit are recorded alongside those gates.
+
+The previous license-policy limitation is retained: `cargo deny check` has no
+approved repository license policy and reports license requirements. No license
+policy or advisory suppression is added. Audit scope remains unfiltered.
+
+The CLI exposes deliberate stream drop through its existing explicit reasoning
+cap; `stream_drop_cap` exercises that path with preserved caps and capture.
+Arbitrary paused-consumer control is not exposed and is not claimed as
+worker-tested. The owned FIFO tests a paused wire capture hook, not a paused
+stream consumer. Shutdown has a five second terminal-evidence drain bound after
+the worker returns and drops its streams; this is not a generation timeout.
+Structured/advisory completion, embeddings, remote termination efficacy and live
+model behavior are not established by this worker streaming matrix. Ollama and
+oMLX do not provide proven general request cancellation/status/idempotency;
+local
+HTTP cancellation alone does not prove remote termination. A trusted helper must
+verify owned evidence. Credentials transformed beyond exact known values are
+outside this filter's guarantee. Abrupt SIGKILL cannot persist terminal
+evidence.
+
+Rust edition 2024, Tokio, dependency/features and formatting style are
+preserved.
+No MSRV, explicit workspace resolver, toolchain pin or CI workflows are
+declared;
+an explicit MSRV would help future maintenance. No inference ran and every
+historical benchmark remains frozen.

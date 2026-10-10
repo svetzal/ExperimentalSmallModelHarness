@@ -189,3 +189,49 @@ Each session entry requires either `label` or `trace`. `trace` matches the
 canonical trace path recorded by the renderer; `label` matches the displayed
 session label. Evidence is display-only and never changes the harness trace or
 its analyzer classification.
+
+## Request recovery lifecycle
+
+`llm.recovery.lifecycle` stores Mojentic's typed transition, identity
+(`logical_request_id`, `attempt_id`, `wire_attempt`), phase, progress, safe failure
+and optional delay. Progress separates headers/raw bytes from observed and
+library-delivered reasoning/content bytes, tool fragments and completed calls.
+Wire attempts are independent of worker interaction and tool depth accounting.
+`llm.recovery.accounting` records the final actual `wire_attempts` total, counted
+from failed/succeeded sends rather than undispatched request preparation.
+`run.started.recovery` records the explicit recovery settings.
+Lifecycle records include attempt starts/successes/failures, admission states,
+retry starts, delays, exhaustion, interruption and cancellation.
+
+`llm.recovery.final_failure` retains the structured recovery error and attempt
+history before the legacy worker returns an error. Harness privacy/persistence
+refusals following a library completion retain its report and explicit outcome.
+`llm.recovery.capture_failure` records a final capture write refusal. Private
+causes and response bodies are absent from default lifecycle/error serialization.
+Active known credentials are filtered from all persisted trace values and keys.
+A changed event envelope records `credential_redacted: true` and `exact: false`.
+Lifecycle payloads record `identifying_metadata_redacted: true` when a known
+credential invalidates the provider request ID.
+Credential prefixes spanning reasoning and content deltas are held in memory;
+contamination fails closed without another completion or completed tool effects.
+Library-delivered progress describes the library API boundary; a privacy refusal
+can withhold those bytes from the worker. Observed counters remain unchanged.
+
+Opt-in wire files use `<attempt_id>.request.body`, `.response.body` and `.json`.
+Metadata includes immutable `request_sha256`, HTTP status, `credential_redacted`,
+`identifying_metadata_redacted`, `exact` and `headers_captured: false`. Bodies are
+buffered until terminal privacy checks; pending metadata never claims exactness.
+A contaminated response is withheld and marked redacted/nonexact. Otherwise body
+bytes are exact at the HTTP boundary, including failures and partial streams.
+JSON/SSE framing is inspected only for credential verification, including
+unconsumed deltas and escaped error strings. Headers, URLs and authentication
+configuration are never captured. Capture write
+errors fail closed and cannot dispatch another request. If the destination itself
+fails, the main trace retains failure/progress and no complete capture is claimed.
+
+Worker shutdown drains terminal evidence for deliberately dropped streams and
+flushes their partial captures. Its five second cleanup bound starts after the
+worker returns; existing reasoning caps and generation timing are unchanged.
+
+Native `render-transcript` presents recovery lifecycle/failure cards alongside
+worker calls and retains interrupted reasoning/content previews safely.

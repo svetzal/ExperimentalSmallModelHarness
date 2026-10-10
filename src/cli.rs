@@ -52,7 +52,12 @@ struct Cli {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  adaptive-agent-harness run --experiment /work/new-cell --provider ollama\n  adaptive-agent-harness run --experiment /work/new-cell --recover-requests --recovery-max-attempts 2 --recovery-admission-command /opt/operator/owned-receipt\n\nWire attempts resend one immutable completion; they do not consume model interactions or replay tools. Recovery is disabled by default. SIGINT/SIGTERM persist terminal request evidence before exit."
+)]
 struct RunArgs {
+    #[command(flatten)]
+    recovery: crate::recovery::RecoverySettings,
     /// Experiment root. Tool access is scoped to this directory.
     #[arg(long)]
     experiment: PathBuf,
@@ -198,6 +203,7 @@ impl RunArgs {
             .context_window_tokens
             .or_else(|| model_context_window_tokens(&model));
         Ok(AgentRunConfig {
+            recovery: self.recovery,
             provider: self.provider,
             experiment_dir: self.experiment,
             trace_dir: self.trace_dir,
