@@ -1,6 +1,7 @@
 # Request recovery integration
 
-Owner: Stacey Vetzal. Scope approved October 9, 2026.
+Owner: Stacey Vetzal. Integration scope approved October 9, 2026.
+Scoped live authorization updated October 10, 2026.
 
 ## Required behavior
 
@@ -55,32 +56,48 @@ existing run settings. Help must explain attempts versus semantic interactions.
 
 ## Experiment boundary
 
-The fresh experiment is
-`~/Work/Sandbox2/Experiments/TransientRecovery-2026-10-09/`.
-The coordinator owns its plan, frozen registration, and result artifacts.
-Foundry changes this Harness repository only. It cannot write the experiment.
+The October 9 proposal named
+`~/Work/Sandbox2/Experiments/TransientRecovery-2026-10-09/`. That historical
+path does not authorize restarting a cell. The October 10 scope covers only a
+NEW registered bounded experiment chosen and owned by the Mac coordinator,
+including its plan, frozen registration and result artifacts. Foundry changes
+this Harness repository only and cannot write any experiment directory.
 
 Provide a deterministic integration test or runnable fixture that the coordinator
 can invoke after freezing the harness revision and worker binary hash.
 
 The Mac coordinates. The Linux worker build and validation run on `mojility-ops-01`.
-Do not start live inference. Do not restart or edit Generation45 or another
-stopped benchmark. Do not infer model efficacy or timeout origin from fake providers.
+Foundry must not start live inference or write experiment directories. After
+validation, the Mac coordinator may run only the NEW registered bounded live
+experiment under the October 10 authorization. The previous no-live rule remains
+part of the historical work record. Generation45 and every stopped benchmark
+remain frozen. Do not infer model efficacy or timeout origin from fake providers.
 
 ## Repository rules
 
-Fetch and pull with rebase before edits. Investigate dirty state first.
-Stop on a rebase conflict. Do not revert other sessions' work.
-Land focused changes on `main`, without pull requests or public feature branches.
+Investigate dirty state and compare upstream main before edits. Ordinary work
+fetches and pulls before editing. Inside a Foundry task worktree, Foundry owns
+Git finalization: do not change refs, commit, push, merge or rebase. Leave focused
+changes for independent review; preserve other sessions' edits. No pull request.
 
 Changes to dependency versions need separate commits. The Mojentic pin is part
 of integration. Unrelated dependency maintenance is outside this feature's scope.
 
-## Pinned API prerequisite found during integration
+## Resolved API prerequisite and production integration
 
-The reviewed revision does not expose Ollama nonsemantic frame progress through
-its recovery streaming API. Harness uses that progress for existing generation
-controls. Integration must preserve those controls and requires a reviewed
-upstream API before dispatch can be wired. See `RECOVERY-CONFORMANCE.md` for
-assertion-bearing diagnostics, the exact binary fixture invocation and the
-explicitly unverified recovery matrix. The existing pin remains unchanged.
+The original reviewed API at `bc8150a381a540e6320cd4fd91a8bbecadb9a735`
+lacked per-frame recovery progress and convenience-wrapper metrics. This blocked
+runtime integration without changing existing generation controls.
+
+Reviewed Mojentic `4ca1ed279c02eab37827a1ed07c30e961155ecf3` resolves the gap
+with typed `Progress { identity, progress }` and `Metrics { identity, metrics }`.
+Harness base `4854cc8a66ede3dacb0f3d37847ee09b14e16421` contains positive
+legacy/raw-recovery/compatibility equivalence assertions. Keep those assertions
+and the exact manifest and lockfile pin.
+
+The production worker uses the reviewed request recovery engine with one wire
+attempt by default. Explicit recovery, cancellable proof-bound admission,
+credential-safe capture and native lifecycle rendering are implemented in
+`src/recovery.rs`, `src/agent.rs` and `src/transcript.rs`. See
+`RECOVERY-CONFORMANCE.md` for assertion-bearing actual-worker evidence, helper
+schema, frozen Linux binary repetitions and explicit limits.

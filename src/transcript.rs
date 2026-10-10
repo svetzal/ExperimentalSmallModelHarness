@@ -306,6 +306,29 @@ fn parse_session(path: &Path) -> Result<Option<Session>> {
                     calls[index].request = Some(record.payload.clone());
                 }
             }
+            "llm.recovery.lifecycle" | "llm.recovery.final_failure" => {
+                if let Some(index) = current_call {
+                    calls[index].harness.push(EventCard {
+                        at,
+                        kind: record.kind.clone(),
+                        title: "Request recovery".into(),
+                        summary: record
+                            .payload
+                            .get("transition")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Final failure")
+                            .into(),
+                        severity: if record.payload.get("failure").is_some_and(|v| !v.is_null())
+                            || record.kind.ends_with("failure")
+                        {
+                            "warning"
+                        } else {
+                            "info"
+                        },
+                        payload: record.payload.clone(),
+                    });
+                }
+            }
             "llm.stream.thinking" => {
                 if let Some(index) = current_call {
                     let call = &mut calls[index];
@@ -317,7 +340,7 @@ fn parse_session(path: &Path) -> Result<Option<Session>> {
                     );
                 }
             }
-            "llm.stream.content" => {
+            "agent.stream.chunk" | "llm.stream.content" => {
                 if let Some(index) = current_call {
                     let call = &mut calls[index];
                     append_stream_text(
