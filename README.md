@@ -504,3 +504,22 @@ Run its deterministic tests with:
 ```sh
 python3 -m unittest discover -s benchmarks -p 'test_provider_activity.py' -v
 ```
+
+## External runner progress
+
+Missing or incomplete process, residency, or accelerator telemetry remains
+`ProgressUnknown` after the throughput projection expires. A quiet stream is
+not sufficient to cancel inference. Stall confirmation requires error-free,
+affirmative inactivity on every sampled activity channel, followed by repeated
+checks beyond the projection. Current process/GPU samplers do not establish
+all of those negatives for an external provider, so automatic stall cancellation
+fails closed there. This does not prove remote termination or authorize a retry.
+
+`fixtures/progress/worker_pause.py` exercises the public worker with scripted
+Ollama and oMLX streams pausing 390 seconds before resuming. It asserts retained
+reasoning and tool feedback, one tool execution, two logical requests and two
+wire attempts. A synthetic throughput registry makes the normal projection
+expire during the pause; it is not real model performance evidence. Run this
+fixture with a portable worker wrapper and `PAUSE_WORKER_PORTABLE=1` to verify
+unavailable external telemetry. Unit tests separately verify repeated reliable
+inactivity and interruption of a genuinely quiet stream.

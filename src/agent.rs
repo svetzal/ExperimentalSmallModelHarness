@@ -3108,6 +3108,16 @@ struct RunnerActivitySample {
 }
 
 impl RunnerActivitySample {
+    // Missing telemetry cannot establish inactivity, especially across containers.
+    // Require every activity channel to be affirmative, error-free negative evidence.
+    fn has_inactivity_evidence(&self) -> bool {
+        self.error.is_none()
+            && self.process_active == Some(false)
+            && self.model_loaded == Some(false)
+            && self.accelerator_resident == Some(false)
+            && self.gpu_utilization_percent == Some(0.0)
+    }
+
     fn has_activity_evidence(&self) -> bool {
         self.process_active == Some(true)
             || self.model_loaded == Some(true)
@@ -3459,6 +3469,7 @@ fn trace_model_progress_status(input: ModelProgressStatusInput<'_>) -> Result<()
             "allowed_seconds": input.projection.allowed_seconds,
             "projected_allowance_exceeded": input.elapsed.as_secs_f64() > input.projection.allowed_seconds,
             "runner_activity_evidence": runner_activity_evidence,
+            "runner_inactivity_evidence": input.runner_activity.is_some_and(RunnerActivitySample::has_inactivity_evidence),
             "runner_activity": input.runner_activity,
             "stalled_candidate_checks": input.stalled_candidate_checks,
             "automatic_interrupt": input.automatic_interrupt,
@@ -4793,6 +4804,10 @@ fn classify_model_progress(
             <= DEFAULT_PROGRESS_STATUS_INTERVAL_SECONDS as f64
     {
         return latest_visible_state;
+    }
+
+    if !runner_activity.is_some_and(RunnerActivitySample::has_inactivity_evidence) {
+        return ModelProgressState::ProgressUnknown;
     }
 
     if stalled_candidate_checks + 1 >= STALLED_CONFIRMATION_CHECKS {
@@ -7489,14 +7504,56 @@ mod tests {
         assert_eq!(state, ModelProgressState::ProgressUnknown);
     }
 
+    fn inactive_runner() -> RunnerActivitySample {
+        RunnerActivitySample {
+            source: "test reliable activity channels".to_string(),
+            process_active: Some(false),
+            model_loaded: Some(false),
+            accelerator_resident: Some(false),
+            accelerator_label: None,
+            gpu_utilization_percent: Some(0.0),
+            raw_summary: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn unknown_or_incomplete_activity_never_authorizes_stall() {
+        let mut incomplete = inactive_runner();
+        incomplete.gpu_utilization_percent = None;
+        let mut failed = inactive_runner();
+        failed.error = Some("telemetry unavailable".to_string());
+        let unknown = RunnerActivitySample {
+            process_active: None,
+            model_loaded: None,
+            accelerator_resident: None,
+            gpu_utilization_percent: None,
+            ..inactive_runner()
+        };
+        for activity in [None, Some(&unknown), Some(&incomplete), Some(&failed)] {
+            assert_eq!(
+                classify_model_progress(
+                    ModelProgressState::Generating,
+                    Duration::from_secs(10_000),
+                    Duration::from_secs(10_000),
+                    30.0,
+                    activity,
+                    STALLED_CONFIRMATION_CHECKS,
+                ),
+                ModelProgressState::ProgressUnknown
+            );
+        }
+    }
+
     #[test]
     fn quiet_runner_requires_repeated_checks_before_stalled() {
+        let inactive = inactive_runner();
         let first_check = classify_model_progress(
             ModelProgressState::WaitingForFirstToken,
             Duration::from_secs(90),
             Duration::from_secs(90),
             30.0,
-            None,
+            Some(&inactive),
             0,
         );
         let second_check = classify_model_progress(
@@ -7504,12 +7561,22 @@ mod tests {
             Duration::from_secs(120),
             Duration::from_secs(120),
             30.0,
-            None,
+            Some(&inactive),
             1,
         );
-
         assert_eq!(first_check, ModelProgressState::PossiblyStalled);
         assert_eq!(second_check, ModelProgressState::Stalled);
+        assert_eq!(
+            classify_model_progress(
+                first_check,
+                Duration::from_secs(120),
+                Duration::from_secs(120),
+                30.0,
+                None,
+                1
+            ),
+            ModelProgressState::ProgressUnknown
+        );
     }
 
     #[test]
@@ -7592,16 +7659,7 @@ mod tests {
                 allowed_seconds: 0.01,
             }),
             progress_status_interval_override: Some(Duration::from_millis(50)),
-            runner_activity_override: Some(RunnerActivitySample {
-                source: "test".to_string(),
-                process_active: Some(false),
-                model_loaded: Some(false),
-                accelerator_resident: Some(false),
-                accelerator_label: None,
-                gpu_utilization_percent: None,
-                raw_summary: None,
-                error: None,
-            }),
+            runner_activity_override: Some(inactive_runner()),
             trace: &trace,
             turn: 1,
             requested_validation_commands: &[],
