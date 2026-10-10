@@ -439,7 +439,23 @@ def run_case(worker, artifacts, provider, name):
                 assert terminal_sent.wait(5), "terminal-only chunk not sent"
                 time.sleep(.1)  # HTTP observer is blocked opening the owned FIFO.
             proc.send_signal(signal.SIGTERM)
-            if name == "cancel_terminal": stop.set()
+            if name == "cancel_terminal":
+                # Keep the terminal frame withheld until the runtime has observed
+                # cancellation. Releasing immediately after SIGTERM races signal
+                # delivery against a successful completed response.
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    traces = list((root / "traces").glob("*.jsonl"))
+                    if traces:
+                        events = [json.loads(line) for line in traces[0].read_text().splitlines()]
+                        if any(event["kind"] == "llm.recovery.lifecycle"
+                               and event["payload"].get("transition") == "cancelled"
+                               for event in events):
+                            break
+                    time.sleep(.01)
+                else:
+                    raise AssertionError("runtime cancellation was not observed before terminal release")
+                stop.set()
             if name == "cancel_terminal_body":
                 time.sleep(.1)  # Let the runtime observe SIGTERM before releasing the wire hook.
                 pending = next(capture.glob("*.pending.json"))
