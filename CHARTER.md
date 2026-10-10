@@ -51,3 +51,12 @@ attempt and encoded request. A syntactically valid provider identifier can still
 echo a credential; filter known active credentials before persistence or admission.
 Credential fragments across transport or semantic boundaries require buffering;
 a redacted capture must never be presented as exact wire evidence.
+
+## Workspace preservation
+
+Capture Git stash object IDs before agent tools run, then compare inventories
+before accepting DONE. Existing stashes are baseline evidence, not automatically
+agent-owned work. Never automatically restore or discard stashes. Record shared
+repository attribution as uncertain. A restored implementation must still pass
+its independent verifier; recovery of missing edits alone does not prove quality.
+See `STASH-COMPLETION-2026-10.md` for the deterministic checks and diagnostic.

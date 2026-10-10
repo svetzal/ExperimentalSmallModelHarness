@@ -435,6 +435,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     if let Some(evidence) = recovery_evidence {
         evidence.bind(trace.clone());
     }
+    let stash_baseline = crate::stash::capture(&tool_root).await;
     let harness_source_state = crate::provenance::capture();
     let tool_surface = ToolSurface::from_environment()?;
     trace.event(
@@ -474,6 +475,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         }),
     )?;
 
+    trace.event("agent.git_stash.entry", &stash_baseline)?;
     trace.event(
         "packet.scope",
         serde_json::json!({
@@ -668,6 +670,10 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     );
     let worker_message =
         worker_message_with_declared_probes(&worker_message, &resolved_contract.probes);
+    let worker_message = match crate::stash::entry_prompt(&stash_baseline) {
+        Some(guidance) => format!("{worker_message}\n\n{guidance}"),
+        None => worker_message,
+    };
     if let Some((spec, plan_trace_file, interaction_trace_file)) = &acceptance_ledger {
         trace.event(
             crate::runtime_events::ACCEPTANCE_LEDGER_DELIVERED,
@@ -825,6 +831,15 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         {
             Ok(turn_result) => turn_result,
             Err(error) => {
+                let current = crate::stash::capture(&tool_root).await;
+                let _ = trace.event(
+                    "agent.git_stash.exit",
+                    serde_json::json!({
+                        "baseline": stash_baseline, "current": current,
+                        "comparison": crate::stash::compare(&stash_baseline, &current),
+                        "exit_reason": "agent_stream_error",
+                    }),
+                );
                 let _ = trace_run_failed(
                     &trace,
                     "agent.stream",
@@ -1285,6 +1300,24 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             continue;
         }
         final_summary = response.clone();
+        if is_done_response(&final_summary) {
+            let current = crate::stash::capture(&tool_root).await;
+            let comparison = crate::stash::compare(&stash_baseline, &current);
+            trace.event(
+                "agent.git_stash.completion_check",
+                serde_json::json!({
+                    "turn": turn, "baseline": stash_baseline, "current": current,
+                    "comparison": comparison, "done_allowed": !comparison.blocks_done(),
+                }),
+            )?;
+            if comparison.blocks_done() {
+                trace.event("agent.git_stash.done_rejected", &comparison)?;
+                final_summary = "FAIL unresolved Git stash state at completion".to_string();
+                final_response_only_next_turn = false;
+                messages.push(LlmMessage::user(comparison.prompt()));
+                continue;
+            }
+        }
         if policy.validation_required_after_write {
             trace.event(
                 "agent.validation.required_after_edit",
@@ -1399,6 +1432,14 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             )?;
         }
     }
+    let stash_final = crate::stash::capture(&tool_root).await;
+    trace.event(
+        "agent.git_stash.exit",
+        serde_json::json!({
+            "baseline": stash_baseline, "current": stash_final,
+            "comparison": crate::stash::compare(&stash_baseline, &stash_final),
+        }),
+    )?;
     scope.observe_runtime(crate::runtime::RuntimeEvent::RunFinished);
 
     let summary = AgentRunSummary {
@@ -10148,6 +10189,152 @@ mod tests {
         assert!(!worker_packet.contains("prohibited-context"));
         let trace = std::fs::read_to_string(summary.trace_file).unwrap();
         assert!(trace.contains("\"kind\":\"initial_context.advisory.skipped\""));
+    }
+
+    fn git_stash_fixture(root: &std::path::Path) {
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "fixture@example.invalid"],
+            vec!["config", "user.name", "Fixture"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        std::fs::write(root.join("tracked.txt"), "seed").unwrap();
+        for args in [vec!["add", "tracked.txt"], vec!["commit", "-m", "seed"]] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stash_entry_existing_stash_is_delivered_and_does_not_reject_done() {
+        let fixture = AgentFixture::new("Finish without changing existing stashes.");
+        git_stash_fixture(&fixture.workspace);
+        std::fs::write(fixture.workspace.join("tracked.txt"), "prior").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["stash", "push"])
+                .current_dir(&fixture.workspace)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let baseline = crate::stash::capture(&fixture.workspace).await;
+        let gateway = ScriptedGateway::new(vec![vec![StreamChunk::Content("DONE".into())]]);
+        let summary = fixture.run(&gateway, 1).await;
+        assert_eq!(summary.final_summary, "DONE");
+        assert_eq!(baseline, crate::stash::capture(&fixture.workspace).await);
+        assert!(gateway.stream_messages()[0].iter().any(|m| {
+            m.content
+                .as_deref()
+                .unwrap_or("")
+                .contains("Git stash inventory at entry")
+        }));
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(!trace.contains("agent.git_stash.done_rejected"));
+        assert!(trace.contains("agent.git_stash.exit"));
+    }
+
+    #[tokio::test]
+    async fn stash_created_by_agent_tool_rejects_done_and_survives_fail() {
+        let fixture = AgentFixture::new("Exercise a stash without discarding it.");
+        git_stash_fixture(&fixture.workspace);
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([(
+                    "command".into(),
+                    serde_json::json!("printf new > tracked.txt && git stash push"),
+                )]),
+            )],
+            vec![StreamChunk::Content("DONE".into())],
+            vec![StreamChunk::Content("FAIL unresolved stash".into())],
+        ]);
+        let summary = fixture.run(&gateway, 2).await;
+        assert_eq!(summary.final_summary, "FAIL unresolved stash");
+        assert!(
+            matches!(crate::stash::capture(&fixture.workspace).await, crate::stash::Inventory::Captured { object_ids, .. } if object_ids.len() == 1)
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("agent.git_stash.done_rejected"));
+        assert!(gateway.stream_messages().last().unwrap().iter().any(|m| {
+            m.content
+                .as_deref()
+                .unwrap_or("")
+                .contains("DONE withheld: Git stash state")
+        }));
+    }
+
+    #[tokio::test]
+    async fn stash_rejection_at_last_turn_never_reports_done() {
+        let fixture = AgentFixture::new("Exercise completion at the budget boundary.");
+        git_stash_fixture(&fixture.workspace);
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([(
+                    "command".into(),
+                    serde_json::json!("printf new > tracked.txt && git stash push"),
+                )]),
+            )],
+            vec![StreamChunk::Content("DONE".into())],
+        ]);
+        let summary = fixture.run(&gateway, 1).await;
+        assert_eq!(
+            summary.final_summary,
+            "FAIL unresolved Git stash state at completion"
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("agent.git_stash.done_rejected"));
+        assert!(!trace.contains("\"final_summary\":\"DONE\""));
+    }
+
+    #[tokio::test]
+    async fn removing_an_entry_stash_rejects_done_without_restoring_it() {
+        let fixture = AgentFixture::new("Detect removal of work that predates entry.");
+        git_stash_fixture(&fixture.workspace);
+        std::fs::write(fixture.workspace.join("tracked.txt"), "prior").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["stash", "push"])
+                .current_dir(&fixture.workspace)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let gateway = ScriptedGateway::new(vec![
+            vec![tool_call_chunk(
+                "shell_command",
+                HashMap::from([("command".into(), serde_json::json!("git stash drop"))]),
+            )],
+            vec![StreamChunk::Content("DONE".into())],
+            vec![StreamChunk::Content("FAIL prior stash was removed".into())],
+        ]);
+        let summary = fixture.run(&gateway, 2).await;
+        assert_eq!(summary.final_summary, "FAIL prior stash was removed");
+        assert!(
+            matches!(crate::stash::capture(&fixture.workspace).await, crate::stash::Inventory::Captured { object_ids, .. } if object_ids.is_empty())
+        );
+        let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+        assert!(trace.contains("removed_baseline_object_ids"));
+        assert!(trace.contains("agent.git_stash.done_rejected"));
     }
 
     struct AgentFixture {

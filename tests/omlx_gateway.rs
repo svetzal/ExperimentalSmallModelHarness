@@ -102,6 +102,145 @@ fn final_response() -> String {
     )
 }
 
+#[test]
+fn built_worker_preserves_entry_stash_and_rejects_new_stash_both_providers() {
+    for provider in ["ollama", "omlx"] {
+        for create_new in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(
+                temp.path().join("task.md"),
+                "Check stash ownership and finish.",
+            )
+            .unwrap();
+            let git = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(&workspace)
+                        .output()
+                        .unwrap()
+                        .status
+                        .success()
+                );
+            };
+            git(&["init"]);
+            git(&["config", "user.email", "fixture@example.invalid"]);
+            git(&["config", "user.name", "Fixture"]);
+            std::fs::write(workspace.join("tracked.txt"), "seed").unwrap();
+            git(&["add", "tracked.txt"]);
+            git(&["commit", "-m", "seed"]);
+            std::fs::write(workspace.join("tracked.txt"), "prior").unwrap();
+            git(&["stash", "push"]);
+            let before = Command::new("git")
+                .args(["stash", "list", "--format=%H"])
+                .current_dir(&workspace)
+                .output()
+                .unwrap()
+                .stdout;
+            let message = |content: &str| json!({"role":"assistant","content":content});
+            let mut messages = vec![];
+            if create_new {
+                messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":"stash-tool","type":"function","function":{"name":"shell_command","arguments":{"command":"printf new > tracked.txt && git stash push"}}}]}));
+            }
+            messages.push(message("DONE"));
+            if create_new {
+                messages.push(message("FAIL unresolved stash"));
+            }
+            let responses = messages
+                .into_iter()
+                .map(|mut m| {
+                    if provider == "ollama" {
+                        format!(
+                            "{}\n{}\n",
+                            json!({"message":m,"done":false}),
+                            json!({"message":{"content":""},"done":true,"done_reason":"stop"})
+                        )
+                    } else {
+                        if let Some(calls) = m.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                            for call in calls {
+                                call["function"]["arguments"] =
+                                    json!(call["function"]["arguments"].to_string());
+                                call["index"] = json!(0);
+                            }
+                        }
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            json!({"choices":[{"delta":m,"finish_reason":"stop"}]})
+                        )
+                    }
+                })
+                .collect();
+            let (host, server) = mock_provider_server(
+                responses,
+                if provider == "ollama" {
+                    "/api/chat"
+                } else {
+                    "/v1/chat/completions"
+                },
+                provider == "omlx",
+            );
+            let output = Command::new(env!("CARGO_BIN_EXE_adaptive-agent-harness"))
+                .current_dir(&workspace)
+                .env("OLLAMA_HOST", &host)
+                .env("OMLX_HOST", &host)
+                .env("OMLX_API_KEY", "test-key")
+                .args(["run", "--experiment"])
+                .arg(temp.path())
+                .args(["--provider", provider, "--max-iterations", "2"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                summary["final_summary"],
+                if create_new {
+                    "FAIL unresolved stash"
+                } else {
+                    "DONE"
+                }
+            );
+            let requests = server.join().unwrap();
+            assert!(requests[0]["messages"].as_array().unwrap().iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Git stash inventory at entry")
+            }));
+            if create_new {
+                assert!(
+                    requests.last().unwrap()["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["content"]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("DONE withheld: Git stash state"))
+                );
+            }
+            let after = Command::new("git")
+                .args(["stash", "list", "--format=%H"])
+                .current_dir(&workspace)
+                .output()
+                .unwrap()
+                .stdout;
+            assert!(after.ends_with(&before));
+            assert_eq!(
+                String::from_utf8(after).unwrap().lines().count(),
+                if create_new { 2 } else { 1 }
+            );
+            let trace = std::fs::read_to_string(summary["trace_file"].as_str().unwrap()).unwrap();
+            assert_eq!(trace.contains("agent.git_stash.done_rejected"), create_new);
+        }
+    }
+}
+
 fn run_cli(host: &str, effort: Option<&str>, budget_flag: &str) -> (tempfile::TempDir, Value) {
     run_cli_options(host, effort, budget_flag, &[])
 }

@@ -127,6 +127,14 @@ quality. Generation40 preserves the implementation and validation evidence.
 
 ## Build and Test
 
+Git workspaces receive an entry stash inventory before agent tools run. DONE
+is withheld for new unresolved stashes, missing baseline stashes or an inventory
+that cannot be verified. Existing stashes remain untouched. The agent decides
+how to resolve its work; the harness never pops or drops it automatically.
+Object IDs identify entries, and shared-repository attribution remains uncertain.
+See [stash completion checks](STASH-COMPLETION-2026-10.md) for trace fields,
+deterministic tests and the restored-implementation diagnostic.
+
 ```sh
 cargo build
 cargo test --all-targets

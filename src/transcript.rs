@@ -644,6 +644,7 @@ fn is_harness_event(kind: &str) -> bool {
         || kind.starts_with("agent.turn.empty")
         || kind.starts_with("agent.turn.hidden")
         || kind.starts_with("agent.contract.probes")
+        || kind.starts_with("agent.git_stash")
         || kind.starts_with("llm.thinking_only_stream")
 }
 
@@ -801,6 +802,7 @@ fn severity_for(kind: &str, payload: &Value) -> &'static str {
     } else if payload.get("success").and_then(Value::as_bool) == Some(false)
         || kind.contains("repair")
         || kind.contains("no_action")
+        || kind == "agent.git_stash.done_rejected"
     {
         "warning"
     } else if payload.get("success").and_then(Value::as_bool) == Some(true)
