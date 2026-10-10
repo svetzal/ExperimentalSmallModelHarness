@@ -346,3 +346,54 @@ No MSRV, explicit workspace resolver, toolchain pin or CI workflows are
 declared;
 an explicit MSRV would help future maintenance. No inference ran and every
 historical benchmark remains frozen.
+
+## Bounded live inference evidence, October 10, 2026
+
+The independently reviewed integration landed as
+`8739f6dadc24df9264d8a909aac27df72d23f2be`. The live worker source revision was
+`2c0e9e973d3038cf15a053d1859ebf2e7197271e`; following commits changed only the
+cancellation fixture synchronization. Mojentic is pinned to reviewed Rust
+`4ca1ed279c02eab37827a1ed07c30e961155ecf3`, without requiring publication.
+The canonical ops-01 release SHA-256 was
+`973c5a55f57b388bea04523c0948e8cdac978673fe6badb56c001bbef031209c`.
+
+All unchanged required gates and the unfiltered security audit passed. Three
+release-worker repetitions passed 306 provider cases and 21 configuration
+refusals across both adapters. Six actual launch combinations passed scripted
+endpoints, and 16 experiment-adapter safety tests passed. The existing optional
+license-policy gap remains unsuppressed.
+
+The fresh immutable experiment directories are
+`Experiments/TransientRecovery-2026-10-10/` and
+`Experiments/TransientRecovery-2026-10-10-Live02/` in the Sandbox2 workspace.
+The first preserves a zero-dispatch contract-mount failure. The replacement
+registration preserved the worker, workload and bounds, correcting the mount
+layout after actual-launch validation. Full notes, registrations, lifecycle
+traces, safe exact captures, Git workspaces, binary patches and native combined
+transcripts remain in those directories.
+
+Real Ollama 0.40.2 inference passed the disabled baseline (one wire attempt,
+one logical interaction, 27.550 seconds) and controlled pre-forward HTTP503
+recovery (two attempts, one interaction, 19.858 seconds). Retry payloads were
+identical, the controlled failure did not dispatch upstream generation, and
+both cells passed cleanup and independent evidence audits. Runtime includes
+cleanup and artifact generation and is not pure inference latency.
+
+The next cell stopped: the model first completed `list_tree` in response to
+actual harness guidance. The fault adapter treated any tool result as its
+trigger and required a shell receipt, closing before forwarding when the
+receipt did not exist. The worker rejected recovery without request-bound
+admission proof. This is an adapter failure, not a natural provider failure.
+Its exact second packet retained the completed inspection result and reasoning.
+No shell executed, no oMLX live cells ran, and no further inference or model
+unload followed the unresolved receipt boundary. The stopped registration is
+not resumed. Real shell-history recovery and oMLX live recovery remain
+unvalidated; exactly-once tools on both paths have repeated scripted evidence.
+
+Recovery remains opt-in, disabled by default. A future fresh live cell must
+trigger only after the intended shell receipt and account for harmless
+inspection under its predeclared interaction bounds. MXFP8 versus MLX affine
+8-bit and retained caches preclude comparative efficacy claims. These results
+do not identify Generation45's original 504 cause or establish conformance
+across all six Mojentic libraries. All historical stopped benchmarks remain
+unchanged.
