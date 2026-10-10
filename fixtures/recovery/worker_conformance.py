@@ -447,7 +447,8 @@ def run_case(worker, artifacts, provider, name):
                 while time.monotonic() < deadline:
                     traces = list((root / "traces").glob("*.jsonl"))
                     if traces:
-                        events = [json.loads(line) for line in traces[0].read_text().splitlines()]
+                        events = [json.loads(line) for line in traces[0].read_text().splitlines(keepends=True)
+                                  if line.endswith("\n")]
                         if any(event["kind"] == "llm.recovery.lifecycle"
                                and event["payload"].get("transition") == "cancelled"
                                for event in events):
@@ -508,7 +509,8 @@ def run_case(worker, artifacts, provider, name):
         assert request["chat_template_kwargs"]["preserve_thinking"] is True
     traces = list((root / "traces").glob("*.jsonl"))
     assert len(traces) == 1
-    events = [json.loads(line) for line in traces[0].read_text().splitlines()]
+    events = [json.loads(line) for line in traces[0].read_text().splitlines(keepends=True)
+                                  if line.endswith("\n")]
     started_run = next(e["payload"] for e in events if e["kind"] == "run.started")
     assert started_run["recovery"]["recover_requests"] == (enabled and name != "one_attempt_capture")
     assert started_run["recovery"]["recovery_max_attempts"] == (3 if name == "persistent504" else 2 if enabled and name != "one_attempt_capture" else 1)
