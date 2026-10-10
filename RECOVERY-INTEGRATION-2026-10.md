@@ -75,3 +75,12 @@ Land focused changes on `main`, without pull requests or public feature branches
 
 Changes to dependency versions need separate commits. The Mojentic pin is part
 of integration. Unrelated dependency maintenance is outside this feature's scope.
+
+## Pinned API prerequisite found during integration
+
+The reviewed revision does not expose Ollama nonsemantic frame progress through
+its recovery streaming API. Harness uses that progress for existing generation
+controls. Integration must preserve those controls and requires a reviewed
+upstream API before dispatch can be wired. See `RECOVERY-CONFORMANCE.md` for
+assertion-bearing diagnostics, the exact binary fixture invocation and the
+explicitly unverified recovery matrix. The existing pin remains unchanged.
