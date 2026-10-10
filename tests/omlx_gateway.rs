@@ -306,6 +306,7 @@ fn worker_effort_and_token_budgets_reach_omlx_on_the_wire() {
         assert_eq!(request["model"], "Qwen3.8-27B-MLX-8bit");
         assert_eq!(request["stream"], true);
         assert_eq!(request["max_tokens"], 8192);
+        assert_eq!(request["temperature"], 1.0);
         assert!(request.get("num_predict").is_none());
         assert!(request.get("num_ctx").is_none());
         assert!(
@@ -618,6 +619,7 @@ fn ollama_worker_preserves_native_reasoning_and_records_provider_controls() {
             assert_eq!(request["model"], "qwen3.8:27b-mxfp8");
             assert_eq!(request["think"], "medium");
             assert_eq!(request["options"]["num_predict"], 8192);
+            assert_eq!(request["options"]["temperature"], 1.0);
             assert_eq!(request["options"]["num_ctx"], 262144);
             assert!(request.get("enable_thinking").is_none());
         }

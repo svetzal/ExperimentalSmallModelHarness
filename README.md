@@ -78,6 +78,12 @@ For `run` and `run-sequential`:
 - Shell tools use a non-login shell, preserving the inherited PATH and virtual
   environment. Task tools resolve the same executables as the worker environment.
 
+Coding-agent completions use temperature `1.0`, following the user-authorized
+Qwen3.8 sampling change. Acceptance-plan and semantic-advisory settings are
+independent. Existing registered experiments retain their original binaries
+and sampling settings. This change is not evidence of improved quality; future
+replicates must measure repetition, reasoning exits and verified outcomes.
+
 Provider snapshots include the requested completion settings and the mapped
 provider controls. Run summaries use `max_tokens` in place of `num_predict`.
 The summary records the requested budget; provider snapshots record its

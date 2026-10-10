@@ -343,7 +343,7 @@ fn agent_completion_config(
         anyhow::bail!("max_tokens must be greater than zero");
     }
     let mut completion_config = CompletionConfig {
-        temperature: 0.2,
+        temperature: 1.0,
         max_tool_iterations: max_model_interactions,
         max_tokens,
         reasoning_effort,
@@ -8214,6 +8214,7 @@ mod tests {
 
         let config = agent_completion_config(7, None, None, None).unwrap();
 
+        assert_eq!(config.temperature, 1.0);
         assert_eq!(config.num_ctx, provider_default);
         assert_eq!(config.max_tool_iterations, 7);
         assert_eq!(config.max_tokens, 16_384);
