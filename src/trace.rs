@@ -39,11 +39,15 @@ impl TraceRecorder {
         self.value_event(kind, payload)
     }
 
-    pub fn value_event(&self, kind: &str, payload: Value) -> Result<()> {
+    pub fn value_event(&self, kind: &str, mut payload: Value) -> Result<()> {
+        let credential_redacted =
+            crate::recovery::redact_value(&mut payload, &crate::recovery::credentials());
         let record = TraceEvent {
             timestamp: Utc::now(),
             kind,
             payload,
+            credential_redacted: credential_redacted.then_some(true),
+            exact: credential_redacted.then_some(false),
         };
         let mut file = self.file.lock().expect("trace mutex poisoned");
         serde_json::to_writer(&mut *file, &record)?;
@@ -58,6 +62,10 @@ struct TraceEvent<'a> {
     timestamp: DateTime<Utc>,
     kind: &'a str,
     payload: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_redacted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exact: Option<bool>,
 }
 
 pub fn error_payload(error: &anyhow::Error) -> Value {

@@ -85,6 +85,7 @@ impl Provider {
 
 #[derive(Debug, Clone)]
 pub struct AgentRunConfig {
+    pub recovery: crate::recovery::RecoverySettings,
     pub provider: Provider,
     pub experiment_dir: PathBuf,
     /// Optional trace destination outside the tool-visible experiment root.
@@ -284,14 +285,51 @@ pub fn default_repair_exit_thinking_tokens() -> usize {
 }
 
 pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
-    let gateway: Box<dyn LlmGateway> = match config.provider {
-        Provider::Omlx => Box::new(OmlxGateway::new()),
-        Provider::Ollama => Box::new(OllamaGateway::new()),
-    };
     let tool_root = PathBuf::from(".")
         .canonicalize()
         .context("canonicalizing harness cwd")?;
-    run_agent_with_gateway(config, gateway.as_ref(), tool_root).await
+    config.recovery.validate(&tool_root)?;
+    let evidence = crate::recovery::evidence(&config.recovery);
+    let call = mojentic::llm::recovery::RecoveryCall::default();
+    let cancellation = call.cancellation.clone();
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("registering terminal request cancellation")?;
+    let signal = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        cancellation.cancel();
+    });
+    let gateway: Box<dyn LlmGateway> = match config.provider {
+        Provider::Omlx => Box::new(crate::recovery::WorkerGateway::new(
+            OmlxGateway::new(),
+            &config.recovery,
+            call,
+            evidence.clone(),
+        )?),
+        Provider::Ollama => Box::new(crate::recovery::WorkerGateway::new(
+            OllamaGateway::new(),
+            &config.recovery,
+            call,
+            evidence.clone(),
+        )?),
+    };
+    let result =
+        run_agent_with_gateway_inner(config, gateway.as_ref(), tool_root, Some(evidence.clone()))
+            .await;
+    let settled = evidence.settle().await;
+    signal.abort();
+    match result {
+        Err(error) => Err(error),
+        Ok(summary) => {
+            settled?;
+            Ok(summary)
+        }
+    }
 }
 
 fn agent_completion_config(
@@ -317,10 +355,20 @@ fn agent_completion_config(
     Ok(completion_config)
 }
 
+#[cfg(test)]
 async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     config: AgentRunConfig,
     gateway: &G,
     tool_root: PathBuf,
+) -> Result<AgentRunSummary> {
+    run_agent_with_gateway_inner(config, gateway, tool_root, None).await
+}
+
+async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
+    config: AgentRunConfig,
+    gateway: &G,
+    tool_root: PathBuf,
+    recovery_evidence: Option<Arc<crate::recovery::Evidence>>,
 ) -> Result<AgentRunSummary> {
     let mut completion_config = agent_completion_config(
         config.max_model_interactions,
@@ -384,6 +432,9 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
         .clone()
         .unwrap_or_else(|| experiment_dir.join("traces"));
     let trace = Arc::new(TraceRecorder::create(&trace_dir)?);
+    if let Some(evidence) = recovery_evidence {
+        evidence.bind(trace.clone());
+    }
     let harness_source_state = crate::provenance::capture();
     let tool_surface = ToolSurface::from_environment()?;
     trace.event(
@@ -400,6 +451,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
             "packet_type": config.packet_type,
             "expected_output_tokens": config.expected_output_tokens,
             "provider": config.provider,
+            "recovery": &config.recovery,
             "max_tokens": config.max_tokens,
             "reasoning_effort": config.reasoning_effort,
             "reasoning_profile": config.reasoning_profile,
@@ -8677,6 +8729,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let trace = TraceRecorder::create(&temp.path().join("traces")).unwrap();
         let config = AgentRunConfig {
+            recovery: Default::default(),
             provider: Provider::Omlx,
             experiment_dir: temp.path().join("experiment"),
             trace_dir: None,
@@ -10142,6 +10195,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    recovery: Default::default(),
                     provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
@@ -10182,6 +10236,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    recovery: Default::default(),
                     provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
@@ -10222,6 +10277,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    recovery: Default::default(),
                     provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir,
@@ -10287,6 +10343,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    recovery: Default::default(),
                     provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
@@ -10326,6 +10383,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    recovery: Default::default(),
                     provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
@@ -10365,6 +10423,7 @@ mod tests {
         ) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    recovery: Default::default(),
                     provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,
@@ -10400,6 +10459,7 @@ mod tests {
         async fn run_with_initial_context(&self, gateway: &ScriptedGateway) -> AgentRunSummary {
             run_agent_with_gateway(
                 AgentRunConfig {
+                    recovery: Default::default(),
                     provider: Provider::Omlx,
                     experiment_dir: self.experiment.clone(),
                     trace_dir: None,

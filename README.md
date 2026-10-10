@@ -45,7 +45,7 @@ environment variables:
 | --- | --- | --- |
 | `OLLAMA_HOST` | Ollama server URL | `http://localhost:11434` |
 | `OMLX_HOST` | Server URL without `/v1` | `http://localhost:8000` |
-| `OMLX_API_KEY` | Bearer token, when the server requires authentication | Unset |
+| `OMLX_API_KEY` | Bearer token for authenticated servers | Unset |
 | `OMLX_TIMEOUT` | Timeout for non-streaming calls, in milliseconds | `600000` |
 
 The gateway adds `/v1` to the URL. Streaming requests have no gateway-wide
@@ -153,6 +153,37 @@ The main commands are:
 - `summarize-matrix` — reproduce the preserved benchmark baseline
 
 Use `cargo run -- <command> --help` for command-specific options.
+
+### Request recovery
+
+Recovery is disabled by default, with one wire attempt per completion. Opt in
+explicitly; wire attempts do not consume model interactions or replay tools:
+
+```bash
+adaptive-agent-harness run --experiment /work/new-cell --provider ollama \
+  --recover-requests --recovery-max-attempts 2 \
+  --recovery-base-delay-ms 100 --recovery-delay-ceiling-ms 30000 \
+  --recovery-budget-ms 60000 \
+  --recovery-admission-command /opt/operator/owned-receipt \
+  --recovery-capture-dir /work/private-wire
+```
+
+The trusted admission executable must be outside the model tool root. It receives
+safe failure metadata and the immutable encoded request SHA-256 on stdin and must
+return proof bound to the previous attempt and logical request. A plain allow
+flag, aggregate activity, cancellation or model residency cannot admit a retry.
+Pending admission is cancellable and expires after five seconds. Semantic partial
+output ends with interruption and cannot be continued by another wire attempt.
+
+`--recovery-capture-dir` is also allowed without `--recover-requests`, providing
+explicit one-attempt capture. Credential checks cover each reasoning/content
+channel and partial tool argument, name and ID fields, including JSON-escaped
+values. Unrelated content cannot release a held reasoning credential prefix.
+Captures exclude headers, withhold credential echoes
+and label redaction and exactness. SIGINT and SIGTERM persist terminal lifecycle
+and failure evidence before exit. Recovery budgets begin after failure; they are
+not total-generation timeouts. See [recovery conformance](RECOVERY-CONFORMANCE.md)
+for proof schema, safe capture limits and the external release-worker fixture.
 
 ### Native initial-context assembly
 
