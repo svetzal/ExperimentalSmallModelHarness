@@ -4,6 +4,7 @@
 //! runtime state or invoke tools. Their structured output is always a proposal
 //! that an owning deterministic policy must validate before use.
 
+use crate::sha256::sha256_hex;
 use crate::trace::TraceRecorder;
 use anyhow::{Context, Result, bail};
 use mojentic::llm::LlmGateway;
@@ -11,7 +12,6 @@ use mojentic::llm::gateway::{CompletionConfig, ResponseFormat};
 use mojentic::llm::models::LlmMessage;
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 pub const SEMANTIC_ADVISORY_SCHEMA_VERSION: &str = "semantic_advisory.v1";
@@ -158,7 +158,7 @@ pub async fn request_semantic_advisory<G: LlmGateway + ?Sized>(
                 );
                 let content = response.content.unwrap_or_default();
                 content_chars = Some(content.chars().count());
-                content_sha256 = Some(format!("{:x}", Sha256::digest(content.as_bytes())));
+                content_sha256 = Some(sha256_hex(content.as_bytes()));
                 content_preview = Some(content.chars().take(256).collect::<String>());
                 serde_json::from_str(&content)
                     .context("decoding structured semantic advisory content")

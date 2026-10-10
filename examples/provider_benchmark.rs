@@ -51,7 +51,10 @@ impl Config {
 }
 
 fn digest(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 fn prefix(nonce: &str, lines: usize) -> String {
     let mut s =

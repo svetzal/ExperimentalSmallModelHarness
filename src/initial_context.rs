@@ -8,13 +8,13 @@
 use crate::semantic_advisory::{
     SemanticAdvisoryKind, SemanticAdvisoryRequest, request_semantic_advisory,
 };
+use crate::sha256::sha256_hex;
 use crate::trace::TraceRecorder;
 use anyhow::{Context, Result, bail};
 use mojentic::llm::LlmGateway;
 use mojentic::llm::models::LlmMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -505,7 +505,7 @@ fn component(record: &GuidanceRecord, inclusion_reason: &str) -> InitialContextC
         inclusion_reason: inclusion_reason.to_string(),
         source: record.source.clone(),
         content_chars: record.content().chars().count(),
-        content_sha256: format!("{:x}", Sha256::digest(record.content().as_bytes())),
+        content_sha256: sha256_hex(record.content().as_bytes()),
     }
 }
 

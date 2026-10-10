@@ -12,6 +12,7 @@ pub mod retry;
 pub mod runtime;
 pub mod runtime_events;
 pub mod semantic_advisory;
+mod sha256;
 pub mod tools;
 pub mod trace;
 pub mod trace_analysis;

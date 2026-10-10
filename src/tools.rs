@@ -7,6 +7,7 @@ use crate::runtime::{
     MutationSource, RuntimeDecision, RuntimeEvent, RuntimePolicy, RuntimeState,
     SuccessfulValidation, ValidationRepair,
 };
+use crate::sha256::sha256_hex;
 use crate::trace::TraceRecorder;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -14,7 +15,6 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use mojentic::llm::tools::{FunctionDescriptor, LlmTool, ToolDescriptor, ToolRunCtx};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -1101,7 +1101,7 @@ impl ToolScope {
             .cloned()
             .with_context(|| format!("unknown declared probe id {probe_id:?}"))?;
         if !probe.command.is_empty() {
-            let command_sha256 = format!("{:x}", Sha256::digest(probe.command.as_bytes()));
+            let command_sha256 = sha256_hex(probe.command.as_bytes());
             let mut result = ShellCommandTool {
                 scope: self.clone(),
             }
@@ -1994,10 +1994,8 @@ impl WriteFileTool {
         let new_content = content.as_bytes();
         let content_changed = previous_content.as_deref() != Some(new_content);
         let previous_bytes = previous_content.as_ref().map(Vec::len);
-        let before_sha256 = previous_content
-            .as_deref()
-            .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
-        let after_sha256 = format!("{:x}", Sha256::digest(new_content));
+        let before_sha256 = previous_content.as_deref().map(sha256_hex);
+        let after_sha256 = sha256_hex(new_content);
         self.scope.note_write_intent(std::slice::from_ref(&path))?;
         self.scope
             .note_patch_fallback_choice(std::slice::from_ref(&path), "write_file", None)?;
@@ -2042,7 +2040,7 @@ fn mutation_receipt(before: Option<&str>, after: &str, mutation_epoch: usize) ->
         .min(after_lines.len().max(1));
     json!({
         "mutation_epoch": mutation_epoch,
-        "after_sha256": format!("{:x}", Sha256::digest(after.as_bytes())),
+        "after_sha256": sha256_hex(after.as_bytes()),
         "total_lines": after_lines.len(),
         "changed_range": {
             "line_start": start_line,
@@ -2873,7 +2871,7 @@ async fn run_atomic_line_range_batch(
         Ok(value) => value,
         Err(error) => return atomic_line_range_batch_errors(scope, calls, &error.to_string()),
     };
-    let original_sha256 = format!("{:x}", Sha256::digest(original.as_bytes()));
+    let original_sha256 = sha256_hex(original.as_bytes());
     let mut ordered = edits.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|edit| std::cmp::Reverse(edit.start_index));
     let mut lines = split_lines_preserving_newlines(&original);
@@ -2895,7 +2893,7 @@ async fn run_atomic_line_range_batch(
     }
     let mutation_epoch = scope.runtime_state_snapshot().mutation_epoch;
     let receipt = mutation_receipt(Some(&original), &content, mutation_epoch);
-    let after_sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let after_sha256 = sha256_hex(content.as_bytes());
     let application_order = ordered
         .iter()
         .map(|edit| edit.call_index)
@@ -3271,7 +3269,7 @@ fn verify_optional_file_hash(args: &HashMap<String, Value>, content: &str) -> Re
     let Some(expected) = args.get("expected_file_sha256").and_then(Value::as_str) else {
         return Ok(());
     };
-    let actual = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let actual = sha256_hex(content.as_bytes());
     if expected != actual {
         bail!(
             "expected_file_sha256 is stale: expected {expected}, current {actual}; no mutation occurred"
@@ -3453,7 +3451,7 @@ fn verify_optional_object_file_hash(
     let Some(expected) = object.get("expected_file_sha256").and_then(Value::as_str) else {
         return Ok(());
     };
-    let actual = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let actual = sha256_hex(content.as_bytes());
     if expected != actual {
         bail!(
             "changes[{index}].expected_file_sha256 is stale: expected {expected}, current {actual}; no mutation occurred"

@@ -3,6 +3,7 @@ use crate::acceptance_interactions::{
 };
 use crate::acceptance_ledger::{AcceptanceLedgerSnapshot, AcceptanceLedgerSpec};
 use crate::acceptance_plan::{DEFAULT_MAX_PLAN_ITEMS, plan_acceptance_with_gateway};
+use crate::sha256::sha256_hex;
 use crate::tools::{
     SuccessfulValidationSnapshot, ToolPolicySnapshot, ToolScope, ToolSurface,
     ValidationRepairSnapshot, tools_for_profile,
@@ -5480,10 +5481,7 @@ fn trace_response_tool_calls(
                 ),
                 "arguments_complete": arguments_complete,
                 "arguments_json_chars": arguments_json.chars().count(),
-                "arguments_sha256": format!(
-                    "{:x}",
-                    Sha256::digest(arguments_json.as_bytes())
-                ),
+                "arguments_sha256": sha256_hex(arguments_json.as_bytes()),
             }),
         )?;
     }
@@ -5624,7 +5622,7 @@ fn reasoning_checkpoint(
     Some(ReasoningCheckpoint {
         total_thinking_chars,
         omitted_prefix_chars: total_thinking_chars.saturating_sub(retained_tail.len()),
-        retained_sha256: format!("{:x}", Sha256::digest(retained_tail.as_bytes())),
+        retained_sha256: sha256_hex(retained_tail.as_bytes()),
         retained_tail,
     })
 }

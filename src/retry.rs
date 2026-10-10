@@ -8,14 +8,13 @@
 
 use crate::agent::{AgentRunConfig, run_agent};
 use crate::runtime_events;
+use crate::sha256::sha256_hex;
 use crate::trace_analysis::analyze_trace;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -347,7 +346,7 @@ fn snapshot(path: &Path) -> Result<ArtifactSnapshot> {
         Ok(bytes) => Ok(ArtifactSnapshot {
             exists: true,
             bytes: bytes.len(),
-            sha256: Some(sha256(&bytes)),
+            sha256: Some(sha256_hex(&bytes)),
         }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ArtifactSnapshot {
             exists: false,
@@ -356,15 +355,6 @@ fn snapshot(path: &Path) -> Result<ArtifactSnapshot> {
         }),
         Err(error) => Err(error).with_context(|| format!("reading artifact {}", path.display())),
     }
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut result = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut result, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    result
 }
 
 fn artifact_bytes_equal(path: &Path, expected: &[u8]) -> Result<bool> {
