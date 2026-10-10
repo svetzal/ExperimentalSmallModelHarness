@@ -1,4 +1,4 @@
-//! Evidence for the worker integration blocker in the exact reviewed Mojentic API.
+//! Positive telemetry prerequisite evidence for the exact reviewed Mojentic API.
 //! These diagnostics deliberately do not claim recovery conformance.
 
 use futures::StreamExt;
@@ -85,12 +85,12 @@ fn server() -> (OllamaGateway, std::thread::JoinHandle<Vec<Vec<u8>>>) {
 }
 
 #[tokio::test]
-async fn reviewed_recovery_stream_does_not_expose_worker_frame_progress() {
+async fn reviewed_recovery_stream_preserves_worker_frame_progress() {
     if std::env::var_os("HARNESS_RECOVERY_DIAGNOSTIC_CHILD").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "reviewed_recovery_stream_does_not_expose_worker_frame_progress",
+                "reviewed_recovery_stream_preserves_worker_frame_progress",
                 "--nocapture",
             ])
             .env_clear()
@@ -134,9 +134,23 @@ async fn reviewed_recovery_stream_does_not_expose_worker_frame_progress() {
     let mut stream =
         recovery.complete_stream_with_recovery("synthetic", &messages, None, &config, &call);
     let mut events = Vec::new();
+    let mut raw_progress = Vec::new();
+    let mut raw_metrics = Vec::new();
+    let mut raw_identity = None;
     while let Some(event) = stream.next().await {
-        // Exhaustive match proves the pinned API has no frame-progress variant.
+        // Exhaustive match preserves semantic events and nonsemantic telemetry.
         match event {
+            RecoveryStreamEvent::Progress { identity, progress } => {
+                assert_eq!(identity.wire_attempt, 1);
+                assert_eq!(raw_identity.get_or_insert(identity.clone()), &identity);
+                raw_progress.push(progress);
+                events.push("progress");
+            }
+            RecoveryStreamEvent::Metrics { identity, metrics } => {
+                assert_eq!(raw_identity.as_ref(), Some(&identity));
+                raw_metrics.push(metrics);
+                events.push("metrics");
+            }
             RecoveryStreamEvent::Content(content) => {
                 assert_eq!(content, "DONE");
                 events.push("content");
@@ -148,8 +162,9 @@ async fn reviewed_recovery_stream_does_not_expose_worker_frame_progress() {
             RecoveryStreamEvent::ToolFragment(_) => panic!("no tool was requested"),
             RecoveryStreamEvent::Completed(response) => {
                 assert_eq!(response.report.identity.wire_attempt, 1);
+                assert_eq!(raw_identity.as_ref(), Some(&response.report.identity));
                 assert_eq!(response.report.progress.raw_bytes, BODY.len() as u64);
-                // Terminal evidence retains metrics; the raw API could map these.
+                // Terminal evidence and exposed metadata retain the same actual metrics.
                 let usage = response.value.evidence.usage.unwrap();
                 assert_eq!(usage["eval_count"], 7);
                 assert_eq!(usage["prompt_eval_count"], 11);
@@ -162,21 +177,35 @@ async fn reviewed_recovery_stream_does_not_expose_worker_frame_progress() {
             RecoveryStreamEvent::Failed(error) => panic!("unexpected recovery failure: {error}"),
         }
     }
-    assert_eq!(events, ["reasoning", "content", "completed"]);
+    assert_eq!(
+        events,
+        [
+            "progress",
+            "progress",
+            "reasoning",
+            "progress",
+            "content",
+            "progress",
+            "metrics",
+            "completed"
+        ]
+    );
+    assert_eq!(raw_progress, legacy_progress);
+    assert_eq!(raw_metrics, legacy_metrics);
     drop(stream);
 
     let mut stream = recovery.complete_stream("synthetic", &messages, None, &config);
-    let mut convenience_progress_count = 0;
-    let mut convenience_metrics_count = 0;
+    let mut convenience_progress = Vec::new();
+    let mut convenience_metrics = Vec::new();
     while let Some(chunk) = stream.next().await {
         match chunk.unwrap() {
-            StreamChunk::Progress(_) => convenience_progress_count += 1,
-            StreamChunk::Metrics(_) => convenience_metrics_count += 1,
+            StreamChunk::Progress(progress) => convenience_progress.push(progress),
+            StreamChunk::Metrics(metrics) => convenience_metrics.push(metrics),
             _ => {}
         }
     }
-    assert_eq!(convenience_progress_count, 0);
-    assert_eq!(convenience_metrics_count, 0);
+    assert_eq!(convenience_progress, legacy_progress);
+    assert_eq!(convenience_metrics, legacy_metrics);
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[0], requests[1]);
@@ -188,13 +217,14 @@ async fn reviewed_recovery_stream_does_not_expose_worker_frame_progress() {
     }
     std::fs::write(artifacts.join("assertions.json"), serde_json::to_vec_pretty(
         &serde_json::json!({
-            "reviewed_revision": "bc8150a381a540e6320cd4fd91a8bbecadb9a735",
+            "reviewed_revision": "4ca1ed279c02eab37827a1ed07c30e961155ecf3",
             "legacy_progress_frames": legacy_progress.len(),
             "legacy_metrics_frames": legacy_metrics.len(),
             "raw_recovery_events": events,
-            "convenience_progress_frames": convenience_progress_count,
-            "convenience_metrics_frames": convenience_metrics_count,
+            "convenience_progress_frames": convenience_progress.len(),
+            "convenience_metrics_frames": convenience_metrics.len(),
             "terminal_metrics_retained": true,
+            "metadata_fields_and_order_preserved": true,
             "encoded_requests_identical": true,
             "recovery_conformance": false,
             "response_body": artifacts.join("response.body"),
