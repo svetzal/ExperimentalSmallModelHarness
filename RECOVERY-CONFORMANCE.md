@@ -443,3 +443,33 @@ Controlled recovery does not explain Generation45's original 504 or establish
 six-library parity. Real mid-generation interruption and general provider
 termination proof remain limits: uncertain local ownership still refuses
 further dispatch. Recovery remains disabled by default.
+
+## Empty semantic fragment correction (October 11, 2026)
+
+Generation50's interrupted second trial exposed a detector false positive. An
+empty content delta copied a reasoning credential prefix into the content
+channel. That stale prefix survived a reasoning mismatch and later combined
+with an unrelated reasoning fragment. Offline replay with the dummy Ollama key
+matched the worker's interruption at 90583 consumed reasoning bytes. Historical
+experiment inputs and results remain frozen.
+
+`CredentialFilter::push` now ignores empty fragments before inspecting or
+changing channel state. Nonempty fragments still pass through the existing
+per-channel, chronological, cross-field and decoded-tool credential checks.
+No credential exemption, retry change or capture-policy relaxation was added.
+
+`empty_content_does_not_retain_a_disproved_reasoning_prefix` reproduces the
+failure using both provider frame formats; it failed before the correction.
+`empty_fragments_do_not_hide_real_split_credentials` proves that real split
+credentials still fail across reasoning, content, tool arguments and channels.
+The public-worker `empty_content_prefix_control` case checks both Ollama and
+oMLX: one request, successful DONE, preserved reasoning, exact captures and no
+retry. These tests use scripted loopback providers, not model inference.
+
+Validation: 369 tests passed with two existing ignored tests, including the
+104-case public-worker matrix and seven CLI refusals. Formatting, strict
+all-target/all-feature Clippy, locked release bins build and the unfiltered
+289-dependency security audit passed. The release worker also passed the new
+control on both providers. Doctests passed (zero examples); documentation built
+with four existing private-link warnings. Markdown lint is clean. No live
+inference or historical experiment changes were made.

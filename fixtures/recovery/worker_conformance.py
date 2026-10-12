@@ -20,9 +20,11 @@ def encoded(value):
     return json.dumps(value, separators=(",", ":")).encode()
 
 
-def frame(provider, field=None, text=None, done=False, tools=None):
+def frame(provider, field=None, text=None, done=False, tools=None, empty_content=False):
     if provider == "ollama":
         message = {}
+        if empty_content:
+            message["content"] = ""
         if field:
             message["thinking" if field == "reasoning" else "content"] = text
         if tools:
@@ -33,6 +35,8 @@ def frame(provider, field=None, text=None, done=False, tools=None):
                          eval_duration=1000000000, total_duration=2000000000)
         return encoded(value) + b"\n"
     delta = {}
+    if empty_content:
+        delta["content"] = ""
     if field:
         delta["reasoning_content" if field == "reasoning" else "content"] = text
     if tools:
@@ -227,6 +231,8 @@ def run_case(worker, artifacts, provider, name):
             expected_count, expected_success, expected_outcome = 2, True, None
     if name == "stream_drop_cap":
         status, expected_count = 200, 1
+    if name == "empty_content_prefix_control":
+        status, expected_count = 200, 1
     if name in ("disabled", "one_attempt_capture"):
         expected_count, expected_success, expected_outcome = 1, False, "exhausted"
     if name == "persistent504":
@@ -290,6 +296,11 @@ def run_case(worker, artifacts, provider, name):
                         final = frame(provider, done=True)
                     body = frame(provider, "reasoning", "Native reasoning before tool.") + frame(provider, tools=[tool]) + final
                 chunks = [body]
+                if first and name == "empty_content_prefix_control":
+                    chunks = [frame(provider, "reasoning", text, empty_content=True)
+                              for text in (secret[:12], " mismatch ", secret[12:])]
+                    chunks += [frame(provider, "content", "DONE"), frame(provider, done=True)]
+                    body = b"".join(chunks)
                 truncate = name.startswith("permanent") and "truncated" in name and first
                 if first and name == "protocol":
                     body = b"malformed-json\n" if provider == "ollama" else b"data: malformed-json\n\n"
@@ -619,6 +630,10 @@ def run_case(worker, artifacts, provider, name):
         assert secret not in text
     semantic = "".join(e["payload"].get("text", e["payload"].get("preview", "")) for e in events if e["kind"] in ("agent.stream.chunk", "llm.stream.thinking"))
     assert secret not in semantic
+    if name == "empty_content_prefix_control":
+        assert rendered_semantic == secret[:12] + " mismatch " + secret[12:] + "DONE"
+        assert not any(e["kind"] == "llm.recovery.final_failure" for e in events)
+        assert not admission_input.exists(), "safe empty fragments caused a retry"
     if name in CREDENTIAL_REGRESSIONS:
         assert not any(e["kind"].startswith("tool.") for e in events), "contaminated tool executed"
         assert not admission_input.exists(), "credential contamination retried"
@@ -665,7 +680,8 @@ CASES = ["503_success", "disabled", "one_attempt_capture", "persistent504", "rej
          "partial_reasoning", "partial_content", "partial_tool", "keepalive", "protocol",
          "permanent_400", "permanent_401", "permanent_403", "permanent_400_truncated",
          "permanent_401_truncated", "permanent_403_truncated", "credential_header", "credential_raw",
-         "credential_semantic", "credential_error", "capture_failure", "tool_once", "stream_drop_cap"] + CREDENTIAL_REGRESSIONS + BOUNDARY_CONTROLS
+         "credential_semantic", "credential_error", "capture_failure", "tool_once", "stream_drop_cap",
+         "empty_content_prefix_control"] + CREDENTIAL_REGRESSIONS + BOUNDARY_CONTROLS
 
 
 def validate_cli(worker, artifacts):

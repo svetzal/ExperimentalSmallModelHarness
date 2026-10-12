@@ -242,6 +242,11 @@ struct CredentialFilter {
 }
 impl CredentialFilter {
     fn push(&mut self, channel: &str, text: &str, secrets: &[String]) -> Result<()> {
+        // Empty deltas carry no semantic bytes and must not copy another
+        // channel's prefix into a channel that has emitted nothing.
+        if text.is_empty() {
+            return Ok(());
+        }
         // Unrelated fields must not interrupt a reconstructable cross-field echo.
         let mut cross_prefix = String::new();
         for (other, prefix) in &self.prefixes {
@@ -1180,6 +1185,55 @@ impl<G: RecoveryProvider> LlmGateway for WorkerGateway<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_content_does_not_retain_a_disproved_reasoning_prefix() {
+        let secrets = vec!["noop".to_owned()];
+        for provider in ["ollama", "omlx"] {
+            let frames: Vec<_> = ["no", " longer", "opped"]
+                .into_iter()
+                .map(|text| {
+                    if provider == "ollama" {
+                        json!({"message": {"content": "", "thinking": text}})
+                    } else {
+                        json!({"choices": [{"delta": {"content": "", "reasoning_content": text}}]})
+                    }
+                })
+                .collect();
+            let mut filter = CredentialFilter::default();
+            for frame in &frames {
+                filter.frame(frame, &secrets).unwrap();
+            }
+            let raw = frames
+                .iter()
+                .map(|frame| {
+                    if provider == "ollama" {
+                        frame.to_string()
+                    } else {
+                        format!("data: {frame}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!encoded_credential(raw.as_bytes(), &secrets));
+        }
+    }
+
+    #[test]
+    fn empty_fragments_do_not_hide_real_split_credentials() {
+        let secrets = vec!["noop".to_owned()];
+        for channel in ["reasoning", "content", "tool/0/arguments"] {
+            let mut filter = CredentialFilter::default();
+            filter.push(channel, "no", &secrets).unwrap();
+            filter.push(channel, "", &secrets).unwrap();
+            filter.push("unrelated", "", &secrets).unwrap();
+            assert!(filter.push(channel, "op", &secrets).is_err());
+        }
+        let mut filter = CredentialFilter::default();
+        filter.push("reasoning", "no", &secrets).unwrap();
+        filter.push("content", "", &secrets).unwrap();
+        assert!(filter.push("content", "op", &secrets).is_err());
+    }
 
     #[test]
     fn decoded_arguments_keep_identity_across_key_colon_and_incomplete_escape() {
