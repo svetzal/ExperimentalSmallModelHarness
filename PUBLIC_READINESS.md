@@ -2,14 +2,44 @@
 
 Date: 2026-10-13. Status: preparation; proposed commands are not implemented.
 
-Build Microgentic as a capable CLI coding agent on the adaptive runtime, with a
-friendly terminal interface and selectable Mojentic gateways. Preserve its
-distinguishing strengths: bounded context, deterministic validation, local-model
-patience, and evidence that explains what happened. Keep the runtime general.
+Build Microgentic as an adaptive coding agent optimized for small models that
+need extra help staying on task. Give it a small, simple, fast interface with
+selectable Mojentic gateways. Preserve bounded context, deterministic validation,
+local-model patience, and evidence that explains what happened. Keep the runtime
+general.
 
 This checklist starts from the current executable and source. It does not claim
 production readiness or a new model capability result. Product work must keep
 registered experiments reproducible.
+
+## Product direction
+
+Decision recorded on 2026-10-13: **an adaptive coding agent optimized for small
+models that need extra help staying on task**. The harness supplies continuity,
+bounded work, relevant context, and fresh feedback so the model can make progress.
+
+Use [Pi's coding agent](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md)
+as a reference for a compact terminal conversation and a small everyday control
+surface. Pi documents interactive and print/JSON operation. Microgentic should
+carry that simplicity through its own adaptive runtime and shell interfaces.
+
+- **Small:** compact installation, few everyday commands, and a focused main
+  view. Keep background services optional and justify new dependencies.
+- **Simple:** start in a project, select a provider/model, give it a task, inspect
+  activity, and review results. Keep experiment setup and policy tuning in
+  documented advanced configuration rather than the everyday interaction.
+- **Fast:** prompt local startup, help, input, and display response. Measure
+  interface overhead separately from model loading/generation and tool execution.
+  Retain throughput-aware patience for slow local models.
+- **Adaptive:** keep task support, context continuity, validation, and repair
+  integrated into the same session engine in terminal and automated modes.
+- **User focused:** public CLI/TUI design sets the control surface. Benchmark
+  adapters translate their registered runs to that surface and its documented
+  advanced controls. Preserve comparable behavior and evidence as the interface
+  evolves.
+
+This sets the product promise; model reliability and speed claims still require
+measurement. Gateway choice remains open, including larger models when useful.
 
 ## Foundations to retain
 
@@ -112,13 +142,15 @@ the first public alpha usable; P2 extends it after core workflows work.
 
 - [x] **Choose the name.** Product: Microgentic. Canonical command: `microgentic`.
   Offer `mg` only as an optional alias, with no default installation.
-- [ ] **Define the product promise.** Position it as an adaptive coding agent
-  with strong local-model support. Describe supported workflows and known
-  limits without presenting screening benchmarks as reliability guarantees.
+- [x] **Define the product promise.** An adaptive coding agent optimized for
+  small models that need extra help staying on task, with a small, simple, fast
+  experience inspired by Pi. Describe known limits and measured capabilities
+  without presenting screening benchmarks as reliability guarantees.
 - [ ] **Define everyday grammar.** Use one executable for `setup`, `run`,
   `status`, provider/model selection, sessions, and skill installation. Keep
   experiment controls available through an advanced/research surface, with an
-  explicit migration period for existing scripts and benchmark adapters.
+  explicit migration period for existing scripts. Adapt benchmark adapters to
+  the public UX; preserve frozen experiments through their pinned artifacts.
 - [ ] **Implement the naming migration.** Update package/binary metadata, help,
   documentation, completions, and release artifacts to Microgentic/`microgentic`.
   Preserve historical evidence and document compatibility for existing
@@ -140,6 +172,53 @@ the first public alpha usable; P2 extends it after core workflows work.
 - [ ] **Define typed outcomes.** Share one outcome between runtime, CLI, JSON,
   TUI, and exit status. Include checks passed/failed/not run, changed paths,
   stop reason, and evidence location. Test returned `FAIL` as well as errors.
+- [ ] **Budget interface overhead.** Establish startup/help latency, installation
+  size, idle memory, and input/render responsiveness baselines; set explicit
+  release budgets from those measurements. Keep model/tool timing separate and
+  avoid adding a provider call to local help or configuration inspection.
+
+### P0: benchmark compatibility through adapters
+
+The current DeepSWE/Pier and Terminal-Bench/Harbor adapters under
+`../Benchmarks/deep-swe/adapter/adaptive_harness_agent.py` and
+`../Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py` launch
+`adaptive-agent-harness run` with `--experiment`, `--contract`, `--trace-dir`,
+model budgets, and policy flags. They also inspect `run.failed` trace records
+after a nonzero process exit. Harbor still uses `--max-tool-iterations`; Pier
+uses `--max-model-interactions`. These are concrete migration points identified
+by source review, not newly executed benchmark results.
+
+- [ ] **Define the adapter boundary before changing commands.** Map benchmark
+  task input, project root, provider/model, permissions, probe contract, budgets,
+  context policy, output, trace destination, and cancellation to the public
+  non-interactive interface. Preserve necessary research controls in documented,
+  versioned advanced configuration. Keep one runtime execution path.
+- [ ] **Migrate maintained launchers and tests.** Update Pier, Harbor, generation
+  runners, and collection/analysis integrations for `microgentic` and the new
+  flags/configuration. Supply explicit provider settings and authorized execution
+  policy; benchmark runs must not enter setup, the TUI, or an approval prompt.
+- [ ] **Consume structured outcomes.** Parse documented JSON/JSONL and typed
+  terminal status, with trace evidence for diagnosis. Distinguish incomplete work,
+  provider failure, environment failure, cancellation, and verified success.
+  Preserve batch-stop rules and independent verifier authority.
+- [ ] **Prove equivalent resolved runs.** Compare old/new intake and effective
+  contracts, model controls, context packets, tool/probe exposure, permissions,
+  and stop policies using deterministic fixtures and scripted gateways. Inspect
+  exact provider snapshots for model-visible equivalence; do not infer it from
+  matching flag names or token counts. Classify intentional changes separately.
+- [ ] **Preserve collection and observability.** Retain exact request/context
+  evidence, workspace and binary patches, original-test protection, verifier
+  isolation, terminal lifecycle, and native transcript generation. Trace and
+  result schema changes need explicit versions and reader compatibility.
+- [ ] **Pin adapter provenance.** Register binary/version/hash, adapter revision,
+  effective configuration, environment, provider, model, and schemas with every
+  new cell. Leave historical run scripts, binaries, registrations, and scores
+  unchanged. Document any temporary CLI aliases and their retirement plan.
+- [ ] **Gate migration before fresh trials.** Pass adapter integration tests
+  through the installed public binary: task delivery, cwd, redirection, outcome
+  decoding, interruption, cleanup, and collected verifier evidence. Freeze new
+  adapter artifacts before registering live replicates; repeat semantic efficacy
+  measurement if migration changes model context or runtime policy.
 
 ### P0: gateway selection and configuration
 
@@ -199,7 +278,8 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
   automation use a plain interface without interactive prompts.
 - [ ] **Design one calm main view.** Use a compact project/provider/model header,
   conversation, and multiline input. Group expandable tool activity under its
-  action. Keep detailed context and trace accounting in secondary views.
+  action. Keep detailed context and trace accounting in secondary views. Review
+  the everyday flow against the Pi-inspired small, simple, fast product direction.
 - [ ] **Make state understandable.** Label connecting, generating, inspecting,
   editing, checking, awaiting input, and stopped. Distinguish unknown progress
   from stalled generation. Refresh elapsed time without invented percentages or
@@ -401,14 +481,16 @@ does not rename the current binary or rewrite preserved CLI review evidence.
 ## First implementation slices and release gate
 
 1. **Command/session contract:** project root, intake, permission semantics,
-   typed outcomes, shell composition, output channels, and compatibility. Verify
-   fixtures and scripted gateways before calling a local model.
+   typed outcomes, shell composition, output channels, and adapter migration.
+   Verify fixtures, scripted gateways, and benchmark equivalence before calling
+   a local model.
 2. **Provider setup:** shared profile resolver, discovery, diagnostics, and
    persistent config. Route standalone planning through it too.
 3. **Conversation TUI:** session events, readable progress, input, steering,
    and change/check review. Add durable resume after state fidelity is tested.
 4. **Installable alpha:** packages, completions, companion skill, lifecycle docs,
-   and measured workflows on declared supported platforms.
+   interface performance budgets, migrated benchmark adapters, and measured
+   workflows on declared supported platforms.
 
 A public alpha should let a new user install it, configure either supported
 local provider, open an existing repository, request a change, inspect and approve
@@ -416,6 +498,11 @@ effects, see fresh checks and a diff, interrupt safely, and recover preserved wo
 The same task must work through the plain CLI, pipelines, and redirected input
 and output with clean results, parseable machine modes, and truthful exit status.
 Publish the remaining limits alongside that alpha.
+
+The alpha must also complete a deterministic benchmark-adapter smoke run through
+the public non-interactive interface, preserving registered inputs, run controls,
+trace evidence, workspace collection, and independent verification. User-facing
+UX improvements and benchmark compatibility must ship together.
 
 Keep sampling, transcript retention, patience, validation, and recovery policy
 fixed during interface-only slices. If a feature changes model context or runtime

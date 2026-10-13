@@ -10,11 +10,17 @@ The harness owns continuity. The model reasons about a scoped packet.
 Deterministic checks establish whether work satisfies its contract.
 A model claim alone cannot establish success.
 
-The public product direction is a CLI coding agent with selectable Mojentic
-gateways and a friendly terminal conversation. Build its session and presentation
-interfaces around the general runtime. Preserve deterministic validation and
-evidence while making setup and everyday work accessible. The preparation backlog
-is in `PUBLIC_READINESS.md`; proposed features there are not implemented behavior.
+The public product is Microgentic: an adaptive coding agent optimized for small
+models that need extra help staying on task. Its CLI and terminal conversation
+should feel small, simple, and fast, with Pi as an interaction reference and
+selectable Mojentic gateways. Build session and presentation around the general
+runtime, preserving validation, evidence, and local-model patience.
+
+Design the control surface for end users. Adapt benchmark launchers to its public
+non-interactive interface and documented advanced configuration. Verify equivalent
+resolved inputs and runtime behavior before new trials; preserve frozen evidence
+through pinned binaries, adapter revisions, and configuration. The preparation
+backlog is in `PUBLIC_READINESS.md`; proposed features are not implemented behavior.
 
 ## Responsibilities
 

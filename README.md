@@ -16,9 +16,11 @@ This is a research project under active development, not a stable library or
 production service. Runtime policies, contracts, trace schemas, and command-line
 interfaces may change as experiments reveal better boundaries.
 
-The [public CLI readiness checklist](PUBLIC_READINESS.md) records the current
-interface review and preparation work for provider setup, a conversation TUI,
-session recovery, packaging, and a product name.
+The [Microgentic public CLI readiness checklist](PUBLIC_READINESS.md) records
+preparation for an adaptive coding agent optimized for small models, with a
+small, simple, fast experience inspired by Pi. It covers provider setup, terminal
+and shell workflows, session recovery, packaging, and benchmark-adapter migration
+to the user-focused control surface.
 
 ## Capabilities
 
