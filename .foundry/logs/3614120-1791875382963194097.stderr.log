@@ -1,0 +1,10 @@
+   Compiling sha2 v0.11.1
+   Compiling adaptive-agent-harness v0.1.0 (/home/svetzal/Work/Sandbox2/Harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.51s
+     Running unittests src/lib.rs (target/debug/deps/adaptive_agent_harness-3527d0f423fd44a1)
+     Running unittests src/main.rs (target/debug/deps/adaptive_agent_harness-fa2043dd9dcf2c5b)
+     Running tests/omlx_gateway.rs (target/debug/deps/omlx_gateway-09b3a39fb99f7bcf)
+     Running tests/recovery_prerequisites.rs (target/debug/deps/recovery_prerequisites-d7125985a82a0b72)
+     Running tests/recovery_worker.rs (target/debug/deps/recovery_worker-e90013e18cbf8269)
+     Running tests/structural_coupling.rs (target/debug/deps/structural_coupling-3de0baa132adea58)
+     Running unittests examples/provider_benchmark.rs (target/debug/examples/provider_benchmark-5bbf27f2f5ac018d)
