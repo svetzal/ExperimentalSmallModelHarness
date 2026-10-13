@@ -49,6 +49,11 @@ replay tools, unload models, or establish generation ownership. Recovery and
 memory/ownership safeguards remain separate responsibilities of the harness
 and experiment coordinator.
 
+Pier also instantiates this class for independent verification. When the verifier
+has no agent network allowlist, it keeps Pier's ordinary no-network topology and
+gets neither bridge nor proxy. An agent cannot use that verifier-only topology
+for inference: provider environment preparation requires the filtered route.
+
 ## Validation
 
 Run unit checks with Pier's Python environment:

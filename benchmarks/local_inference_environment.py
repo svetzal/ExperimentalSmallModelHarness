@@ -82,7 +82,11 @@ class LocalInferenceDockerEnvironment(DockerEnvironment):
     def _prepare_egress_proxy_compose(self) -> None:
         super()._prepare_egress_proxy_compose()
         if self._egress_proxy_compose_path is None:
-            raise ValueError("Local inference requires Pier's filtered isolated topology")
+            # Pier reuses this class for a verifier with no agent allowlist.
+            # Its ordinary no-network topology needs neither proxy nor bridge.
+            if self.network_allowlist.domains:
+                raise ValueError("Local inference requires Pier's filtered isolated topology")
+            return
         path = self._egress_proxy_compose_path
         compose = json.loads(path.read_text())
         add_bridge(compose, Path(__file__).with_name("local_inference_bridge.py"),
@@ -99,4 +103,6 @@ class LocalInferenceDockerEnvironment(DockerEnvironment):
         path.write_text(json.dumps(compose, indent=2))
 
     def agent_process_env(self, env: dict[str, str] | None) -> dict[str, str]:
+        if self._egress_proxy_compose_path is None:
+            raise ValueError("Agent inference requires a prepared filtered isolated route")
         return routed_environment(super().agent_process_env(env) or {}, self.local_inference_ports)

@@ -1,7 +1,11 @@
 import copy
 import unittest
+import tempfile
 from pathlib import Path
-from local_inference_environment import SERVICE, add_bridge, routed_environment, validate_ports
+from local_inference_environment import SERVICE, LocalInferenceDockerEnvironment, add_bridge, routed_environment, validate_ports
+from pier.models.task.config import EnvironmentConfig
+from pier.models.trial.paths import TrialPaths
+from pier.models.agent.network import NetworkAllowlist
 
 
 class LocalInferenceTests(unittest.TestCase):
@@ -31,6 +35,22 @@ class LocalInferenceTests(unittest.TestCase):
         for ports in ((), (0,), (65536,), (11436, 11436), (True,)):
             with self.subTest(ports=ports), self.assertRaises(ValueError):
                 validate_ports(ports)
+
+    def test_verifier_keeps_no_network_and_cannot_gain_inference_route(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'environment').mkdir()
+            (root / 'environment/Dockerfile').write_text('FROM ubuntu:24.04\n')
+            environment = LocalInferenceDockerEnvironment(
+                environment_dir=root / 'environment', environment_name='verifier',
+                session_id='verifier-test', trial_paths=TrialPaths(root),
+                task_env_config=EnvironmentConfig(), network_allowlist=NetworkAllowlist(),
+                local_inference_ports=(11436,), local_inference_image='sha256:'+'a'*64)
+            environment._prepare_egress_proxy_compose()
+            self.assertFalse(environment.task_env_config.allow_internet)
+            self.assertIsNone(environment._egress_proxy_compose_path)
+            with self.assertRaises(ValueError):
+                environment.agent_process_env({'OLLAMA_HOST': 'http://host.docker.internal:11436'})
 
     def test_topology_has_no_worker_egress_or_published_ports(self):
         compose = {'services': {'main': {'networks': ['pier-egress-internal']}},
