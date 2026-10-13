@@ -146,9 +146,12 @@ the first public alpha usable; P2 extends it after core workflows work.
   small models that need extra help staying on task, with a small, simple, fast
   experience inspired by Pi. Describe known limits and measured capabilities
   without presenting screening benchmarks as reliability guarantees.
-- [ ] **Define everyday grammar.** Use one executable for `setup`, `run`,
-  `status`, provider/model selection, sessions, and skill installation. Keep
-  experiment controls available through an advanced/research surface, with an
+- [x] **Choose everyday entry points.** Bare `microgentic` opens the interactive
+  TUI. `microgentic setup` configures provider, default model, and reasoning
+  effort. `microgentic run` requires a prompt through stdin or `--prompt`.
+- [ ] **Finish grammar edges.** Define configuration overrides, prompt-source
+  errors, output modes, sessions, and skill installation around these entry
+  points. Keep research controls in documented advanced configuration, with an
   explicit migration period for existing scripts. Adapt benchmark adapters to
   the public UX; preserve frozen experiments through their pinned artifacts.
 - [ ] **Implement the naming migration.** Update package/binary metadata, help,
@@ -156,9 +159,10 @@ the first public alpha usable; P2 extends it after core workflows work.
   Preserve historical evidence and document compatibility for existing
   `adaptive-agent-harness` invocations. Alias setup must be explicit and must
   not overwrite an existing command or shell alias.
-- [ ] **Define task intake.** Accept a quoted request, stdin, and an explicit
-  task file. Specify precedence and empty-input errors. Convert requests to the
-  existing contract type without requiring users to author probe JSON.
+- [ ] **Implement prompt intake.** Accept `run --prompt "..."` or read the prompt
+  from piped/redirected stdin. Read prompt files through normal input redirection.
+  Specify precedence and empty-input errors. Convert requests to the existing
+  contract type without requiring users to author probe JSON.
 - [ ] **Make shell composition a core contract.** Support pipelines and stdin,
   stdout, and stderr redirection without requiring the TUI. Define piped input
   roles, EOF behavior, clean result output, non-interactive execution, and broken
@@ -226,11 +230,15 @@ by source review, not newly executed benchmark results.
   and standalone commands must use the resolved profile. Show any override in
   the interface and trace.
 - [ ] **Add named profiles.** Separate profile name, gateway type, endpoint,
-  model, credential reference, and capabilities. Define and test precedence:
-  flags, environment, project config, user config, defaults.
+  model, default reasoning effort, credential reference, and capabilities.
+  Define and test precedence: flags, environment, project config, user config,
+  defaults.
 - [ ] **Make setup reach a working state.** Select a gateway, test connectivity,
-  list actual models, select one, and show effective settings. Use a credential
-  store or environment reference; mask secrets in output and diagnostics.
+  list actual models, choose the default model and a supported reasoning effort,
+  and review/save effective settings. Persist these defaults for TUI and `run`;
+  show explicit per-run overrides and reject unsupported effort choices. Use a
+  credential store or environment reference; mask secrets in output and
+  diagnostics.
 - [ ] **Establish the support matrix.** Retain oMLX and Ollama first. Assess the
   OpenAI gateway in the pinned Mojentic dependency as the next integration.
   Treat custom OpenAI-compatible endpoints as separately tested profiles;
@@ -273,13 +281,15 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
 
 ### P1: friendly TUI
 
-- [ ] **Define launch behavior.** The bare executable opens a conversation when
-  stdin and stdout are terminals. Provide `--no-tui`; pipes, `--json`, and
-  automation use a plain interface without interactive prompts.
-- [ ] **Design one calm main view.** Use a compact project/provider/model header,
-  conversation, and multiline input. Group expandable tool activity under its
-  action. Keep detailed context and trace accounting in secondary views. Review
-  the everyday flow against the Pi-inspired small, simple, fast product direction.
+- [ ] **Implement launch behavior.** Bare `microgentic` opens the conversation
+  TUI when stdin and stdout are terminals. `run` uses the plain interface even
+  on a terminal. Missing prompts and redirected bare invocations return clear
+  usage errors without entering the TUI or waiting for hidden input.
+- [ ] **Design one calm main view.** Use a compact project/provider/model/effort
+  header, conversation, and multiline input. Group expandable tool activity
+  under its action. Keep detailed context and trace accounting in secondary
+  views. Review the everyday flow against the Pi-inspired small, simple, fast
+  product direction.
 - [ ] **Make state understandable.** Label connecting, generating, inspecting,
   editing, checking, awaiting input, and stopped. Distinguish unknown progress
   from stalled generation. Refresh elapsed time without invented percentages or
@@ -360,16 +370,20 @@ The behaviors and examples in this section are requirements for implementation.
 
 ### Input
 
-- A positional request supplies the task. If stdin is redirected or piped,
-  consume it as explicitly labeled task input, such as a diff or build log.
-  Keep that material separate from the user's instruction and execution policy.
-- With no positional request, non-terminal stdin supplies the task through EOF.
-  The bare command with terminal stdin and stdout opens the TUI. If stdout is
-  redirected while stdin is a terminal and no task was supplied, return a useful
-  missing-task error rather than wait for hidden interactive input.
-- Provide `--task PATH` for a task file and `--task -` for explicit task intake
-  from stdin. Reject a task file combined with a positional task. A task file may
-  still receive separate piped reference input; never read stdin twice.
+- `microgentic run --prompt "..."` supplies the task explicitly. With no
+  `--prompt`, `run` reads its prompt from piped/redirected stdin through EOF.
+  A prompt file uses `microgentic run < prompt.txt`; no separate task-file flag
+  or positional prompt is needed in the everyday grammar.
+- If `--prompt` is provided with piped/redirected stdin, the directive is the
+  instruction and stdin is labeled reference material, such as a diff or build
+  log. Never silently replace the explicit prompt or treat reference material
+  as execution policy. Read stdin once.
+- `run` with terminal stdin and no `--prompt` fails immediately with examples
+  of both supported forms. Reject empty/whitespace-only prompts, including an
+  empty explicit `--prompt`; do not fall back to another source silently.
+- A bare `microgentic` opens the TUI when stdin and stdout are terminals. Bare
+  invocations with redirected input/output return a usage error directing the
+  user to `run`; do not infer a batch task or open `/dev/tty`.
 - Read task/reference input once through EOF. Specify size and encoding limits;
   report unsupported or oversized input rather than silently truncate it.
   Empty reference input is valid when a task exists; an empty task is an error.
@@ -401,23 +415,28 @@ The behaviors and examples in this section are requirements for implementation.
 ### Proposed examples and acceptance checks
 
 These examples describe the intended public interface; it is not implemented
-yet. `--task` and `--stream` are proposed flags.
+yet. The core `run` prompt grammar is decided; `--stream` remains a proposed flag.
 
 ```sh
-printf '%s\n' 'Explain this project' | microgentic run
+microgentic
+microgentic setup
+echo "Hello!" | microgentic run
+microgentic run --prompt "Explain this project"
 microgentic run < task.txt > result.txt
-git diff --no-ext-diff | microgentic run "Review this diff" > review.md
-microgentic run "Explain this build failure" < build.log > diagnosis.txt
-microgentic run --task task.txt > result.txt 2> diagnostics.log
+git diff --no-ext-diff | microgentic run --prompt "Review this diff" > review.md
+microgentic run --prompt "Explain this build failure" < build.log > diagnosis.txt
+microgentic run < task.txt > result.txt 2> diagnostics.log
 microgentic status --json | jq '.outcome'
-microgentic run --task task.txt --json --stream > events.jsonl
-microgentic run "Summarize the public API" >> summaries.txt
+microgentic run --json --stream < task.txt > events.jsonl
+microgentic run --prompt "Summarize the public API" >> summaries.txt
 ```
 
 - [ ] Verify input-only, output-only, and combined redirection; pipes into and
   out of the agent; append output; and separate stderr capture.
-- [ ] Verify task-only stdin and positional-task-plus-reference stdin remain
+- [ ] Verify prompt-only stdin and `--prompt` plus reference stdin remain
   distinct, including multiline Unicode, empty input, and input-size failures.
+  Reject positional prompts, duplicate explicit prompts, and missing prompts;
+  verify redirected bare invocations direct users to `run`.
 - [ ] Verify stdout is clean under verbose provider/tool activity; parse the
   complete JSON result and every JSONL event independently.
 - [ ] Verify non-interactive runs never prompt, launch the TUI, or read from
@@ -431,18 +450,20 @@ microgentic run "Summarize the public API" >> summaries.txt
 
 ## Proposed command map
 
-`microgentic` is the chosen canonical command. The public command surface below
-is proposed and is not implemented yet. Review the final grammar before
-implementation.
+Decision recorded on 2026-10-13: bare `microgentic` opens the TUI, `setup`
+configures provider/default model/effort, and `run` requires stdin or `--prompt`.
+The interface is not implemented yet. Additional commands/options below remain
+proposals to fill out these entry points.
 
 | Command | User purpose |
 | --- | --- |
 | `microgentic` | Open a terminal conversation in the current project |
-| `microgentic setup` | Preview connection and configuration setup |
+| `microgentic setup` | Configure provider, default model, and effort level |
 | `microgentic setup --apply` | Save the reviewed setup |
-| `microgentic run "Fix the parser" --dir .` | Inspect and propose a concrete change |
-| `microgentic run --task task.txt` | Read a task file in plain or terminal mode |
-| `microgentic run "Fix the parser" --dir . --apply` | Apply the retained proposal and permitted checks |
+| `echo "Hello!" \| microgentic run` | Read the prompt from stdin in plain mode |
+| `microgentic run --prompt "Fix the parser" --dir .` | Inspect and propose a concrete change |
+| `microgentic run < task.txt` | Read the prompt from a file through stdin |
+| `microgentic run --prompt "Fix the parser" --dir . --apply` | Apply the retained proposal and permitted checks |
 | `microgentic provider list` | Show configured profiles and destinations |
 | `microgentic provider edit local --apply` | Apply a reviewed profile change |
 | `microgentic model list --provider local` | Discover models for a profile |
