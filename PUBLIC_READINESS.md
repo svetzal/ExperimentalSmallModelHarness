@@ -1,11 +1,11 @@
-# Public CLI readiness checklist
+# Microgentic public CLI readiness checklist
 
 Date: 2026-10-13. Status: preparation; proposed commands are not implemented.
 
-Build a capable CLI coding agent on the adaptive runtime, with a friendly
-terminal interface and selectable Mojentic gateways. Preserve its distinguishing
-strengths: bounded context, deterministic validation, local-model patience, and
-evidence that explains what happened. Keep the runtime general.
+Build Microgentic as a capable CLI coding agent on the adaptive runtime, with a
+friendly terminal interface and selectable Mojentic gateways. Preserve its
+distinguishing strengths: bounded context, deterministic validation, local-model
+patience, and evidence that explains what happened. Keep the runtime general.
 
 This checklist starts from the current executable and source. It does not claim
 production readiness or a new model capability result. Product work must keep
@@ -110,13 +110,20 @@ the first public alpha usable; P2 extends it after core workflows work.
 
 ### P0: product and command contract
 
-- [ ] **Choose the promise and name.** Position it as an adaptive coding agent
+- [x] **Choose the name.** Product: Microgentic. Canonical command: `microgentic`.
+  Offer `mg` only as an optional alias, with no default installation.
+- [ ] **Define the product promise.** Position it as an adaptive coding agent
   with strong local-model support. Describe supported workflows and known
   limits without presenting screening benchmarks as reliability guarantees.
 - [ ] **Define everyday grammar.** Use one executable for `setup`, `run`,
   `status`, provider/model selection, sessions, and skill installation. Keep
   experiment controls available through an advanced/research surface, with an
   explicit migration period for existing scripts and benchmark adapters.
+- [ ] **Implement the naming migration.** Update package/binary metadata, help,
+  documentation, completions, and release artifacts to Microgentic/`microgentic`.
+  Preserve historical evidence and document compatibility for existing
+  `adaptive-agent-harness` invocations. Alias setup must be explicit and must
+  not overwrite an existing command or shell alias.
 - [ ] **Define task intake.** Accept a quoted request, stdin, and an explicit
   task file. Specify precedence and empty-input errors. Convert requests to the
   existing contract type without requiring users to author probe JSON.
@@ -261,43 +268,51 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
 
 ## Proposed command map
 
-`agent` is a placeholder, not a chosen binary name. These commands do not exist
-yet. Review the final grammar before implementation.
+`microgentic` is the chosen canonical command. The public command surface below
+is proposed and is not implemented yet. Review the final grammar before
+implementation.
 
 | Command | User purpose |
 | --- | --- |
-| `agent` | Open a terminal conversation in the current project |
-| `agent setup` | Preview connection and configuration setup |
-| `agent setup --apply` | Save the reviewed setup |
-| `agent run "Fix the parser" --dir .` | Inspect and propose a concrete change |
-| `agent run "Fix the parser" --dir . --apply` | Apply the retained proposal and permitted checks |
-| `agent provider list` | Show configured profiles and destinations |
-| `agent provider edit local --apply` | Apply a reviewed profile change |
-| `agent model list --provider local` | Discover models for a profile |
-| `agent status --json` | Report session outcome and check state |
-| `agent session list` | Find previous work |
-| `agent session show SESSION_ID` | Inspect conversation, changes, and evidence |
-| `agent session resume SESSION_ID` | Reopen work; require approval for further effects |
-| `agent init --apply` | Install reviewed companion guidance globally |
-| `agent init --local --apply` | Install reviewed guidance in this project |
+| `microgentic` | Open a terminal conversation in the current project |
+| `microgentic setup` | Preview connection and configuration setup |
+| `microgentic setup --apply` | Save the reviewed setup |
+| `microgentic run "Fix the parser" --dir .` | Inspect and propose a concrete change |
+| `microgentic run "Fix the parser" --dir . --apply` | Apply the retained proposal and permitted checks |
+| `microgentic provider list` | Show configured profiles and destinations |
+| `microgentic provider edit local --apply` | Apply a reviewed profile change |
+| `microgentic model list --provider local` | Discover models for a profile |
+| `microgentic status --json` | Report session outcome and check state |
+| `microgentic session list` | Find previous work |
+| `microgentic session show SESSION_ID` | Inspect conversation, changes, and evidence |
+| `microgentic session resume SESSION_ID` | Reopen work; require approval for further effects |
+| `microgentic init --apply` | Install reviewed companion guidance globally |
+| `microgentic init --local --apply` | Install reviewed guidance in this project |
 
 TUI approval and CLI `--apply` must authorize the same retained proposal. Bind
 non-interactive approval to a session/proposal ID and reject stale workspace
 state. Repeating a prompt cannot prove the generated plan is identical.
 
-## Naming direction
+## Naming decision
 
-**Mojent** is the leading working candidate: short to type, tied to Mojentic,
-and broad enough to cover coding without defining the product by model size.
-**Mojentic Code** is the descriptive alternative if the family name matters more
-than a distinct product name. Neither is adopted by this document.
+Decision recorded on 2026-10-13:
 
-Try realistic commands, then check pronunciation, searchability, executable and
-package collisions, repository names, and brand/domain availability. A quick
-web search on the review date did not establish a clear Mojent conflict, but it
-is not name clearance. Two appealing generic alternatives overlap with AI tools:
-[Mettle](https://github.com/Creed-Space/METTLE) and
-[Trellis](https://github.com/e-onux/trellis). Keep them off the leading list.
+- Product name: **Microgentic**.
+- Canonical executable and documented command: **`microgentic`**.
+- Optional user-selected shell alias: **`mg`**.
+
+`mg` already names an [Emacs-style editor](https://man.openbsd.org/mg) and resolves
+to `/usr/bin/mg` on the reviewed Mac. Do not ship or install an `mg` executable
+by default. Users who want the shortcut can explicitly choose an alias:
+
+```sh
+alias mg=microgentic
+```
+
+Use `microgentic` in official examples and automation so they work independently
+of a user's aliases. The name is settled; package/repository and brand/domain
+availability checks remain release preparation work. This documentation decision
+does not rename the current binary or rewrite preserved CLI review evidence.
 
 ## First implementation slices and release gate
 
