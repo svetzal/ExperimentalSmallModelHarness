@@ -103,6 +103,202 @@ fn final_response() -> String {
 }
 
 #[test]
+fn microgentic_and_legacy_entry_points_preserve_exact_provider_requests() {
+    for provider in ["omlx", "ollama"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let prompt = "Inspect this project, then finish.\nUnicode: 世界\n";
+        let contract = temp.path().join("contract.json");
+        std::fs::write(&contract, json!({"profile":{"id":"terminal_work","version":"terminal_work_profile.v1"},"guidance":prompt,"read_scope":["./**"],"write_scope":["./**"],"probes":[]}).to_string()).unwrap();
+        let config = temp.path().join("invalid-user-config.json");
+        std::fs::write(&config, "malformed personal configuration").unwrap();
+        let mut captured = Vec::new();
+        for modern in [false, true] {
+            let response = if provider == "omlx" {
+                final_response()
+            } else {
+                format!(
+                    "{}\n{}\n",
+                    json!({"message":{"role":"assistant","content":"DONE"},"done":false}),
+                    json!({"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"})
+                )
+            };
+            let inspect = if provider == "omlx" {
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"delta":{"content":"Inspecting.","tool_calls":[{"index":0,"id":"inspect-1","type":"function","function":{"name":"list_tree","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})
+                )
+            } else {
+                format!(
+                    "{}\n{}\n",
+                    json!({"message":{"role":"assistant","content":"Inspecting.","tool_calls":[{"function":{"name":"list_tree","arguments":{}}}]},"done":false}),
+                    json!({"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"})
+                )
+            };
+            let (host, server) = mock_provider_server(
+                vec![inspect, response],
+                if provider == "omlx" {
+                    "/v1/chat/completions"
+                } else {
+                    "/api/chat"
+                },
+                provider == "omlx",
+            );
+            let trace = temp.path().join(if modern {
+                "modern-traces"
+            } else {
+                "legacy-traces"
+            });
+            let mut command = Command::new(if modern {
+                env!("CARGO_BIN_EXE_microgentic")
+            } else {
+                env!("CARGO_BIN_EXE_adaptive-agent-harness")
+            });
+            command
+                .current_dir(if modern { temp.path() } else { &root })
+                .env("OMLX_HOST", &host)
+                .env("OLLAMA_HOST", &host)
+                .env("OMLX_API_KEY", "test-key")
+                .args(["--config"])
+                .arg(&config)
+                .args(["run", "--experiment"])
+                .arg(temp.path())
+                .arg("--contract")
+                .arg(&contract)
+                .arg("--trace-dir")
+                .arg(&trace)
+                .args([
+                    "--provider",
+                    provider,
+                    "--reasoning-effort",
+                    "low",
+                    "--max-iterations",
+                    "3",
+                ]);
+            if modern {
+                command
+                    .args(["--prompt", prompt, "--dir"])
+                    .arg(&root)
+                    .args([
+                        "--json",
+                        "--max-tokens",
+                        "8192",
+                        "--max-model-interactions",
+                        "75",
+                    ]);
+            } else {
+                command.args(["--num-predict", "8192", "--max-tool-iterations", "75"]);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                summary["tool_root"],
+                root.canonicalize().unwrap().to_str().unwrap()
+            );
+            assert!(
+                summary["final_summary"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .any(|line| line == "DONE")
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            captured.push(requests);
+        }
+        assert_eq!(
+            captured[0], captured[1],
+            "provider request changed for {provider}"
+        );
+    }
+}
+
+#[test]
+fn saved_defaults_and_stdin_prompt_reach_the_public_worker_without_stdout_noise() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let config = temp.path().join("config.json");
+    let setup = Command::new(env!("CARGO_BIN_EXE_microgentic"))
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "setup",
+            "--provider",
+            "ollama",
+            "--model",
+            "custom-model",
+            "--reasoning-effort",
+            "low",
+            "--apply",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let response = format!(
+        "{}\n{}\n",
+        json!({"message":{"role":"assistant","content":"DONE"},"done":false}),
+        json!({"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"})
+    );
+    let (host, server) = mock_provider_server(vec![response], "/api/chat", false);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_microgentic"))
+        .arg("--config")
+        .arg(&config)
+        .current_dir(temp.path())
+        .env("OLLAMA_HOST", &host)
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .args(["run", "--dir"])
+        .arg(&root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let prompt = "Hello!\nUnicode: 世界\n";
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(prompt.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"DONE\n");
+    let requests = server.join().unwrap();
+    assert_eq!(requests[0]["model"], "custom-model");
+    assert_eq!(requests[0]["think"], "low");
+    assert!(
+        requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains(prompt)))
+    );
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "management artifacts entered the project"
+    );
+}
+
+#[test]
 fn built_worker_preserves_entry_stash_and_rejects_new_stash_both_providers() {
     for provider in ["ollama", "omlx"] {
         for create_new in [false, true] {

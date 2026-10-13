@@ -1,7 +1,8 @@
-# Experimental Small Model Harness
+# Microgentic
 
-An experimental adaptive agent runtime for studying how smaller local language
-models inspect, edit, validate, and repair scoped artifacts.
+An adaptive coding agent optimized for small models that need extra help staying
+on task. Microgentic provides a small terminal interface over an experimental
+runtime for inspecting, editing, validating, and repairing scoped artifacts.
 
 The harness is built in Rust on top of
 [Mojentic](https://github.com/svetzal/mojentic-ru). It emphasizes deterministic
@@ -42,7 +43,8 @@ to the user-focused control surface.
 
 ## Provider configuration
 
-`run` and `run-sequential` accept `--provider omlx|ollama` (default: omlx).
+`run` and `run-sequential` accept `--provider omlx|ollama`. The built-in default
+is oMLX; everyday runs honor saved setup defaults.
 The selected gateway handles the worker and its in-run semantic advisories.
 Standalone planning commands still use oMLX. Configure connections with
 environment variables:
@@ -53,6 +55,19 @@ environment variables:
 | `OMLX_HOST` | Server URL without `/v1` | `http://localhost:8000` |
 | `OMLX_API_KEY` | Bearer token for authenticated servers | Unset |
 | `OMLX_TIMEOUT` | Timeout for non-streaming calls, in milliseconds | `600000` |
+
+`microgentic setup` previews provider, default model, and reasoning effort.
+`microgentic setup --apply` saves those settings. The wizard runs only on a
+terminal; scripts can pass `--provider`, `--model`, and `--reasoning-effort`
+directly. Use `default` during setup to leave effort at the model/provider
+default. Setup does not call a provider or store credentials.
+
+Settings live in `$XDG_CONFIG_HOME/microgentic/config.json`, or
+`~/.config/microgentic/config.json`. Use `--config PATH` for another file.
+Explicit run flags override saved defaults. Changing provider uses that
+provider's model default unless `--model` is supplied. Advanced contract/experiment
+runs and the compatibility executable use explicit flags and historical defaults
+without reading personal settings.
 
 The gateway adds `/v1` to the URL. Streaming requests have no gateway-wide
 response timeout. The harness retains authority over stream patience and stops.
@@ -155,6 +170,53 @@ cargo clippy --all-targets -- -D warnings
 
 ## Command-Line Interface
 
+Install the canonical command from this checkout:
+
+```sh
+cargo install --path . --bin microgentic
+```
+
+Configure defaults, open the terminal interface, or submit a plain-mode task:
+
+```sh
+microgentic setup --apply
+microgentic
+echo "Hello!" | microgentic run
+microgentic run --prompt "Explain this project"
+microgentic run < task.txt > result.txt 2> diagnostics.log
+git diff --no-ext-diff | microgentic run --prompt "Review this diff"
+microgentic run --prompt "Fix the parser" --dir ./project --json
+```
+
+The bare command needs terminal stdin and stdout. `run` never opens the TUI.
+Without `--prompt`, it reads stdin through EOF. With `--prompt`, piped stdin is
+labeled reference material; its shell fences do not declare validation probes.
+Empty prompts, duplicate `--prompt` flags, positional prompts, and invalid UTF-8
+fail before a provider call. Stdin is limited to 1 MiB.
+
+`--dir` selects the file/shell tool root. Normal prompt runs retain inputs and
+traces outside that root under `$XDG_STATE_HOME/microgentic/runs`, or
+`~/.local/state/microgentic/runs`. Each run has a separate directory. Results go
+to stdout; logs go to stderr. `--json` returns the existing full run summary.
+
+In the TUI, Enter sends a task, Alt-Enter inserts a newline, Page Up/Down scroll,
+Ctrl-C requests cancellation, and Esc exits when idle. The view shows defaults,
+elapsed time, results, and trace locations. Each task starts an independent run;
+previous displayed messages are not yet a retained conversation. Detailed live
+tool views and durable session resume remain preparation work.
+
+Run still uses the existing editing, shell, validation, and stop policies.
+It can mutate the selected project. Preview/apply permissions, JSONL streaming,
+and a typed task-to-exit-status mapping remain pending; process success still
+requires inspection of the native terminal result for benchmark classification.
+
+The temporary `adaptive-agent-harness` executable preserves old flags and JSON
+output. Its library import remains `adaptive_agent_harness`. No `mg` executable
+or shell alias is installed. Users can opt into `alias mg=microgentic` themselves.
+
+See [CLI migration evidence](MICROGENTIC-CLI-MIGRATION.md) for deterministic
+checks and benchmark adapter changes.
+
 List the available commands:
 
 ```sh
@@ -180,7 +242,7 @@ Recovery is disabled by default, with one wire attempt per completion. Opt in
 explicitly; wire attempts do not consume model interactions or replay tools:
 
 ```bash
-adaptive-agent-harness run --experiment /work/new-cell --provider ollama \
+microgentic run --experiment /work/new-cell --provider ollama --json \
   --recover-requests --recovery-max-attempts 2 \
   --recovery-base-delay-ms 100 --recovery-delay-ceiling-ms 30000 \
   --recovery-budget-ms 60000 \

@@ -17,7 +17,8 @@ use crate::trace_analysis::analyze_trace;
 use crate::transcript::{RenderTranscriptConfig, render_transcript};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 
 const DEFAULT_MODEL: &str = "Qwen3.8-27B-MLX-8bit";
 
@@ -28,7 +29,9 @@ fn model_context_window_tokens(model: &str) -> Option<usize> {
     }
 }
 
-fn parse_reasoning_effort(value: &str) -> Result<mojentic::llm::gateway::ReasoningEffort, String> {
+pub(crate) fn parse_reasoning_effort(
+    value: &str,
+) -> Result<mojentic::llm::gateway::ReasoningEffort, String> {
     use mojentic::llm::gateway::ReasoningEffort;
     match value {
         "enabled" => Ok(ReasoningEffort::Enabled),
@@ -45,67 +48,102 @@ fn parse_reasoning_effort(value: &str) -> Result<mojentic::llm::gateway::Reasoni
 }
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(
+    name = "microgentic",
+    version,
+    about = "An adaptive coding agent optimized for small models",
+    after_help = "Examples:\n  microgentic\n  microgentic setup\n  echo 'Hello!' | microgentic run\n  microgentic run --prompt 'Fix the parser'\n\nRun uses the existing agent tool and validation policies and can edit the selected project."
+)]
 struct Cli {
+    /// User configuration file (default: $XDG_CONFIG_HOME/microgentic/config.json).
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  adaptive-agent-harness run --experiment /work/new-cell --provider ollama\n  adaptive-agent-harness run --experiment /work/new-cell --recover-requests --recovery-max-attempts 2 --recovery-admission-command /opt/operator/owned-receipt\n\nWire attempts resend one immutable completion; they do not consume model interactions or replay tools. Recovery is disabled by default. SIGINT/SIGTERM persist terminal request evidence before exit."
+    after_help = "Examples:\n  echo 'Hello!' | microgentic run\n  microgentic run --prompt 'Fix the parser' --dir .\n  microgentic run --prompt 'Review this diff' < changes.diff\n\nRun can edit files and execute project commands under the existing runtime policy. Research controls retain their previous meanings. Wire recovery is disabled by default; SIGINT/SIGTERM persist terminal request evidence."
 )]
 struct RunArgs {
-    #[command(flatten)]
-    recovery: crate::recovery::RecoverySettings,
-    /// Experiment root. Tool access is scoped to this directory.
+    /// Prompt. When omitted, read from piped or redirected stdin.
+    #[arg(long, conflicts_with = "goal")]
+    prompt: Option<String>,
+
+    /// Project root for file and shell tools (default: current directory).
+    #[arg(long, default_value = ".")]
+    dir: PathBuf,
+
+    /// Emit the existing complete run summary as JSON instead of final response text.
     #[arg(long)]
-    experiment: PathBuf,
+    json: bool,
+
+    /// Advanced: contract/goal base directory; independent of the tool root (--dir).
+    #[arg(long, help_heading = "Advanced / research")]
+    experiment: Option<PathBuf>,
 
     /// Trace destination. Defaults to `<experiment>/traces`; may be placed
     /// outside the tool-visible experiment root by an external evaluator.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced / research")]
     trace_dir: Option<PathBuf>,
 
     /// Goal file, relative to the experiment root unless absolute.
-    #[arg(long, default_value = "task.md")]
-    goal: PathBuf,
+    #[arg(
+        long,
+        conflicts_with = "contract",
+        help_heading = "Advanced / research"
+    )]
+    goal: Option<PathBuf>,
 
     /// Explicit run-contract JSON file, relative to the experiment root unless absolute.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced / research")]
     contract: Option<PathBuf>,
 
     /// Local inference provider. Uses OMLX_HOST or OLLAMA_HOST.
-    #[arg(long, value_enum, default_value = "omlx")]
-    provider: Provider,
+    #[arg(long, value_enum)]
+    provider: Option<Provider>,
 
     /// Provider model ID. Defaults to Qwen3.8-27B-MLX-8bit (oMLX) or qwen3.8:27b-mxfp8 (Ollama).
     #[arg(long)]
     model: Option<String>,
 
     /// Maximum Mojentic iterative-solver turns.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, help_heading = "Advanced / research")]
     max_iterations: usize,
 
     /// Maximum model interaction cycles per agent turn.
-    #[arg(long, alias = "max-tool-iterations", default_value_t = 75)]
+    #[arg(
+        long,
+        alias = "max-tool-iterations",
+        default_value_t = 75,
+        help_heading = "Advanced / research"
+    )]
     max_model_interactions: usize,
 
     /// Context window for harness accounting and Ollama num_ctx; configure the actual oMLX limit on the server.
     /// Defaults to 262144 for Qwen3.8-27B-MLX-8bit and Mojentic accounting otherwise.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced / research")]
     context_window_tokens: Option<usize>,
 
     /// Packet type used for default output-token budgeting.
-    #[arg(long, default_value = "multi-file-edit")]
+    #[arg(
+        long,
+        default_value = "multi-file-edit",
+        help_heading = "Advanced / research"
+    )]
     packet_type: String,
 
     /// Override the packet output-token budget.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced / research")]
     expected_output_tokens: Option<usize>,
 
     /// Maximum generated tokens per request, including reasoning (default: 16384).
-    #[arg(long, visible_alias = "num-predict")]
+    #[arg(
+        long,
+        visible_alias = "num-predict",
+        help_heading = "Advanced / research"
+    )]
     max_tokens: Option<usize>,
 
     /// Worker reasoning effort: disabled, enabled, low, medium, high, xhigh. Omit for the model default.
@@ -114,55 +152,65 @@ struct RunArgs {
     reasoning_effort: Option<mojentic::llm::gateway::ReasoningEffort>,
 
     /// Explicit model capability profile; omit to leave validation to the provider.
-    #[arg(long, value_parser = ["qwen3.8"])]
+    #[arg(long, value_parser = ["qwen3.8"], help_heading = "Advanced / research")]
     reasoning_profile: Option<String>,
 
     /// Preserve completed native assistant reasoning in history (separate from capped checkpoints).
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced / research")]
     preserve_reasoning: bool,
 
     /// Max reasoning-only tokens in one LLM call before an action-only handoff. Disabled by default; positive values explicitly opt into interruption.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced / research")]
     max_thinking_only_tokens: Option<usize>,
 
     /// Post-validation hidden-only reasoning interruption. Disabled by default; positive values opt in.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced / research")]
     repair_exit_thinking_tokens: Option<usize>,
 
     /// Action handoff policy: text-only preserves the legacy continuation;
     /// constrained ends the failed-probe turn and exposes only repair-action tools;
     /// constrained-action-only disables model reasoning after a capped repair attempt,
     /// withholding arbitrary shell during the native action-only request.
-    #[arg(long, default_value = "text-only")]
+    #[arg(
+        long,
+        default_value = "text-only",
+        help_heading = "Advanced / research"
+    )]
     repair_handoff_policy: String,
 
     /// Pre-validation hidden action-intent reasoning tokens before interrupting and forcing an action. 0 disables.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, help_heading = "Advanced / research")]
     action_boundary_interrupt_tokens: usize,
 
     /// Retain this many tokens (approximately) from the tail of a hidden-only
     /// no-action turn as a continuity checkpoint for the next ordinary turn.
     /// This does not disable reasoning or narrow the tool surface. 0 disables.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, help_heading = "Advanced / research")]
     reasoning_checkpoint_tokens: usize,
 
     /// Transcript retention policy for model/tool context.
-    #[arg(long, default_value = "summarized-transcript")]
+    #[arg(
+        long,
+        default_value = "summarized-transcript",
+        help_heading = "Advanced / research"
+    )]
     transcript_policy: String,
 
     /// Adapter-owned initial-context catalog JSON. Task-only assembly when omitted.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced / research")]
     initial_context_catalog: Option<PathBuf>,
 
     /// Model used for isolated semantic advisory calls. Defaults to the worker model.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced / research")]
     semantic_advisor_model: Option<String>,
 
     /// Generate a proposal-derived acceptance checklist and interaction ledger,
     /// retain it in worker context, and require current coverage before DONE.
     /// Ledger coverage is advisory and does not replace declared probes.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help_heading = "Advanced / research")]
     acceptance_ledger: bool,
+    #[command(flatten, next_help_heading = "Advanced / research")]
+    recovery: crate::recovery::RecoverySettings,
 }
 
 impl RunArgs {
@@ -196,18 +244,19 @@ impl RunArgs {
                     self.repair_handoff_policy
                 )
             })?;
+        let provider = self.provider.unwrap_or_default();
         let model = self
             .model
-            .unwrap_or_else(|| self.provider.default_model().to_string());
+            .unwrap_or_else(|| provider.default_model().to_string());
         let context_window_tokens = self
             .context_window_tokens
             .or_else(|| model_context_window_tokens(&model));
         Ok(AgentRunConfig {
             recovery: self.recovery,
-            provider: self.provider,
-            experiment_dir: self.experiment,
+            provider,
+            experiment_dir: self.experiment.unwrap_or_else(|| PathBuf::from(".")),
             trace_dir: self.trace_dir,
-            goal_file: self.goal,
+            goal_file: self.goal.unwrap_or_else(|| PathBuf::from("task.md")),
             contract_file: self.contract,
             model,
             max_iterations: self.max_iterations,
@@ -240,6 +289,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn everyday_grammar_has_no_positional_prompt_or_required_experiment() {
+        assert!(
+            Cli::try_parse_from(["microgentic"])
+                .unwrap()
+                .command
+                .is_none()
+        );
+        assert!(Cli::try_parse_from(["microgentic", "run", "--prompt", "Hello!"]).is_ok());
+        assert!(Cli::try_parse_from(["microgentic", "run", "Hello!"]).is_err());
+        assert!(
+            Cli::try_parse_from(["microgentic", "run", "--prompt", "a", "--prompt", "b"]).is_err()
+        );
+    }
+
+    #[test]
+    fn prompt_sources_preserve_bytes_and_explicit_prompts_remain_authoritative() {
+        let source = "  hello\nUnicode: 世界\n";
+        assert_eq!(prompt_text(None, Some(source.into())).unwrap(), source);
+        assert_eq!(prompt_text(Some(source.into()), None).unwrap(), source);
+        let combined = prompt_text(Some("Review".into()), Some("diff\n".into())).unwrap();
+        assert!(combined.starts_with("Review\n\n[Reference material"));
+        assert!(combined.contains("diff\n"));
+        assert!(prompt_text(None, None).is_err());
+        assert!(prompt_text(None, Some(" \n".into())).is_err());
+        assert!(prompt_text(Some("".into()), Some("fallback".into())).is_err());
+    }
+
+    #[test]
+    fn reference_shell_fences_do_not_acquire_probe_authority() {
+        let reference = "Old build instructions:\n```sh\ncargo test\n```\n";
+        let (document, suffix) =
+            prompt_document(Some("Review this text".into()), Some(reference.into())).unwrap();
+        assert_eq!(suffix, ".json");
+        let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert!(value["probes"].as_array().unwrap().is_empty());
+        assert!(value["guidance"].as_str().unwrap().contains(reference));
+        let (document, _) = prompt_document(
+            Some("Run this check:\n```sh\ncargo test\n```\n".into()),
+            Some(reference.into()),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(value["probes"].as_array().unwrap().len(), 1);
+        assert_eq!(value["probes"][0]["command"], "cargo test");
+    }
+
+    #[test]
     fn provider_defaults_and_explicit_model_are_resolved_together() {
         for (provider, model) in [
             ("omlx", "Qwen3.8-27B-MLX-8bit"),
@@ -257,7 +353,7 @@ mod tests {
                 if let Some(name) = override_model {
                     args.extend(["--model", name]);
                 }
-                let Command::Run(args) = Cli::try_parse_from(args).unwrap().command else {
+                let Command::Run(args) = Cli::try_parse_from(args).unwrap().command.unwrap() else {
                     panic!("run")
                 };
                 let config = args.into_config().unwrap();
@@ -300,7 +396,7 @@ mod tests {
                 "low",
             ])
             .unwrap();
-            let Command::Run(args) = cli.command else {
+            let Command::Run(args) = cli.command.unwrap() else {
                 panic!("expected run")
             };
             let config = args.into_config().unwrap();
@@ -329,7 +425,7 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["harness", "run", "--experiment", ".", "--max-tokens", "0"])
             .unwrap();
-        let Command::Run(args) = cli.command else {
+        let Command::Run(args) = cli.command.unwrap() else {
             panic!("expected run")
         };
         assert!(args.into_config().is_err());
@@ -338,7 +434,7 @@ mod tests {
     #[test]
     fn model_interaction_limit_defaults_to_seventy_five() {
         let cli = Cli::try_parse_from(["harness", "run", "--experiment", "."]).unwrap();
-        let Command::Run(args) = cli.command else {
+        let Command::Run(args) = cli.command.unwrap() else {
             panic!("expected run command");
         };
         assert_eq!(args.max_model_interactions, 75);
@@ -355,7 +451,7 @@ mod tests {
             "61",
         ])
         .unwrap();
-        let Command::Run(args) = cli.command else {
+        let Command::Run(args) = cli.command.unwrap() else {
             panic!("expected run command");
         };
         assert_eq!(args.max_model_interactions, 61);
@@ -378,7 +474,10 @@ mod tests {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the Mojentic-backed agent selected by the resolved contract profile.
+    /// Configure provider, default model, and reasoning effort (previews unless --apply).
+    Setup(SetupArgs),
+
+    /// Run a prompt from stdin or --prompt using the existing runtime. [Mutates]
     Run(RunArgs),
 
     /// Run bounded natural attempts on one retained worker artifact.
@@ -546,12 +645,62 @@ enum Command {
     },
 }
 
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  microgentic setup\n  microgentic setup --provider ollama --model qwen3.8:27b-mxfp8 --reasoning-effort low --apply\n\nCredentials and server URLs remain in OMLX_HOST/OMLX_API_KEY or OLLAMA_HOST. No provider call is made during setup."
+)]
+struct SetupArgs {
+    #[arg(long, value_enum)]
+    provider: Option<Provider>,
+    #[arg(long)]
+    model: Option<String>,
+    /// Use default to preserve the model/provider default.
+    #[arg(long, value_parser = ["default", "disabled", "enabled", "low", "medium", "high", "xhigh"])]
+    reasoning_effort: Option<String>,
+    /// Save the reviewed configuration. Without this flag setup only previews.
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+/// Shared application boundary for the public and compatibility executables.
+pub async fn main_entry(legacy: bool) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "adaptive_agent_harness=info".into()),
+        )
+        .init();
+    dispatch(legacy).await
+}
+
 pub async fn run() -> Result<()> {
+    dispatch(false).await
+}
+
+async fn dispatch(legacy: bool) -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            bail!("interactive mode needs a terminal; try: echo 'Hello!' | microgentic run");
+        }
+        return crate::tui::run(cli.config).await;
+    };
+    match command {
+        Command::Setup(args) => setup(args, cli.config.as_deref())?,
         Command::Run(run) => {
-            let summary = run_agent(run.into_config()?).await?;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
+            let json = run.json || legacy;
+            let config = prepare_run(run, cli.config.as_deref(), legacy)?;
+            let summary = run_agent(config).await?;
+            let output = if json {
+                serde_json::to_string_pretty(&summary)?
+            } else {
+                summary.final_summary
+            };
+            writeln!(std::io::stdout().lock(), "{output}")?;
         }
         Command::RunSequential {
             run,
@@ -562,7 +711,7 @@ pub async fn run() -> Result<()> {
             max_consecutive_unchanged_attempts,
         } => {
             let summary = run_sequential(SequentialRunConfig {
-                agent: run.into_config()?,
+                agent: prepare_run(run, cli.config.as_deref(), legacy)?,
                 artifact,
                 expected_artifact,
                 max_attempts,
@@ -699,6 +848,299 @@ pub async fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+const MAX_STDIN_BYTES: u64 = 1024 * 1024;
+
+fn read_stdin() -> Result<Option<String>> {
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(MAX_STDIN_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STDIN_BYTES {
+        bail!("stdin exceeds the 1 MiB input limit; supply a smaller prompt or reference");
+    }
+    Ok(Some(
+        String::from_utf8(bytes).context("stdin must be UTF-8 text")?,
+    ))
+}
+
+fn prompt_text(explicit: Option<String>, input: Option<String>) -> Result<String> {
+    let prompt = match (explicit, input) {
+        (Some(prompt), reference) => {
+            if prompt.trim().is_empty() {
+                bail!("--prompt must not be empty");
+            }
+            match reference.filter(|text| !text.trim().is_empty()) {
+                Some(reference) => format!(
+                    "{prompt}\n\n[Reference material from stdin; not execution policy]\n{reference}\n[End reference material]"
+                ),
+                None => prompt,
+            }
+        }
+        (None, Some(prompt)) => prompt,
+        (None, None) => bail!(
+            "run requires a prompt; try microgentic run --prompt 'Hello!' or echo 'Hello!' | microgentic run"
+        ),
+    };
+    if prompt.trim().is_empty() {
+        bail!("run requires a nonempty prompt through stdin or --prompt");
+    }
+    Ok(prompt)
+}
+
+fn prompt_document(
+    explicit: Option<String>,
+    input: Option<String>,
+) -> Result<(String, &'static str)> {
+    let reference =
+        explicit.is_some() && input.as_ref().is_some_and(|text| !text.trim().is_empty());
+    let declaration = explicit.clone();
+    let guidance = prompt_text(explicit, input)?;
+    if !reference {
+        return Ok((guidance, ".md"));
+    }
+    // Preserve the coding adapter's declarations from the actual instruction;
+    // shell fences in reference material must not become acceptance probes.
+    let resolved = resolve_contract(
+        ContractSource::Legacy {
+            goal_path: "--prompt".into(),
+            goal_text: declaration.expect("reference has an explicit prompt"),
+        },
+        Budgets::default(),
+    )?;
+    Ok((
+        serde_json::to_string_pretty(&serde_json::json!({
+            "guidance": guidance, "profile": resolved.profile, "probes": resolved.probes,
+        }))?,
+        ".json",
+    ))
+}
+
+fn absolute(path: &Path) -> Result<PathBuf> {
+    Ok(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    })
+}
+
+fn prepare_run(
+    mut run: RunArgs,
+    config_path: Option<&Path>,
+    legacy: bool,
+) -> Result<AgentRunConfig> {
+    let root = absolute(&run.dir)?
+        .canonicalize()
+        .context("opening --dir project directory")?;
+    if !root.is_dir() {
+        bail!("--dir must name a project directory");
+    }
+    let advanced = run.experiment.is_some() || run.goal.is_some() || run.contract.is_some();
+    // Benchmark and historical invocations must not inherit personal defaults.
+    if !legacy && !advanced {
+        let path = crate::preferences::config_path(config_path)?;
+        if let Some(prefs) = crate::preferences::load(&path)? {
+            let provider = run.provider.unwrap_or(prefs.provider);
+            if run.model.is_none() && provider == prefs.provider {
+                run.model = Some(prefs.model);
+            }
+            if run.reasoning_effort.is_none() && provider == prefs.provider {
+                run.reasoning_effort = prefs
+                    .reasoning_effort
+                    .as_deref()
+                    .map(parse_reasoning_effort)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?;
+            }
+            run.provider = Some(provider);
+        }
+    }
+    let input = if !advanced || run.prompt.is_some() {
+        read_stdin()?
+    } else {
+        None
+    };
+    if let Some(contract) = &run.contract {
+        if let Some(prompt) = &run.prompt {
+            if input.as_ref().is_some_and(|text| !text.trim().is_empty()) {
+                bail!("--contract cannot receive additional stdin reference material");
+            }
+            let base = run
+                .experiment
+                .as_ref()
+                .map(|p| absolute(p))
+                .transpose()?
+                .unwrap_or(root.clone());
+            let path = if contract.is_absolute() {
+                contract.clone()
+            } else {
+                base.join(contract)
+            };
+            let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+            if prompt.trim().is_empty() || value["guidance"].as_str() != Some(prompt.as_str()) {
+                bail!(
+                    "--prompt must exactly match --contract guidance; the contract is authoritative"
+                );
+            }
+        }
+    } else if !advanced || run.prompt.is_some() {
+        let (prompt, suffix) = prompt_document(run.prompt.take(), input)?;
+        let base = if let Some(experiment) = &run.experiment {
+            absolute(experiment)?
+        } else {
+            let state = crate::preferences::state_root()?;
+            std::fs::create_dir_all(&state)?;
+            if state.canonicalize()?.starts_with(&root) {
+                bail!(
+                    "Microgentic state must be outside --dir; set XDG_STATE_HOME to another directory"
+                );
+            }
+            tempfile::Builder::new()
+                .prefix("run-")
+                .tempdir_in(state)?
+                .keep()
+        };
+        let file = tempfile::Builder::new()
+            .prefix("prompt-")
+            .suffix(suffix)
+            .tempfile_in(&base)?;
+        std::fs::write(file.path(), prompt)?;
+        let (_, path) = file.keep()?;
+        run.experiment = Some(base);
+        if suffix == ".json" {
+            run.contract = Some(path.clone());
+        }
+        run.goal = Some(path);
+    }
+    // Resolve relative management paths before changing the one process tool cwd.
+    if let Some(experiment) = &mut run.experiment {
+        *experiment = absolute(experiment)?;
+    }
+    if let Some(trace) = &mut run.trace_dir {
+        *trace = absolute(trace)?;
+    }
+    std::env::set_current_dir(root)?;
+    run.into_config()
+}
+
+fn setup(args: SetupArgs, explicit_path: Option<&Path>) -> Result<()> {
+    let path = crate::preferences::config_path(explicit_path)?;
+    let before = crate::preferences::load(&path)?;
+    let mut prefs = before.clone().unwrap_or_default();
+    let wizard = args.provider.is_none() && args.model.is_none() && args.reasoning_effort.is_none();
+    if wizard && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
+        bail!(
+            "setup needs settings or a terminal; try microgentic setup --provider ollama --model qwen3.8:27b-mxfp8 --reasoning-effort default --apply"
+        );
+    }
+    let provider = if wizard {
+        let value = ask("Provider (omlx/ollama)", prefs.provider.as_str())?;
+        match value.as_str() {
+            "omlx" => Provider::Omlx,
+            "ollama" => Provider::Ollama,
+            _ => bail!("provider must be omlx or ollama"),
+        }
+    } else {
+        args.provider.unwrap_or(prefs.provider)
+    };
+    if provider != prefs.provider {
+        prefs.model = provider.default_model().into();
+        prefs.reasoning_effort = None;
+    }
+    prefs.provider = provider;
+    prefs.model = if wizard {
+        ask("Default model ID", &prefs.model)?
+    } else {
+        args.model.unwrap_or(prefs.model)
+    };
+    let effort = if wizard {
+        Some(ask(
+            "Default effort (default/disabled/enabled/low/medium/high/xhigh)",
+            prefs.reasoning_effort.as_deref().unwrap_or("default"),
+        )?)
+    } else {
+        args.reasoning_effort
+    };
+    if let Some(effort) = effort {
+        prefs.reasoning_effort = (effort != "default").then_some(effort);
+    }
+    prefs.validate()?;
+    if args.apply {
+        crate::preferences::save(&path, &prefs)?;
+    }
+    if args.json {
+        writeln!(
+            std::io::stdout().lock(),
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"path":path,"before":before,"after":prefs,"applied":args.apply})
+            )?
+        )?;
+    } else {
+        println!(
+            "{} {}",
+            if args.apply {
+                "Saved configuration:"
+            } else {
+                "Configuration preview:"
+            },
+            path.display()
+        );
+        println!(
+            "Provider: {} → {}",
+            before
+                .as_ref()
+                .map(|p| p.provider.as_str())
+                .unwrap_or("unset"),
+            prefs.provider.as_str()
+        );
+        println!(
+            "Model: {} → {}",
+            before.as_ref().map(|p| p.model.as_str()).unwrap_or("unset"),
+            prefs.model
+        );
+        println!(
+            "Effort: {} → {}",
+            before
+                .as_ref()
+                .and_then(|p| p.reasoning_effort.as_deref())
+                .unwrap_or("model default"),
+            prefs.reasoning_effort.as_deref().unwrap_or("model default")
+        );
+        if !args.apply {
+            println!(
+                "Save these settings with:\n  microgentic --config {} setup --provider {} --model {} --reasoning-effort {} --apply",
+                shell_quote(&path.to_string_lossy()),
+                prefs.provider.as_str(),
+                shell_quote(&prefs.model),
+                prefs.reasoning_effort.as_deref().unwrap_or("default")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn ask(label: &str, default: &str) -> Result<String> {
+    eprint!("{label} [{default}]: ");
+    std::io::stderr().flush()?;
+    let mut text = String::new();
+    if std::io::stdin().read_line(&mut text)? == 0 {
+        bail!("setup input ended; configuration was not saved");
+    }
+    let text = text.trim();
+    Ok(if text.is_empty() {
+        default.to_string()
+    } else {
+        text.to_string()
+    })
 }
 
 fn contract_source(goal: Option<PathBuf>, contract: Option<PathBuf>) -> Result<ContractSource> {

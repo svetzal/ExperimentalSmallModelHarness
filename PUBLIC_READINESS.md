@@ -1,6 +1,7 @@
 # Microgentic public CLI readiness checklist
 
-Date: 2026-10-13. Status: preparation; proposed commands are not implemented.
+Date: 2026-10-13. Status: initial CLI implementation; remaining proposals are
+identified below. See [migration evidence](MICROGENTIC-CLI-MIGRATION.md).
 
 Build Microgentic as an adaptive coding agent optimized for small models that
 need extra help staying on task. Give it a small, simple, fast interface with
@@ -159,7 +160,12 @@ the first public alpha usable; P2 extends it after core workflows work.
   Preserve historical evidence and document compatibility for existing
   `adaptive-agent-harness` invocations. Alias setup must be explicit and must
   not overwrite an existing command or shell alias.
-- [ ] **Implement prompt intake.** Accept `run --prompt "..."` or read the prompt
+- [x] **Implement the initial name and grammar.** Cargo package and canonical
+  command are `microgentic`; the old executable/library remain compatible.
+  Bare invocation opens the first TUI; setup previews/saves provider/model/effort.
+  Existing runtime policies remain unchanged. Complete packaging/completions
+  and the wider naming migration separately.
+- [x] **Implement prompt intake.** Accept `run --prompt "..."` or read the prompt
   from piped/redirected stdin. Read prompt files through normal input redirection.
   Specify precedence and empty-input errors. Convert requests to the existing
   contract type without requiring users to author probe JSON.
@@ -183,13 +189,19 @@ the first public alpha usable; P2 extends it after core workflows work.
 
 ### P0: benchmark compatibility through adapters
 
-The current DeepSWE/Pier and Terminal-Bench/Harbor adapters under
+The first migration is implemented in the maintained adapters, with an exported
+patch and deterministic checks in [migration evidence](MICROGENTIC-CLI-MIGRATION.md).
+The source review below describes the pre-migration interface; frozen experiments
+remain unchanged. Container installation and future registered cells need the
+broader gates below.
+
+At the review baseline, the DeepSWE/Pier and Terminal-Bench/Harbor adapters under
 `../Benchmarks/deep-swe/adapter/adaptive_harness_agent.py` and
-`../Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py` launch
+`../Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py` launched
 `adaptive-agent-harness run` with `--experiment`, `--contract`, `--trace-dir`,
-model budgets, and policy flags. They also inspect `run.failed` trace records
-after a nonzero process exit. Harbor still uses `--max-tool-iterations`; Pier
-uses `--max-model-interactions`. These are concrete migration points identified
+model budgets, and policy flags. They also inspected `run.failed` trace records
+after a nonzero process exit. Harbor used `--max-tool-iterations`; Pier
+used `--max-model-interactions`. These were concrete migration points identified
 by source review, not newly executed benchmark results.
 
 - [ ] **Define the adapter boundary before changing commands.** Map benchmark
@@ -281,7 +293,7 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
 
 ### P1: friendly TUI
 
-- [ ] **Implement launch behavior.** Bare `microgentic` opens the conversation
+- [x] **Implement launch behavior.** Bare `microgentic` opens the conversation
   TUI when stdin and stdout are terminals. `run` uses the plain interface even
   on a terminal. Missing prompts and redirected bare invocations return clear
   usage errors without entering the TUI or waiting for hidden input.
@@ -414,8 +426,9 @@ The behaviors and examples in this section are requirements for implementation.
 
 ### Proposed examples and acceptance checks
 
-These examples describe the intended public interface; it is not implemented
-yet. The core `run` prompt grammar is decided; `--stream` remains a proposed flag.
+The basic entry points, prompt intake, text output, and JSON summaries are
+implemented. `status`, `--stream`, and richer session commands remain proposals;
+those examples are future acceptance targets.
 
 ```sh
 microgentic
@@ -452,8 +465,8 @@ microgentic run --prompt "Summarize the public API" >> summaries.txt
 
 Decision recorded on 2026-10-13: bare `microgentic` opens the TUI, `setup`
 configures provider/default model/effort, and `run` requires stdin or `--prompt`.
-The interface is not implemented yet. Additional commands/options below remain
-proposals to fill out these entry points.
+The three entry points are implemented. `--apply` currently saves setup only;
+run preview/apply and additional commands below remain proposals.
 
 | Command | User purpose |
 | --- | --- |
@@ -461,7 +474,7 @@ proposals to fill out these entry points.
 | `microgentic setup` | Configure provider, default model, and effort level |
 | `microgentic setup --apply` | Save the reviewed setup |
 | `echo "Hello!" \| microgentic run` | Read the prompt from stdin in plain mode |
-| `microgentic run --prompt "Fix the parser" --dir .` | Inspect and propose a concrete change |
+| `microgentic run --prompt "Fix the parser" --dir .` | Run the task in the selected project under the current runtime policy |
 | `microgentic run < task.txt` | Read the prompt from a file through stdin |
 | `microgentic run --prompt "Fix the parser" --dir . --apply` | Apply the retained proposal and permitted checks |
 | `microgentic provider list` | Show configured profiles and destinations |
@@ -495,9 +508,10 @@ alias mg=microgentic
 ```
 
 Use `microgentic` in official examples and automation so they work independently
-of a user's aliases. The name is settled; package/repository and brand/domain
-availability checks remain release preparation work. This documentation decision
-does not rename the current binary or rewrite preserved CLI review evidence.
+of a user's aliases. The Cargo package and primary executable now use the chosen
+name, with the old executable retained for compatibility. Package/repository and
+brand/domain availability checks remain release preparation work. Preserved CLI
+review evidence keeps its original names.
 
 ## First implementation slices and release gate
 

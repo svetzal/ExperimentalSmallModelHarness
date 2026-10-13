@@ -22,6 +22,12 @@ resolved inputs and runtime behavior before new trials; preserve frozen evidence
 through pinned binaries, adapter revisions, and configuration. The preparation
 backlog is in `PUBLIC_READINESS.md`; proposed features are not implemented behavior.
 
+The initial Microgentic CLI keeps task preparation and presentation outside the
+runtime policy. Benchmark adapters supply explicit providers and authoritative
+contracts instead of inheriting personal setup defaults. Prove migration fidelity
+with provider requests after tool feedback, not only matching option names.
+See `MICROGENTIC-CLI-MIGRATION.md` for the implementation boundary and checks.
+
 ## Responsibilities
 
 The harness maintains goals, acceptance criteria, budgets, and stopping rules.

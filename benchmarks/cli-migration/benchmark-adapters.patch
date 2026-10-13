@@ -1,0 +1,323 @@
+--- a/Benchmarks/deep-swe/adapter/adaptive_harness_agent.py
++++ b/Benchmarks/deep-swe/adapter/adaptive_harness_agent.py
+@@ -24,7 +24,7 @@
+ 
+     BINARY_ENV = "ADAPTIVE_HARNESS_BINARY"
+     REMOTE_EXPERIMENT = "/installed-agent"
+-    REMOTE_BINARY = "/installed-agent/adaptive-agent-harness"
++    REMOTE_BINARY = "/installed-agent/microgentic"
+     REMOTE_LAUNCHER = "/installed-agent/signal-safe-launcher.py"
+     REMOTE_CA_BUNDLE = "/installed-agent/ca-certificates.crt"
+     REMOTE_CONTRACT = "/installed-agent/run-contract.json"
+@@ -45,6 +45,7 @@
+         *,
+         binary_path: str | Path | None = None,
+         harness_revision: str = "unknown",
++        provider: str = "ollama",
+         context_window_tokens: int = 262_144,
+         num_predict: int = 16_384,
+         max_iterations: int = 10,
+@@ -76,6 +77,9 @@
+         if not self.ca_bundle_path.is_file():
+             raise FileNotFoundError(f"CA bundle not found: {self.ca_bundle_path}")
+ 
++        if provider not in {"omlx", "ollama"}:
++            raise ValueError("provider must be omlx or ollama")
++        self.provider = provider
+         self.harness_revision = harness_revision
+         self.binary_sha256 = hashlib.sha256(self.binary_path.read_bytes()).hexdigest()
+         self.ca_bundle_sha256 = hashlib.sha256(
+@@ -141,12 +145,15 @@
+ 
+     @override
+     def network_allowlist(self) -> NetworkAllowlist:
+-        ollama_host = self.extra_env.get(
+-            "OLLAMA_HOST", "http://host.docker.internal:11434"
+-        )
+-        hostname = urlparse(ollama_host).hostname
++        host_key, default_host = (
++            ("OLLAMA_HOST", "http://host.docker.internal:11434")
++            if self.provider == "ollama"
++            else ("OMLX_HOST", "http://localhost:8000")
++        )
++        provider_host = self.extra_env.get(host_key, default_host)
++        hostname = urlparse(provider_host).hostname
+         if not hostname:
+-            raise ValueError(f"OLLAMA_HOST has no hostname: {ollama_host!r}")
++            raise ValueError(f"{host_key} has no hostname: {provider_host!r}")
+         return NetworkAllowlist(domains=[hostname])
+ 
+     @override
+@@ -180,9 +187,9 @@
+         if "/" not in self.model_name:
+             return self.model_name
+         provider, model = self.model_name.split("/", 1)
+-        if provider != "ollama":
++        if provider != self.provider:
+             raise ValueError(
+-                f"adaptive harness requires an Ollama model, got provider {provider!r}"
++                f"adaptive harness requires an {'Ollama' if self.provider == 'ollama' else 'oMLX'} model, got provider {provider!r}"
+             )
+         return model
+ 
+@@ -314,6 +321,13 @@
+         args = [
+             self.REMOTE_BINARY,
+             "run",
++            "--prompt",
++            instruction,
++            "--dir",
++            ".",
++            "--json",
++            "--provider",
++            self.provider,
+             "--experiment",
+             self.REMOTE_EXPERIMENT,
+             "--contract",
+@@ -324,7 +338,7 @@
+             model,
+             "--context-window-tokens",
+             str(self.context_window_tokens),
+-            "--num-predict",
++            "--max-tokens",
+             str(self.num_predict),
+             "--max-iterations",
+             str(self.max_iterations),
+@@ -378,6 +392,7 @@
+             "harness_revision": self.harness_revision,
+             "harness_binary_sha256": self.binary_sha256,
+             "model": model,
++            "provider": self.provider,
+             "trace_dir": self.REMOTE_TRACE_DIR,
+             "state": "running",
+             "intent_guidance_present": self.guidance_content is not None,
+--- a/Benchmarks/deep-swe/adapter/Dockerfile
++++ b/Benchmarks/deep-swe/adapter/Dockerfile
+@@ -18,5 +18,6 @@
+ RUN cargo build --manifest-path /src/Cargo.toml --release --locked
+ 
+ FROM scratch
++COPY --from=builder /src/target/release/microgentic /microgentic
+ COPY --from=builder /src/target/release/adaptive-agent-harness /adaptive-agent-harness
+ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /ca-certificates.crt
+--- a/Benchmarks/deep-swe/adapter/build-linux-binary.sh
++++ b/Benchmarks/deep-swe/adapter/build-linux-binary.sh
+@@ -20,11 +20,13 @@
+   --output "type=local,dest=${output_dir}" \
+   "${harness_dir}"
+ 
+-chmod 755 "${output_dir}/adaptive-agent-harness"
++chmod 755 "${output_dir}/microgentic" "${output_dir}/adaptive-agent-harness"
+ printf '%s\n' "${harness_revision}" > "${output_dir}/harness-revision.txt"
++shasum -a 256 "${output_dir}/microgentic" \
++  > "${output_dir}/microgentic.sha256"
+ shasum -a 256 "${output_dir}/adaptive-agent-harness" \
+   > "${output_dir}/adaptive-agent-harness.sha256"
+ shasum -a 256 "${output_dir}/ca-certificates.crt" \
+   > "${output_dir}/ca-certificates.crt.sha256"
+ 
+-echo "Built ${output_dir}/adaptive-agent-harness"
++echo "Built ${output_dir}/microgentic (adaptive-agent-harness compatibility entry included)"
+--- a/Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py
++++ b/Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py
+@@ -21,7 +21,7 @@
+ 
+     BINARY_ENV = "ADAPTIVE_HARNESS_BINARY"
+     REMOTE_EXPERIMENT = "/installed-agent"
+-    REMOTE_BINARY = "/installed-agent/adaptive-agent-harness"
++    REMOTE_BINARY = "/installed-agent/microgentic"
+     REMOTE_LAUNCHER = "/installed-agent/signal-safe-launcher.py"
+     REMOTE_CA_BUNDLE = "/installed-agent/ca-certificates.crt"
+     REMOTE_CONTRACT = "/installed-agent/run-contract.json"
+@@ -41,6 +41,7 @@
+         *,
+         binary_path: str | Path | None = None,
+         harness_revision: str = "unknown",
++        provider: str = "ollama",
+         context_window_tokens: int = 131_072,
+         num_predict: int = 16_384,
+         max_iterations: int = 10,
+@@ -66,6 +67,9 @@
+         if not self.ca_bundle_path.is_file():
+             raise FileNotFoundError(f"CA bundle not found: {self.ca_bundle_path}")
+ 
++        if provider not in {"omlx", "ollama"}:
++            raise ValueError("provider must be omlx or ollama")
++        self.provider = provider
+         self.harness_revision = harness_revision
+         self.binary_sha256 = hashlib.sha256(self.binary_path.read_bytes()).hexdigest()
+         self.ca_bundle_sha256 = hashlib.sha256(
+@@ -161,9 +165,9 @@
+         if "/" not in self.model_name:
+             return self.model_name
+         provider, model = self.model_name.split("/", 1)
+-        if provider != "ollama":
++        if provider != self.provider:
+             raise ValueError(
+-                f"adaptive harness requires an Ollama model, got provider {provider!r}"
++                f"adaptive harness requires an {'Ollama' if self.provider == 'ollama' else 'oMLX'} model, got provider {provider!r}"
+             )
+         return model
+ 
+@@ -236,6 +240,13 @@
+         args = [
+             self.REMOTE_BINARY,
+             "run",
++            "--prompt",
++            instruction,
++            "--dir",
++            ".",
++            "--json",
++            "--provider",
++            self.provider,
+             "--experiment",
+             self.REMOTE_EXPERIMENT,
+             "--contract",
+@@ -246,11 +257,11 @@
+             model,
+             "--context-window-tokens",
+             str(self.context_window_tokens),
+-            "--num-predict",
++            "--max-tokens",
+             str(self.num_predict),
+             "--max-iterations",
+             str(self.max_iterations),
+-            "--max-tool-iterations",
++            "--max-model-interactions",
+             str(self.max_tool_iterations),
+             "--max-thinking-only-tokens",
+             str(self.max_thinking_only_tokens),
+@@ -291,6 +302,7 @@
+             "harness_binary_sha256": self.binary_sha256,
+             "ca_bundle_sha256": self.ca_bundle_sha256,
+             "model": model,
++            "provider": self.provider,
+             "trace_dir": self.REMOTE_TRACE_DIR,
+             "return_code": result.return_code,
+             "contract_probe_count": len(self.contract_probes),
+--- a/Benchmarks/terminal-bench-2.1/adapter/Dockerfile
++++ b/Benchmarks/terminal-bench-2.1/adapter/Dockerfile
+@@ -18,5 +18,6 @@
+ RUN cargo build --manifest-path /src/Cargo.toml --release --locked
+ 
+ FROM scratch
++COPY --from=builder /src/target/release/microgentic /microgentic
+ COPY --from=builder /src/target/release/adaptive-agent-harness /adaptive-agent-harness
+ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /ca-certificates.crt
+--- a/Benchmarks/terminal-bench-2.1/adapter/build-linux-binary.sh
++++ b/Benchmarks/terminal-bench-2.1/adapter/build-linux-binary.sh
+@@ -20,11 +20,13 @@
+   --output "type=local,dest=${output_dir}" \
+   "${harness_dir}"
+ 
+-chmod 755 "${output_dir}/adaptive-agent-harness"
++chmod 755 "${output_dir}/microgentic" "${output_dir}/adaptive-agent-harness"
+ printf '%s\n' "${harness_revision}" > "${output_dir}/harness-revision.txt"
++shasum -a 256 "${output_dir}/microgentic" \
++  > "${output_dir}/microgentic.sha256"
+ shasum -a 256 "${output_dir}/adaptive-agent-harness" \
+   > "${output_dir}/adaptive-agent-harness.sha256"
+ shasum -a 256 "${output_dir}/ca-certificates.crt" \
+   > "${output_dir}/ca-certificates.crt.sha256"
+ 
+-echo "Built ${output_dir}/adaptive-agent-harness"
++echo "Built ${output_dir}/microgentic (adaptive-agent-harness compatibility entry included)"
+--- a/Benchmarks/terminal-bench-2.1/adapter/tests/test_adaptive_harness_agent.py
++++ b/Benchmarks/terminal-bench-2.1/adapter/tests/test_adaptive_harness_agent.py
+@@ -40,7 +40,7 @@
+         self, command: str, user: str | int | None = None, **_kwargs: object
+     ) -> FakeResult:
+         self.commands.append((command, user))
+-        if "adaptive-agent-harness run" in command:
++        if "microgentic run" in command:
+             if self.cancel_run:
+                 raise asyncio.CancelledError
+             return FakeResult(return_code=self.run_return_code, stderr="run failed")
+@@ -97,6 +97,12 @@
+     assert f"--experiment {agent.REMOTE_EXPERIMENT}" in run_command
+     assert f"--trace-dir {agent.REMOTE_TRACE_DIR}" in run_command
+     assert "--model qwen-test" in run_command
++    assert "--prompt" in run_command
++    assert "--dir ." in run_command
++    assert "--json" in run_command
++    assert "--provider ollama" in run_command
++    assert "--max-tokens 16384" in run_command
++    assert "--max-model-interactions 50" in run_command
+     assert f"SSL_CERT_FILE={agent.REMOTE_CA_BUNDLE}" in run_command
+     assert f"{agent.REMOTE_LAUNCHER} env" in run_command
+     assert agent.REMOTE_PID in run_command
+--- /dev/null
++++ b/Benchmarks/deep-swe/scripts/test_microgentic_adapter.py
+@@ -0,0 +1,72 @@
++from __future__ import annotations
++
++import json
++import shlex
++from dataclasses import dataclass
++from pathlib import Path
++
++import pytest
++from adapter.adaptive_harness_agent import AdaptiveHarnessAgent
++from pier.models.agent.context import AgentContext
++
++
++@dataclass
++class Result:
++    return_code: int = 0
++    stdout: str = ""
++    stderr: str = ""
++
++
++class Environment:
++    def __init__(self):
++        self.commands = []
++        self.uploads = {}
++
++    def agent_process_env(self, values):
++        return values
++
++    async def upload_file(self, source_path, target_path):
++        self.uploads[target_path] = Path(source_path).read_bytes()
++
++    async def exec(self, command, **kwargs):
++        self.commands.append(command)
++        return Result()
++
++
++@pytest.mark.asyncio
++async def test_public_prompt_and_controls_preserve_the_registered_contract(tmp_path):
++    binary = tmp_path / "microgentic"
++    binary.write_bytes(b"test-binary")
++    binary.with_name("ca-certificates.crt").write_bytes(b"test-ca")
++    agent = AdaptiveHarnessAgent(logs_dir=tmp_path / "logs", binary_path=binary,
++                                 model_name="ollama/qwen-test", num_predict=8192,
++                                 max_model_interactions=23)
++    environment = Environment()
++    prompt = "Preserve this: 'quotes', $(literal), `literal`, and Unicode 世界.\nNext line."
++    context = AgentContext()
++    await agent.run(prompt, environment, context)
++    contract = json.loads(environment.uploads[agent.REMOTE_CONTRACT])
++    assert contract["guidance"] == prompt
++    assert contract["profile"]["id"] == "terminal_work"
++    assert contract["probes"] == []
++    command = next(c for c in environment.commands if "/installed-agent/microgentic run" in c)
++    args = shlex.split(command)
++    assert args[args.index("--prompt") + 1] == prompt
++    assert args[args.index("--provider") + 1] == "ollama"
++    assert args[args.index("--dir") + 1] == "."
++    assert args[args.index("--max-tokens") + 1] == "8192"
++    assert args[args.index("--max-model-interactions") + 1] == "23"
++    assert "--json" in args
++    assert context.metadata["provider"] == "ollama"
++    assert context.metadata["workspace_snapshot"] == "committed_after_agent_exit"
++
++
++def test_selected_provider_routes_network_and_model_prefix(tmp_path):
++    binary = tmp_path / "microgentic"
++    binary.write_bytes(b"test-binary")
++    binary.with_name("ca-certificates.crt").write_bytes(b"test-ca")
++    agent = AdaptiveHarnessAgent(logs_dir=tmp_path / "logs", binary_path=binary,
++                                 model_name="omlx/test", provider="omlx",
++                                 extra_env={"OMLX_HOST": "http://my-omlx.example:8000"})
++    assert agent._ollama_model() == "test"
++    assert agent.network_allowlist().domains == ["my-omlx.example"]

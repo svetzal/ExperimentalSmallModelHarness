@@ -1,0 +1,37 @@
+{
+  "schema_version": "microgentic_adapter_migration.v1",
+  "files": [
+    {
+      "path": "Benchmarks/deep-swe/adapter/adaptive_harness_agent.py",
+      "sha256": "972ed8960b4888ef2fc86b59dddd39330219f01c89d9bfeca7128b4b60b9230a"
+    },
+    {
+      "path": "Benchmarks/deep-swe/adapter/Dockerfile",
+      "sha256": "89eb2454b7e09e4946abead294130376a9a2cc7361beb4f18cbce17296ed6a12"
+    },
+    {
+      "path": "Benchmarks/deep-swe/adapter/build-linux-binary.sh",
+      "sha256": "9f2818bc9170f2ba80346da2767c092398bb4c0fb11126005f4b89cb50a0bea3"
+    },
+    {
+      "path": "Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py",
+      "sha256": "52a83be93f8f2fdd83e58c428e8149131125b7a83821d9fcdb27897f64e9d17b"
+    },
+    {
+      "path": "Benchmarks/terminal-bench-2.1/adapter/Dockerfile",
+      "sha256": "89eb2454b7e09e4946abead294130376a9a2cc7361beb4f18cbce17296ed6a12"
+    },
+    {
+      "path": "Benchmarks/terminal-bench-2.1/adapter/build-linux-binary.sh",
+      "sha256": "9f2818bc9170f2ba80346da2767c092398bb4c0fb11126005f4b89cb50a0bea3"
+    },
+    {
+      "path": "Benchmarks/terminal-bench-2.1/adapter/tests/test_adaptive_harness_agent.py",
+      "sha256": "8fc58c2d42803f2ba3a1dcb381e6fdb87496b546132faa0d280ddb5162eece96"
+    },
+    {
+      "path": "Benchmarks/deep-swe/scripts/test_microgentic_adapter.py",
+      "sha256": "7646567592ec5967879254e4147029afd88aa6b57c3430fde8ef29b69901367a"
+    }
+  ]
+}
