@@ -1,0 +1,203 @@
+{
+  "schema_version": "cli_surface_review.v1",
+  "review_date": "2026-10-13",
+  "source_revision": "408b374956833a87fe92b7a00c73ba436ac33675",
+  "binary_version": "adaptive-agent-harness 0.1.0",
+  "build_command": "cargo build --locked",
+  "build_exit_code": 0,
+  "review_scope": "help, parser errors and read-only commands; no inference or project mutations",
+  "records": [
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Usage: adaptive-agent-harness <COMMAND>\n\nCommands:\n  run                          Run the Mojentic-backed agent selected by the resolved contract profile\n  run-sequential               Run bounded natural attempts on one retained worker artifact\n  analyze-trace                Summarize context assembly and tool payload pressure from trace JSONL files\n  render-transcript            Render one or more harness traces as a self-contained HTML transcript\n  summarize-matrix             Summarize the preserved 30-cell demo matrix baseline into canonical counts (harness completion, independent validation, hard-stops, environment corrections), replacing matrix-specific classification\n  resolve-contract             Resolve a run contract without starting a provider or gateway: either a legacy Markdown `task.md` (via shell-fence scraping) or an explicit contract JSON file. Prints the resolved contract. This is both the no-provider resolution command and the snapshot generator/checker for `fixtures/contracts/snapshots/`\n  plan-task                    Propose and validate a measurement-only acceptance checklist without starting the worker loop or exposing tools\n  plan-interactions            Propose and validate measurement-only combined scenarios over a fixed acceptance plan without starting the worker loop or exposing tools\n  author-interaction-evidence  Author and validate measurement-only evidence for one deterministic interaction candidate without starting the worker loop or exposing tools\n  help                         Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "run",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Run the Mojentic-backed agent selected by the resolved contract profile\n\nUsage: adaptive-agent-harness run [OPTIONS] --experiment <EXPERIMENT>\n\nOptions:\n      --recover-requests\n          Recover eligible wire requests. Never replays model interactions or tools\n      --recovery-max-attempts <RECOVERY_MAX_ATTEMPTS>\n          Wire attempts per completion, including the first; separate from interaction/depth budgets [default: 1]\n      --recovery-retryable-status <RECOVERY_RETRYABLE_STATUS>\n          Explicit HTTP retry status selection (repeatable); permanent 400/401/403 remain ineligible\n      --recovery-base-delay-ms <RECOVERY_BASE_DELAY_MS>\n          Initial jitter ceiling in milliseconds [default: 100]\n      --recovery-delay-ceiling-ms <RECOVERY_DELAY_CEILING_MS>\n          Maximum permissible delay, including Retry-After [default: 30000]\n      --recovery-budget-ms <RECOVERY_BUDGET_MS>\n          Recovery budget after failure, in milliseconds; never a generation timeout\n      --recovery-admission-command <RECOVERY_ADMISSION_COMMAND>\n          Trusted executable outside the tool root; JSON proof on stdout, metadata on stdin\n      --recovery-capture-dir <RECOVERY_CAPTURE_DIR>\n          Opt-in credential-filtered HTTP bodies outside the tool root; allowed with one attempt and recovery disabled\n      --experiment <EXPERIMENT>\n          Experiment root. Tool access is scoped to this directory\n      --trace-dir <TRACE_DIR>\n          Trace destination. Defaults to `<experiment>/traces`; may be placed outside the tool-visible experiment root by an external evaluator\n      --goal <GOAL>\n          Goal file, relative to the experiment root unless absolute [default: task.md]\n      --contract <CONTRACT>\n          Explicit run-contract JSON file, relative to the experiment root unless absolute\n      --provider <PROVIDER>\n          Local inference provider. Uses OMLX_HOST or OLLAMA_HOST [default: omlx] [possible values: omlx, ollama]\n      --model <MODEL>\n          Provider model ID. Defaults to Qwen3.8-27B-MLX-8bit (oMLX) or qwen3.8:27b-mxfp8 (Ollama)\n      --max-iterations <MAX_ITERATIONS>\n          Maximum Mojentic iterative-solver turns [default: 10]\n      --max-model-interactions <MAX_MODEL_INTERACTIONS>\n          Maximum model interaction cycles per agent turn [default: 75]\n      --context-window-tokens <CONTEXT_WINDOW_TOKENS>\n          Context window for harness accounting and Ollama num_ctx; configure the actual oMLX limit on the server. Defaults to 262144 for Qwen3.8-27B-MLX-8bit and Mojentic accounting otherwise\n      --packet-type <PACKET_TYPE>\n          Packet type used for default output-token budgeting [default: multi-file-edit]\n      --expected-output-tokens <EXPECTED_OUTPUT_TOKENS>\n          Override the packet output-token budget\n      --max-tokens <MAX_TOKENS>\n          Maximum generated tokens per request, including reasoning (default: 16384) [alias: --num-predict]\n      --reasoning-effort <REASONING_EFFORT>\n          Worker reasoning effort: disabled, enabled, low, medium, high, xhigh. Omit for the model default. Named levels depend on the model's chat template; advisory calls keep their defaults\n      --reasoning-profile <REASONING_PROFILE>\n          Explicit model capability profile; omit to leave validation to the provider [possible values: qwen3.8]\n      --preserve-reasoning\n          Preserve completed native assistant reasoning in history (separate from capped checkpoints)\n      --max-thinking-only-tokens <MAX_THINKING_ONLY_TOKENS>\n          Max reasoning-only tokens in one LLM call before an action-only handoff. Disabled by default; positive values explicitly opt into interruption\n      --repair-exit-thinking-tokens <REPAIR_EXIT_THINKING_TOKENS>\n          Post-validation hidden-only reasoning interruption. Disabled by default; positive values opt in\n      --repair-handoff-policy <REPAIR_HANDOFF_POLICY>\n          Action handoff policy: text-only preserves the legacy continuation; constrained ends the failed-probe turn and exposes only repair-action tools; constrained-action-only disables model reasoning after a capped repair attempt, withholding arbitrary shell during the native action-only request [default: text-only]\n      --action-boundary-interrupt-tokens <ACTION_BOUNDARY_INTERRUPT_TOKENS>\n          Pre-validation hidden action-intent reasoning tokens before interrupting and forcing an action. 0 disables [default: 0]\n      --reasoning-checkpoint-tokens <REASONING_CHECKPOINT_TOKENS>\n          Retain this many tokens (approximately) from the tail of a hidden-only no-action turn as a continuity checkpoint for the next ordinary turn. This does not disable reasoning or narrow the tool surface. 0 disables [default: 0]\n      --transcript-policy <TRANSCRIPT_POLICY>\n          Transcript retention policy for model/tool context [default: summarized-transcript]\n      --initial-context-catalog <INITIAL_CONTEXT_CATALOG>\n          Adapter-owned initial-context catalog JSON. Task-only assembly when omitted\n      --semantic-advisor-model <SEMANTIC_ADVISOR_MODEL>\n          Model used for isolated semantic advisory calls. Defaults to the worker model\n      --acceptance-ledger\n          Generate a proposal-derived acceptance checklist and interaction ledger, retain it in worker context, and require current coverage before DONE. Ledger coverage is advisory and does not replace declared probes\n  -h, --help\n          Print help\n\nExamples:\n  adaptive-agent-harness run --experiment /work/new-cell --provider ollama\n  adaptive-agent-harness run --experiment /work/new-cell --recover-requests --recovery-max-attempts 2 --recovery-admission-command /opt/operator/owned-receipt\n\nWire attempts resend one immutable completion; they do not consume model interactions or replay tools. Recovery is disabled by default. SIGINT/SIGTERM persist terminal request evidence before exit.\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "run-sequential",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Run bounded natural attempts on one retained worker artifact\n\nUsage: adaptive-agent-harness run-sequential [OPTIONS] --experiment <EXPERIMENT> --artifact <ARTIFACT> --expected-artifact <EXPECTED_ARTIFACT>\n\nOptions:\n      --recover-requests\n          Recover eligible wire requests. Never replays model interactions or tools\n      --recovery-max-attempts <RECOVERY_MAX_ATTEMPTS>\n          Wire attempts per completion, including the first; separate from interaction/depth budgets [default: 1]\n      --recovery-retryable-status <RECOVERY_RETRYABLE_STATUS>\n          Explicit HTTP retry status selection (repeatable); permanent 400/401/403 remain ineligible\n      --recovery-base-delay-ms <RECOVERY_BASE_DELAY_MS>\n          Initial jitter ceiling in milliseconds [default: 100]\n      --recovery-delay-ceiling-ms <RECOVERY_DELAY_CEILING_MS>\n          Maximum permissible delay, including Retry-After [default: 30000]\n      --recovery-budget-ms <RECOVERY_BUDGET_MS>\n          Recovery budget after failure, in milliseconds; never a generation timeout\n      --recovery-admission-command <RECOVERY_ADMISSION_COMMAND>\n          Trusted executable outside the tool root; JSON proof on stdout, metadata on stdin\n      --recovery-capture-dir <RECOVERY_CAPTURE_DIR>\n          Opt-in credential-filtered HTTP bodies outside the tool root; allowed with one attempt and recovery disabled\n      --experiment <EXPERIMENT>\n          Experiment root. Tool access is scoped to this directory\n      --trace-dir <TRACE_DIR>\n          Trace destination. Defaults to `<experiment>/traces`; may be placed outside the tool-visible experiment root by an external evaluator\n      --goal <GOAL>\n          Goal file, relative to the experiment root unless absolute [default: task.md]\n      --contract <CONTRACT>\n          Explicit run-contract JSON file, relative to the experiment root unless absolute\n      --provider <PROVIDER>\n          Local inference provider. Uses OMLX_HOST or OLLAMA_HOST [default: omlx] [possible values: omlx, ollama]\n      --model <MODEL>\n          Provider model ID. Defaults to Qwen3.8-27B-MLX-8bit (oMLX) or qwen3.8:27b-mxfp8 (Ollama)\n      --max-iterations <MAX_ITERATIONS>\n          Maximum Mojentic iterative-solver turns [default: 10]\n      --max-model-interactions <MAX_MODEL_INTERACTIONS>\n          Maximum model interaction cycles per agent turn [default: 75]\n      --context-window-tokens <CONTEXT_WINDOW_TOKENS>\n          Context window for harness accounting and Ollama num_ctx; configure the actual oMLX limit on the server. Defaults to 262144 for Qwen3.8-27B-MLX-8bit and Mojentic accounting otherwise\n      --packet-type <PACKET_TYPE>\n          Packet type used for default output-token budgeting [default: multi-file-edit]\n      --expected-output-tokens <EXPECTED_OUTPUT_TOKENS>\n          Override the packet output-token budget\n      --max-tokens <MAX_TOKENS>\n          Maximum generated tokens per request, including reasoning (default: 16384) [alias: --num-predict]\n      --reasoning-effort <REASONING_EFFORT>\n          Worker reasoning effort: disabled, enabled, low, medium, high, xhigh. Omit for the model default. Named levels depend on the model's chat template; advisory calls keep their defaults\n      --reasoning-profile <REASONING_PROFILE>\n          Explicit model capability profile; omit to leave validation to the provider [possible values: qwen3.8]\n      --preserve-reasoning\n          Preserve completed native assistant reasoning in history (separate from capped checkpoints)\n      --max-thinking-only-tokens <MAX_THINKING_ONLY_TOKENS>\n          Max reasoning-only tokens in one LLM call before an action-only handoff. Disabled by default; positive values explicitly opt into interruption\n      --repair-exit-thinking-tokens <REPAIR_EXIT_THINKING_TOKENS>\n          Post-validation hidden-only reasoning interruption. Disabled by default; positive values opt in\n      --repair-handoff-policy <REPAIR_HANDOFF_POLICY>\n          Action handoff policy: text-only preserves the legacy continuation; constrained ends the failed-probe turn and exposes only repair-action tools; constrained-action-only disables model reasoning after a capped repair attempt, withholding arbitrary shell during the native action-only request [default: text-only]\n      --action-boundary-interrupt-tokens <ACTION_BOUNDARY_INTERRUPT_TOKENS>\n          Pre-validation hidden action-intent reasoning tokens before interrupting and forcing an action. 0 disables [default: 0]\n      --reasoning-checkpoint-tokens <REASONING_CHECKPOINT_TOKENS>\n          Retain this many tokens (approximately) from the tail of a hidden-only no-action turn as a continuity checkpoint for the next ordinary turn. This does not disable reasoning or narrow the tool surface. 0 disables [default: 0]\n      --transcript-policy <TRANSCRIPT_POLICY>\n          Transcript retention policy for model/tool context [default: summarized-transcript]\n      --initial-context-catalog <INITIAL_CONTEXT_CATALOG>\n          Adapter-owned initial-context catalog JSON. Task-only assembly when omitted\n      --semantic-advisor-model <SEMANTIC_ADVISOR_MODEL>\n          Model used for isolated semantic advisory calls. Defaults to the worker model\n      --acceptance-ledger\n          Generate a proposal-derived acceptance checklist and interaction ledger, retain it in worker context, and require current coverage before DONE. Ledger coverage is advisory and does not replace declared probes\n      --artifact <ARTIFACT>\n          Root-relative worker artifact whose state is retained between attempts\n      --expected-artifact <EXPECTED_ARTIFACT>\n          Expected artifact file, relative to the experiment root unless absolute\n      --max-attempts <MAX_ATTEMPTS>\n          Maximum number of naturally completed attempts [default: 8]\n      --max-failed-repair-cycles <MAX_FAILED_REPAIR_CYCLES>\n          Stop after this many completed failed edit-to-probe cycles [default: 8]\n      --max-consecutive-unchanged-attempts <MAX_CONSECUTIVE_UNCHANGED_ATTEMPTS>\n          Stop after this many consecutive attempts leave the artifact unchanged [default: 2]\n  -h, --help\n          Print help\n\nExamples:\n  adaptive-agent-harness run --experiment /work/new-cell --provider ollama\n  adaptive-agent-harness run --experiment /work/new-cell --recover-requests --recovery-max-attempts 2 --recovery-admission-command /opt/operator/owned-receipt\n\nWire attempts resend one immutable completion; they do not consume model interactions or replay tools. Recovery is disabled by default. SIGINT/SIGTERM persist terminal request evidence before exit.\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "analyze-trace",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Summarize context assembly and tool payload pressure from trace JSONL files\n\nUsage: adaptive-agent-harness analyze-trace <TRACES>...\n\nArguments:\n  <TRACES>...  Trace JSONL files to analyze\n\nOptions:\n  -h, --help  Print help\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "render-transcript",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Render one or more harness traces as a self-contained HTML transcript\n\nUsage: adaptive-agent-harness render-transcript [OPTIONS] --output <OUTPUT> <TRACES>...\n\nArguments:\n  <TRACES>...  Trace JSONL files or directories to discover recursively\n\nOptions:\n      --output <OUTPUT>      Destination HTML file\n      --title <TITLE>        Report title embedded in the single-file transcript [default: \"Agent Transcript\"]\n      --evidence <EVIDENCE>  Optional generic transcript_evidence.v1 JSON file\n  -h, --help                 Print help\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "summarize-matrix",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Summarize the preserved 30-cell demo matrix baseline into canonical counts (harness completion, independent validation, hard-stops, environment corrections), replacing matrix-specific classification\n\nUsage: adaptive-agent-harness summarize-matrix\n\nOptions:\n  -h, --help  Print help\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "resolve-contract",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Resolve a run contract without starting a provider or gateway: either a legacy Markdown `task.md` (via shell-fence scraping) or an explicit contract JSON file. Prints the resolved contract. This is both the no-provider resolution command and the snapshot generator/checker for `fixtures/contracts/snapshots/`\n\nUsage: adaptive-agent-harness resolve-contract [OPTIONS]\n\nOptions:\n      --goal <GOAL>          Legacy Markdown goal file. Mutually exclusive with `--contract`\n      --contract <CONTRACT>  Explicit contract JSON file. Mutually exclusive with `--goal`\n  -h, --help                 Print help\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "plan-task",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Propose and validate a measurement-only acceptance checklist without starting the worker loop or exposing tools\n\nUsage: adaptive-agent-harness plan-task [OPTIONS] --trace-dir <TRACE_DIR>\n\nOptions:\n      --goal <GOAL>\n          Legacy Markdown goal file. Mutually exclusive with --contract\n      --contract <CONTRACT>\n          Explicit run contract. Mutually exclusive with --goal\n      --trace-dir <TRACE_DIR>\n          Trace directory for the isolated planning call\n      --model <MODEL>\n          oMLX model ID from /v1/models [default: Qwen3.8-27B-MLX-8bit]\n      --max-items <MAX_ITEMS>\n          Maximum acceptance items allowed in the proposal [default: 16]\n      --max-output-tokens <MAX_OUTPUT_TOKENS>\n          Maximum generated tokens for the isolated planning call [default: 2048]\n  -h, --help\n          Print help\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "plan-interactions",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Propose and validate measurement-only combined scenarios over a fixed acceptance plan without starting the worker loop or exposing tools\n\nUsage: adaptive-agent-harness plan-interactions [OPTIONS] --plan <PLAN> --trace-dir <TRACE_DIR>\n\nOptions:\n      --goal <GOAL>\n          Legacy Markdown goal file. Mutually exclusive with --contract\n      --contract <CONTRACT>\n          Explicit run contract. Mutually exclusive with --goal\n      --plan <PLAN>\n          Validated atomic acceptance-plan JSON file\n      --trace-dir <TRACE_DIR>\n          Trace directory for isolated interaction planning\n      --model <MODEL>\n          oMLX model ID from /v1/models [default: Qwen3.8-27B-MLX-8bit]\n      --max-scenarios <MAX_SCENARIOS>\n          Maximum interaction scenarios allowed in the proposal [default: 12]\n      --max-output-tokens <MAX_OUTPUT_TOKENS>\n          Maximum generated tokens for each isolated attempt [default: 2048]\n  -h, --help\n          Print help\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "author-interaction-evidence",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "Author and validate measurement-only evidence for one deterministic interaction candidate without starting the worker loop or exposing tools\n\nUsage: adaptive-agent-harness author-interaction-evidence [OPTIONS] --plan <PLAN> --candidate <CANDIDATE> --trace-dir <TRACE_DIR>\n\nOptions:\n      --goal <GOAL>\n          Legacy Markdown goal file. Mutually exclusive with --contract\n      --contract <CONTRACT>\n          Explicit run contract. Mutually exclusive with --goal\n      --plan <PLAN>\n          Validated atomic acceptance-plan JSON file\n      --candidate <CANDIDATE>\n          Deterministically supplied interaction-candidate JSON file\n      --trace-dir <TRACE_DIR>\n          Trace directory for isolated evidence authoring\n      --model <MODEL>\n          oMLX model ID from /v1/models [default: Qwen3.8-27B-MLX-8bit]\n      --max-output-tokens <MAX_OUTPUT_TOKENS>\n          Maximum generated tokens for each isolated attempt [default: 2048]\n  -h, --help\n          Print help\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness"
+      ],
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "Usage: adaptive-agent-harness <COMMAND>\n\nCommands:\n  run                          Run the Mojentic-backed agent selected by the resolved contract profile\n  run-sequential               Run bounded natural attempts on one retained worker artifact\n  analyze-trace                Summarize context assembly and tool payload pressure from trace JSONL files\n  render-transcript            Render one or more harness traces as a self-contained HTML transcript\n  summarize-matrix             Summarize the preserved 30-cell demo matrix baseline into canonical counts (harness completion, independent validation, hard-stops, environment corrections), replacing matrix-specific classification\n  resolve-contract             Resolve a run contract without starting a provider or gateway: either a legacy Markdown `task.md` (via shell-fence scraping) or an explicit contract JSON file. Prints the resolved contract. This is both the no-provider resolution command and the snapshot generator/checker for `fixtures/contracts/snapshots/`\n  plan-task                    Propose and validate a measurement-only acceptance checklist without starting the worker loop or exposing tools\n  plan-interactions            Propose and validate measurement-only combined scenarios over a fixed acceptance plan without starting the worker loop or exposing tools\n  author-interaction-evidence  Author and validate measurement-only evidence for one deterministic interaction candidate without starting the worker loop or exposing tools\n  help                         Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n"
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "rnu"
+      ],
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "error: unrecognized subcommand 'rnu'\n\nUsage: adaptive-agent-harness <COMMAND>\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "run"
+      ],
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "error: the following required arguments were not provided:\n  --experiment <EXPERIMENT>\n\nUsage: adaptive-agent-harness run --experiment <EXPERIMENT>\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "run",
+        "--experiment",
+        ".",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "error: invalid value 'openai' for '--provider <PROVIDER>'\n  [possible values: omlx, ollama]\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "resolve-contract"
+      ],
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Error: one of --goal or --contract is required\n"
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "resolve-contract",
+        "--contract",
+        "fixtures/contracts/invalid/scope_escape.json"
+      ],
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Error: explicit contract: read_scope rule \"../outside\" escapes the workspace root\n"
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "summarize-matrix"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"completed_cells\": 30,\n  \"independently_validated_passes\": 24,\n  \"independent_validation_failures\": 6,\n  \"independent_validation_unknown\": 0,\n  \"hard_stops\": 6,\n  \"hard_stop_counts_by_reason\": {\n    \"action_boundary\": 1,\n    \"hidden_only_no_action\": 5\n  },\n  \"environment_corrections\": 6,\n  \"passes_by_model\": {\n    \"gemma4-31b-mlx\": 5,\n    \"qwen35-122b\": 5,\n    \"qwen36-27b-bf16\": 5,\n    \"qwen36-27b-mxfp8\": 5,\n    \"qwen36-35b-nvfp4\": 4\n  },\n  \"passes_by_task\": {\n    \"go-shortest-path\": 4,\n    \"javascript-topological-sort\": 5,\n    \"python-expression-parser\": 5,\n    \"ruby-ini-parser\": 5,\n    \"rust-binary-search-tree\": 5\n  },\n  \"failing_cells\": [\n    \"gemma4-latest/go-shortest-path\",\n    \"gemma4-latest/javascript-topological-sort\",\n    \"gemma4-latest/python-expression-parser\",\n    \"gemma4-latest/ruby-ini-parser\",\n    \"gemma4-latest/rust-binary-search-tree\",\n    \"qwen36-35b-nvfp4/go-shortest-path\"\n  ]\n}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "resolve-contract",
+        "--contract",
+        "fixtures/contracts/explicit/rust-cargo-task.json"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"schema_version\": \"run_contract.v1\",\n  \"guidance\": \"Implement the missing binary search tree operations.\\n\\nRun both commands from the project root:\\n\\n```sh\\ncargo fmt --check\\ncargo test\\n```\\n\\nReply DONE only after validation passes. Reply FAIL only if blocked.\",\n  \"read_scope\": {\n    \"kind\": \"rules\",\n    \"rules\": [\n      \".\"\n    ]\n  },\n  \"write_scope\": {\n    \"kind\": \"rules\",\n    \"rules\": [\n      \".\"\n    ]\n  },\n  \"mutable_artifact_classes\": {\n    \"classes\": [\n      {\n        \"name\": \"documentation\",\n        \"exempt_file_names\": [\n          \".gitignore\",\n          \".ignore\",\n          \"readme\",\n          \"license\",\n          \"licence\",\n          \"changelog\",\n          \"contributors\",\n          \"authors\"\n        ],\n        \"exempt_extensions\": [\n          \"md\",\n          \"markdown\",\n          \"txt\",\n          \"rst\",\n          \"adoc\"\n        ]\n      }\n    ]\n  },\n  \"evidence_invalidation\": {\n    \"invalidated_by_source_mutation\": true,\n    \"generation_gated_freshness\": true,\n    \"tracked_artifact_classes\": [\n      \"documentation\"\n    ]\n  },\n  \"probes\": [\n    {\n      \"id\": \"cargo-fmt-check\",\n      \"command\": \"cargo fmt --check\"\n    },\n    {\n      \"id\": \"cargo-test\",\n      \"command\": \"cargo test\"\n    }\n  ],\n  \"budgets\": {\n    \"max_iterations\": 10,\n    \"max_model_interactions\": 75,\n    \"context_window_tokens\": null,\n    \"max_thinking_only_tokens\": 4096,\n    \"repair_exit_thinking_tokens\": 16384\n  },\n  \"terminal\": {\n    \"done_token\": \"DONE\",\n    \"fail_token\": \"FAIL\"\n  },\n  \"adapter_kind\": \"explicit\",\n  \"profile\": {\n    \"id\": \"coding\",\n    \"version\": \"coding_profile.v1\"\n  },\n  \"defaults_provenance\": {\n    \"declared_fields\": [\n      \"guidance\",\n      \"probes\",\n      \"read_scope\",\n      \"write_scope\"\n    ],\n    \"defaulted_fields\": [\n      \"mutable_artifact_classes\",\n      \"evidence_invalidation\",\n      \"budgets\",\n      \"terminal\"\n    ]\n  }\n}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "adaptive-agent-harness",
+        "analyze-trace",
+        "../Experiments/Generation41/mock-validation/worker-ollama-full-transcript-retain-true/traces/run-20261007T005345Z.jsonl"
+      ],
+      "exit_code": 0,
+      "stdout": "[Output omitted: preserved trace analysis is available from the command above.]",
+      "stderr": "",
+      "stdout_shape": {
+        "type": "array",
+        "items": 1
+      }
+    }
+  ]
+}

@@ -10,6 +10,12 @@ The harness owns continuity. The model reasons about a scoped packet.
 Deterministic checks establish whether work satisfies its contract.
 A model claim alone cannot establish success.
 
+The public product direction is a CLI coding agent with selectable Mojentic
+gateways and a friendly terminal conversation. Build its session and presentation
+interfaces around the general runtime. Preserve deterministic validation and
+evidence while making setup and everyday work accessible. The preparation backlog
+is in `PUBLIC_READINESS.md`; proposed features there are not implemented behavior.
+
 ## Responsibilities
 
 The harness maintains goals, acceptance criteria, budgets, and stopping rules.

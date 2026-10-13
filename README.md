@@ -16,6 +16,10 @@ This is a research project under active development, not a stable library or
 production service. Runtime policies, contracts, trace schemas, and command-line
 interfaces may change as experiments reveal better boundaries.
 
+The [public CLI readiness checklist](PUBLIC_READINESS.md) records the current
+interface review and preparation work for provider setup, a conversation TUI,
+session recovery, packaging, and a product name.
+
 ## Capabilities
 
 - Typed run contracts for scope, guidance, probes, budgets, and terminal rules
