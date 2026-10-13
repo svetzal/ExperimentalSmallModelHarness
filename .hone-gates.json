@@ -19,6 +19,11 @@
       "name": "release-build",
       "command": "cargo build --locked --release --bins",
       "required": true
+    },
+    {
+      "name": "collection-tests",
+      "command": "python3 -m unittest discover -s benchmarks -p 'test_collection_validation.py'",
+      "required": true
     }
   ]
 }
