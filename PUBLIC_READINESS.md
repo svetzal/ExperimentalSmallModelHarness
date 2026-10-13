@@ -127,6 +127,10 @@ the first public alpha usable; P2 extends it after core workflows work.
 - [ ] **Define task intake.** Accept a quoted request, stdin, and an explicit
   task file. Specify precedence and empty-input errors. Convert requests to the
   existing contract type without requiring users to author probe JSON.
+- [ ] **Make shell composition a core contract.** Support pipelines and stdin,
+  stdout, and stderr redirection without requiring the TUI. Define piped input
+  roles, EOF behavior, clean result output, non-interactive execution, and broken
+  pipe cleanup. Verify the shell composition cases below before public release.
 - [ ] **Resolve project scope once.** Support `--dir`, default to cwd, and use
   the resolved root for tools, shell, instructions, and display. Store session
   artifacts outside model-visible project files by default.
@@ -234,7 +238,8 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
 
 - [ ] **Finish shared output options.** Implement `--json`, JSONL events,
   `--quiet`, and `--verbose` consistently. Results go to stdout; progress and
-  diagnostics go to stderr. Test pipes, non-TTY runs, and `NO_COLOR`.
+  diagnostics go to stderr. Test the shell composition contract, non-TTY runs,
+  and `NO_COLOR`; output redirection must not change the task's meaning.
 - [ ] **Make help teach the workflow.** Add summaries, examples at every level,
   mutation labels, typo suggestions, and actionable errors. Disclose research
   settings progressively.
@@ -266,6 +271,84 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
   and five or more before boundary claims. Separate provider errors and
   environment-invalidated runs from model outcomes.
 
+## Shell composition contract
+
+Decision recorded on 2026-10-13: Microgentic must participate fully in standard
+shell operations. Pipes and redirection are supported workflows alongside the
+TUI, with the same session engine, permission rules, validation, and outcomes.
+The behaviors and examples in this section are requirements for implementation.
+
+### Input
+
+- A positional request supplies the task. If stdin is redirected or piped,
+  consume it as explicitly labeled task input, such as a diff or build log.
+  Keep that material separate from the user's instruction and execution policy.
+- With no positional request, non-terminal stdin supplies the task through EOF.
+  The bare command with terminal stdin and stdout opens the TUI. If stdout is
+  redirected while stdin is a terminal and no task was supplied, return a useful
+  missing-task error rather than wait for hidden interactive input.
+- Provide `--task PATH` for a task file and `--task -` for explicit task intake
+  from stdin. Reject a task file combined with a positional task. A task file may
+  still receive separate piped reference input; never read stdin twice.
+- Read task/reference input once through EOF. Specify size and encoding limits;
+  report unsupported or oversized input rather than silently truncate it.
+  Empty reference input is valid when a task exists; an empty task is an error.
+- Child tools must not consume the caller's stdin. Close or explicitly supply
+  their input so shell commands cannot steal the task stream or block on it.
+
+### Output and interaction
+
+- Stdout contains the requested result: final response text by default, one
+  structured result with `--json`, or JSONL events with `--json --stream`.
+  Document event schemas and how partial output relates to terminal failure.
+  End textual records with a newline.
+- Progress, warnings, provider diagnostics, and tool logs go to stderr. Tool
+  output enters stdout only when it is deliberately part of the requested
+  result. `--quiet` suppresses optional chatter while preserving errors.
+- When either stdin or stdout is not a terminal, use plain non-interactive mode.
+  Disable the TUI, control sequences, color, and prompts. Respect `NO_COLOR` in
+  terminal mode too. Never open `/dev/tty` to work around piped input or redirects.
+- Missing credentials, configuration, or required permission must produce an
+  actionable error and nonzero exit rather than a prompt. An explicit `--apply`
+  and selected permission policy govern mutations; `--yes` does not grant new
+  execution authority. Read-only requests must remain usable in pipelines.
+- Redirection to files, append redirection, stderr capture, and downstream
+  consumers must preserve result content and truthful exit status. Detect write
+  failures and a closed downstream pipe, cancel remaining work, and clean up
+  provider/tool ownership. Preserve appropriate failure or signal status for
+  shell scripts, including pipelines run with `pipefail`.
+
+### Proposed examples and acceptance checks
+
+These examples describe the intended public interface; it is not implemented
+yet. `--task` and `--stream` are proposed flags.
+
+```sh
+printf '%s\n' 'Explain this project' | microgentic run
+microgentic run < task.txt > result.txt
+git diff --no-ext-diff | microgentic run "Review this diff" > review.md
+microgentic run "Explain this build failure" < build.log > diagnosis.txt
+microgentic run --task task.txt > result.txt 2> diagnostics.log
+microgentic status --json | jq '.outcome'
+microgentic run --task task.txt --json --stream > events.jsonl
+microgentic run "Summarize the public API" >> summaries.txt
+```
+
+- [ ] Verify input-only, output-only, and combined redirection; pipes into and
+  out of the agent; append output; and separate stderr capture.
+- [ ] Verify task-only stdin and positional-task-plus-reference stdin remain
+  distinct, including multiline Unicode, empty input, and input-size failures.
+- [ ] Verify stdout is clean under verbose provider/tool activity; parse the
+  complete JSON result and every JSONL event independently.
+- [ ] Verify non-interactive runs never prompt, launch the TUI, or read from
+  `/dev/tty`; test missing credentials and permissions plus stdin from `/dev/null`.
+- [ ] Verify slow producers/consumers, early downstream exit, failed writes,
+  SIGINT/SIGTERM, partial stream failure, and `pipefail` outcomes. Confirm no
+  orphaned model request or tool process remains after termination.
+- [ ] Compare terminal and redirected runs with scripted gateways: task intake,
+  permitted effects, check evidence, and outcome must agree. Test actual shell
+  pipelines and the installed binary, not only in-memory input/output mocks.
+
 ## Proposed command map
 
 `microgentic` is the chosen canonical command. The public command surface below
@@ -278,6 +361,7 @@ implementation.
 | `microgentic setup` | Preview connection and configuration setup |
 | `microgentic setup --apply` | Save the reviewed setup |
 | `microgentic run "Fix the parser" --dir .` | Inspect and propose a concrete change |
+| `microgentic run --task task.txt` | Read a task file in plain or terminal mode |
 | `microgentic run "Fix the parser" --dir . --apply` | Apply the retained proposal and permitted checks |
 | `microgentic provider list` | Show configured profiles and destinations |
 | `microgentic provider edit local --apply` | Apply a reviewed profile change |
@@ -317,8 +401,8 @@ does not rename the current binary or rewrite preserved CLI review evidence.
 ## First implementation slices and release gate
 
 1. **Command/session contract:** project root, intake, permission semantics,
-   typed outcomes, output channels, and compatibility. Verify fixtures and
-   scripted gateways before calling a local model.
+   typed outcomes, shell composition, output channels, and compatibility. Verify
+   fixtures and scripted gateways before calling a local model.
 2. **Provider setup:** shared profile resolver, discovery, diagnostics, and
    persistent config. Route standalone planning through it too.
 3. **Conversation TUI:** session events, readable progress, input, steering,
@@ -329,8 +413,9 @@ does not rename the current binary or rewrite preserved CLI review evidence.
 A public alpha should let a new user install it, configure either supported
 local provider, open an existing repository, request a change, inspect and approve
 effects, see fresh checks and a diff, interrupt safely, and recover preserved work.
-The same task must work through the plain CLI with parseable output and truthful
-exit status. Publish the remaining limits alongside that alpha.
+The same task must work through the plain CLI, pipelines, and redirected input
+and output with clean results, parseable machine modes, and truthful exit status.
+Publish the remaining limits alongside that alpha.
 
 Keep sampling, transcript retention, patience, validation, and recovery policy
 fixed during interface-only slices. If a feature changes model context or runtime
