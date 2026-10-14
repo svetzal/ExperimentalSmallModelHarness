@@ -75,3 +75,24 @@ Validation passed: 386 native tests, with two existing ignored tests;
 `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` also passed.
 
 No live local-model trial or model-capability measurement is part of this change.
+
+## Evidence footer visibility
+
+Follow-up baseline: `4a5e896`, on 2026-10-13.
+
+The TUI previously appended an `Evidence:` trace path to every completed reply.
+This came from presentation code, so ordinary greetings also displayed it.
+The footer now appears when the current exchange requests project tools.
+Read-only inspection, edits, and checks all qualify. The worker sends a structured
+tool-start event; the TUI tracks activity separately for each exchange.
+It does not classify prompt wording or keep a persistent engineering mode.
+
+Every exchange retains its trace. Hiding a footer does not change provider
+instructions, tool authority, validation, completion, or benchmark output.
+The trace path is an activity record, not a claim that validation passed.
+
+The PTY fixtures for both providers check greetings, empty-reply recovery,
+quoted engineering discussion, source edits with checks, read-only inspection,
+and a conversational follow-up after work. They check footer visibility and
+continued trace retention. All eight CLI integration tests pass, including
+the comparison of benchmark packets and context ledgers with the task path.

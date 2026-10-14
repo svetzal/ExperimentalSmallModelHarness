@@ -48,6 +48,7 @@ struct ActiveRun {
     events: UnboundedReceiver<ConversationEvent>,
     activity: String,
     streamed_text: String,
+    used_project_tools: bool,
     terminal_reported: bool,
 }
 
@@ -299,6 +300,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                                     events,
                                     activity: "Working".into(),
                                     streamed_text: String::new(),
+                                    used_project_tools: false,
                                     terminal_reported: false,
                                 })
                             }
@@ -363,9 +365,13 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             run.streamed_text.push_str(&text);
             run.activity = "Replying".into();
         }
+        ConversationEvent::ToolStarted { name } => {
+            run.used_project_tools = true;
+            run.activity = format!("Using {name}");
+            view.history.push_str(&format!("\n  {}\n", run.activity));
+        }
         ConversationEvent::Activity { message } => {
-            if message.starts_with("Using ")
-                || message.ends_with("finished")
+            if message.ends_with("finished")
                 || message.ends_with("reported an error")
                 || message.starts_with("Context shortened")
             {
@@ -379,10 +385,14 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
                 view.history
                     .push_str(&format!("\nResult: {final_summary}\n"));
             }
-            view.history.push_str(&format!(
-                "\nEvidence: {}\n",
-                summary["trace_file"].as_str().unwrap_or("unknown")
-            ));
+            // Trace visibility follows this exchange's actual work, never its
+            // wording or tool history retained from an earlier prompt.
+            if run.used_project_tools {
+                view.history.push_str(&format!(
+                    "\nEvidence: {}\n",
+                    summary["trace_file"].as_str().unwrap_or("unknown")
+                ));
+            }
             view.status = "Ready for your next message. Esc to quit.".into();
             run.terminal_reported = true;
         }

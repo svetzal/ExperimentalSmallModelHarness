@@ -142,6 +142,7 @@ def exercise(provider):
         release_first.set()
         completed = wait_for(master, b"Ready for your next message")
         assert b"read_file finished" in completed, "tool activity missing"
+        assert b"Evidence:" in completed, "read-only project inspection lost its trace footer"
         send_prompt(master, "What codename and Unicode did you see? Do not reread the file.")
         wait_for(master, b"FOLLOWUP-LIVE")
         wait_for(master, b"Ready for your next message")

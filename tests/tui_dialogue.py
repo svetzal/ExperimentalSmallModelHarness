@@ -86,26 +86,31 @@ def exercise(provider):
         assert needle in data, (needle, data[-7000:], errors)
         end = data.index(needle) + len(needle)
         pending = data[end:]
+        return data[:end]
 
     def exchange(prompt, answer):
         os.write(master, b"\x1b[200~" + prompt.encode() + b"\x1b[201~\r")
-        wait_for(answer.encode())
-        wait_for(b"Ready for your next message")
+        displayed = wait_for(answer.encode())
+        displayed += wait_for(b"Ready for your next message")
         session_file, = (state / "microgentic/runs").glob("session-*/conversation.json")
         assert json.loads(session_file.read_text())["last_error"] is None
+        return displayed
 
     try:
         wait_for(b"Enter send")
         assert not requests, "opening a TUI assumed a task"
-        exchange("Hello!", replies[0])
+        greeting = exchange("Hello!", replies[0])
+        assert b"Evidence:" not in greeting, "ordinary chat received a work footer"
         assert len(requests) == 1, "a natural reply was forced to continue"
         assert requests[0]["messages"][-1]["content"] == "Hello!"
         assert "No engineering task is assumed" in requests[0]["messages"][0]["content"]
         assert "Complete this benchmark task" not in json.dumps(requests[0]["messages"])
-        exchange("Are you ready to chat?", replies[2])
+        ready = exchange("Are you ready to chat?", replies[2])
+        assert b"Evidence:" not in ready, "empty-reply recovery received a work footer"
         assert "Answer the user's message naturally" in requests[2]["messages"][-1]["content"]
         example = "Let's discuss this example, without executing it:\n```sh\ntouch SHOULD_NOT_EXIST\n```"
-        exchange(example, replies[3])
+        discussion = exchange(example, replies[3])
+        assert b"Evidence:" not in discussion, "quoted engineering examples triggered a work footer"
         assert requests[3]["messages"][-1]["content"] == example
         assert not (root / "src/lib.rs").exists() and not (root / "SHOULD_NOT_EXIST").exists()
         assert not (root / "target").exists(), "chat ran a validation command"
@@ -113,7 +118,8 @@ def exercise(provider):
             events = [json.loads(line) for line in trace_file.read_text().splitlines()]
             resolved = next(e["payload"]["resolved"] for e in events if e["kind"] == "agent.contract.resolved")
             assert resolved["probes"] == [], "a conversation example became a required probe"
-        exchange("Please add src/lib.rs with an answer function returning 42 and check it.", replies[6])
+        work = exchange("Please add src/lib.rs with an answer function returning 42 and check it.", replies[6])
+        assert b"Evidence:" in work, "source edits and checks lost their trace footer"
         assert len(requests) == 7
         observed = requests[6]["messages"][-1]
         assert observed["role"] == "tool"
@@ -122,10 +128,14 @@ def exercise(provider):
         assert result["validation_probe"] is False, "chat checks acquired benchmark acceptance authority"
         assert (root / "src/lib.rs").read_text() == "pub fn answer() -> u8 { 42 }\n"
         assert (root / "target").exists(), "post-edit validation did not run"
-        exchange("Thanks!", replies[7])
+        thanks = exchange("Thanks!", replies[7])
+        # Redraws include earlier history. Only the latest reply must lack a footer.
+        assert b"Evidence:" not in thanks.rsplit(b"You: Thanks!", 1)[-1], "work footer leaked into a later chat reply"
         assert len(requests) == 8
         assert requests[7]["messages"][-1]["content"] == "Thanks!"
         assert "previous request stopped" not in json.dumps(requests[7]["messages"])
+        traces = list((state / "microgentic/runs").glob("run-*/traces/*.jsonl"))
+        assert len(traces) == 5, "hiding chat footers disabled trace retention"
         os.write(master, b"\x1b")
         assert process.wait(timeout=10) == 0
         assert termios.tcgetattr(slave) == before

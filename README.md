@@ -211,6 +211,12 @@ Follow-up prompts retain actual user messages, completed assistant responses, an
 native tool request/result pairs. You can draft your next message while a reply
 streams; Enter submits it after the current request settles.
 
+The TUI shows an `Evidence:` trace location only for exchanges that use project
+tools, including inspection, edits, and checks. Ordinary replies omit the footer,
+including conversation after completed work. Every exchange still saves its trace.
+The footer points to recorded activity; validation results remain in the reply
+and trace.
+
 Each TUI invocation starts a new conversation, scoped to its project and resolved
 provider/model/effort. State is saved outside the project in a unique
 `session-*/conversation.json` under the run-state directory. Previous task-scoped

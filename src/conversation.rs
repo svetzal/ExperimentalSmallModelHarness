@@ -20,6 +20,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 pub(crate) enum ConversationEvent {
     ReplyStarted,
     Content { text: String },
+    ToolStarted { name: String },
     Activity { message: String },
     Finished { summary: Value },
     Failed { message: String },
@@ -197,14 +198,19 @@ impl ConversationRun {
     }
 
     pub(crate) fn observe(&self, kind: &str, payload: &Value) {
+        if kind == "llm.response.tool_call.normalized" {
+            self.emit(ConversationEvent::ToolStarted {
+                name: payload["tool_name"]
+                    .as_str()
+                    .unwrap_or("project tool")
+                    .into(),
+            });
+            return;
+        }
         let message = match kind {
             "llm.stream.thinking" => {
                 format!("Thinking · {} characters", payload["total_thinking_chars"])
             }
-            "llm.response.tool_call.normalized" => format!(
-                "Using {}",
-                payload["tool_name"].as_str().unwrap_or("project tool")
-            ),
             "llm.context_assembly.appended" if payload["component"] == "tool_result" => format!(
                 "{} {}",
                 payload["tool_name"].as_str().unwrap_or("Tool"),

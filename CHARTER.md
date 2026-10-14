@@ -42,6 +42,11 @@ quoted examples as data and keep observational shell checks separate from
 executor-owned acceptance probes. Benchmark task prompting, probe authority, and
 terminal rules remain on the existing task path. See `MICROGENTIC-CHAT.md`.
 
+Show the TUI evidence footer for project-tool activity in the current exchange.
+Ordinary chat stays free of that footer, including conversational replies after
+completed work. Keep all traces saved and use structured activity events rather
+than prompt classification to control presentation. This changes no task authority.
+
 Benchmark task mode is explicit: `microgentic benchmark run` and
 `benchmark run-sequential` read experiment files and emit JSON. Keep personal
 setup, stdin intake, and conversation history outside this path. Preserve the
