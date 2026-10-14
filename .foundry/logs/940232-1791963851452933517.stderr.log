@@ -1,0 +1,28 @@
+ Downloading crates ...
+  Downloaded signal-hook-mio v0.2.5
+  Downloaded litrs v1.0.1
+  Downloaded signal-hook v0.3.18
+    Checking mio v1.2.1
+   Compiling rustix v1.1.4
+   Compiling signal-hook v0.3.18
+   Compiling litrs v1.0.1
+   Compiling microgentic v0.1.0 (/home/svetzal/Work/Sandbox2/Harness)
+    Checking unicode-width v0.2.2
+    Checking tokio v1.53.3
+    Checking signal-hook-mio v0.2.5
+   Compiling document-features v0.2.12
+    Checking crossterm v0.29.0
+    Checking tempfile v3.27.0
+    Checking tokio-util v0.7.18
+    Checking tower v0.5.3
+    Checking tokio-rustls v0.26.4
+    Checking tokio-native-tls v0.3.1
+    Checking tokio-tungstenite v0.30.0
+    Checking h2 v0.4.20
+    Checking tower-http v0.6.11
+    Checking hyper v1.10.1
+    Checking hyper-util v0.1.20
+    Checking hyper-rustls v0.27.9
+    Checking reqwest v0.13.4
+    Checking mojentic v2.1.0 (https://github.com/svetzal/mojentic-ru.git?rev=4ca1ed279c02eab37827a1ed07c30e961155ecf3#4ca1ed27)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 34.84s

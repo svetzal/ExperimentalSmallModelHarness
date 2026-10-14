@@ -1,0 +1,31 @@
+   Compiling mio v1.2.1
+   Compiling rustix v1.1.4
+   Compiling signal-hook v0.3.18
+   Compiling microgentic v0.1.0 (/home/svetzal/Work/Sandbox2/Harness)
+   Compiling unicode-width v0.2.2
+   Compiling tokio v1.53.3
+   Compiling signal-hook-mio v0.2.5
+   Compiling crossterm v0.29.0
+   Compiling tempfile v3.27.0
+   Compiling tokio-util v0.7.18
+   Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.4
+   Compiling tokio-native-tls v0.3.1
+   Compiling tokio-tungstenite v0.30.0
+   Compiling tower-http v0.6.11
+   Compiling h2 v0.4.20
+   Compiling hyper v1.10.1
+   Compiling hyper-util v0.1.20
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling mojentic v2.1.0 (https://github.com/svetzal/mojentic-ru.git?rev=4ca1ed279c02eab37827a1ed07c30e961155ecf3#4ca1ed27)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 07s
+     Running unittests src/lib.rs (target/debug/deps/adaptive_agent_harness-aac562934c75e862)
+     Running unittests src/bin/legacy.rs (target/debug/deps/adaptive_agent_harness-924691af36a40088)
+     Running unittests src/main.rs (target/debug/deps/microgentic-976e2fa9cd257693)
+     Running tests/microgentic_cli.rs (target/debug/deps/microgentic_cli-73538965cf876a1e)
+     Running tests/omlx_gateway.rs (target/debug/deps/omlx_gateway-4c18574bfbf72e55)
+     Running tests/recovery_prerequisites.rs (target/debug/deps/recovery_prerequisites-045f6bef0968a30a)
+     Running tests/recovery_worker.rs (target/debug/deps/recovery_worker-8acaff53194fc868)
+     Running tests/structural_coupling.rs (target/debug/deps/structural_coupling-2279d1f386324782)
+     Running unittests examples/provider_benchmark.rs (target/debug/examples/provider_benchmark-31a3efdb6f076906)
