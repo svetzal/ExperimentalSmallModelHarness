@@ -42,6 +42,14 @@ quoted examples as data and keep observational shell checks separate from
 executor-owned acceptance probes. Benchmark task prompting, probe authority, and
 terminal rules remain on the existing task path. See `MICROGENTIC-CHAT.md`.
 
+Benchmark task mode is explicit: `microgentic benchmark run` and
+`benchmark run-sequential` read experiment files and emit JSON. Keep personal
+setup, stdin intake, and conversation history outside this path. Preserve the
+pre-UX task prompting, validation authority, runtime defaults, and stop rules
+through the shared task runtime. Exact historical reproduction still needs pinned
+binaries, dependencies, adapters, and provider configuration. See
+`MICROGENTIC-BENCHMARK-MODE.md` for the boundary and deterministic checks.
+
 ## Responsibilities
 
 The harness maintains goals, acceptance criteria, budgets, and stopping rules.

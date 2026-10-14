@@ -1,0 +1,76 @@
+--- a/Benchmarks/deep-swe/adapter/adaptive_harness_agent.py
++++ b/Benchmarks/deep-swe/adapter/adaptive_harness_agent.py
+@@ -320,12 +320,10 @@
+         model = self._ollama_model()
+         args = [
+             self.REMOTE_BINARY,
++            "benchmark",
+             "run",
+-            "--prompt",
+-            instruction,
+             "--dir",
+             ".",
+-            "--json",
+             "--provider",
+             self.provider,
+             "--experiment",
+--- a/Benchmarks/deep-swe/scripts/test_microgentic_adapter.py
++++ b/Benchmarks/deep-swe/scripts/test_microgentic_adapter.py
+@@ -49,14 +49,14 @@
+     assert contract["guidance"] == prompt
+     assert contract["profile"]["id"] == "terminal_work"
+     assert contract["probes"] == []
+-    command = next(c for c in environment.commands if "/installed-agent/microgentic run" in c)
++    command = next(c for c in environment.commands if "/installed-agent/microgentic benchmark run" in c)
+     args = shlex.split(command)
+-    assert args[args.index("--prompt") + 1] == prompt
++    assert "--prompt" not in args
+     assert args[args.index("--provider") + 1] == "ollama"
+     assert args[args.index("--dir") + 1] == "."
+     assert args[args.index("--max-tokens") + 1] == "8192"
+     assert args[args.index("--max-model-interactions") + 1] == "23"
+-    assert "--json" in args
++    assert "--json" not in args
+     assert context.metadata["provider"] == "ollama"
+     assert context.metadata["workspace_snapshot"] == "committed_after_agent_exit"
+ 
+--- a/Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py
++++ b/Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py
+@@ -239,12 +239,10 @@
+ 
+         args = [
+             self.REMOTE_BINARY,
++            "benchmark",
+             "run",
+-            "--prompt",
+-            instruction,
+             "--dir",
+             ".",
+-            "--json",
+             "--provider",
+             self.provider,
+             "--experiment",
+--- a/Benchmarks/terminal-bench-2.1/adapter/tests/test_adaptive_harness_agent.py
++++ b/Benchmarks/terminal-bench-2.1/adapter/tests/test_adaptive_harness_agent.py
+@@ -40,7 +40,7 @@
+         self, command: str, user: str | int | None = None, **_kwargs: object
+     ) -> FakeResult:
+         self.commands.append((command, user))
+-        if "microgentic run" in command:
++        if "microgentic benchmark run" in command:
+             if self.cancel_run:
+                 raise asyncio.CancelledError
+             return FakeResult(return_code=self.run_return_code, stderr="run failed")
+@@ -97,9 +97,10 @@
+     assert f"--experiment {agent.REMOTE_EXPERIMENT}" in run_command
+     assert f"--trace-dir {agent.REMOTE_TRACE_DIR}" in run_command
+     assert "--model qwen-test" in run_command
+-    assert "--prompt" in run_command
++    assert "microgentic benchmark run" in run_command
++    assert "--prompt" not in run_command
+     assert "--dir ." in run_command
+-    assert "--json" in run_command
++    assert "--json" not in run_command
+     assert "--provider ollama" in run_command
+     assert "--max-tokens 16384" in run_command
+     assert "--max-model-interactions 50" in run_command

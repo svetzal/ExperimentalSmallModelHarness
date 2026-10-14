@@ -32,6 +32,55 @@ fn missing_or_invalid_intake_never_starts_a_provider() {
 }
 
 #[test]
+fn benchmark_help_and_errors_explain_isolated_file_intake() {
+    let help = worker()
+        .args(["benchmark", "run", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("--experiment <EXPERIMENT>"));
+    assert!(text.contains("--goal <GOAL>"));
+    assert!(text.contains("stdin, --config, and TUI history are ignored"));
+    assert!(!text.contains("echo 'Hello!'"));
+    let temp = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["benchmark", "run"],
+        vec!["benchmark", "run", "--experiment", ".", "--prompt", "hello"],
+    ] {
+        let output = worker()
+            .current_dir(temp.path())
+            .args(args)
+            .env("OMLX_HOST", "http://127.0.0.1:1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("Connection refused"));
+        assert!(!temp.path().join("traces").exists());
+    }
+}
+
+#[test]
+fn benchmark_packets_match_task_runs_and_ignore_ambient_intake() {
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/benchmark_continuity.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_microgentic"))
+        .arg(env!("CARGO_BIN_EXE_microgentic"))
+        .arg("benchmark")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn setup_previews_before_saving_and_persists_model_default_effort() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("nested/config.json");

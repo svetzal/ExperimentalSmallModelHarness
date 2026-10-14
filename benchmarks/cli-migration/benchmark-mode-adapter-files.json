@@ -1,0 +1,26 @@
+{
+  "schema_version": "microgentic_benchmark_adapter_migration.v1",
+  "baseline_harness_revision": "d44b418",
+  "files": [
+    {
+      "path": "Benchmarks/deep-swe/adapter/adaptive_harness_agent.py",
+      "baseline_sha256": "972ed8960b4888ef2fc86b59dddd39330219f01c89d9bfeca7128b4b60b9230a",
+      "sha256": "f459455379022ae9f373ff8566c9217faba0bd57c122d7119732c493ee1e51a1"
+    },
+    {
+      "path": "Benchmarks/deep-swe/scripts/test_microgentic_adapter.py",
+      "baseline_sha256": "7646567592ec5967879254e4147029afd88aa6b57c3430fde8ef29b69901367a",
+      "sha256": "ac2dffe90691d822bf99abf9c6e3966601967b626352072ddae0ebada6ee50ba"
+    },
+    {
+      "path": "Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py",
+      "baseline_sha256": "52a83be93f8f2fdd83e58c428e8149131125b7a83821d9fcdb27897f64e9d17b",
+      "sha256": "ba61da4e5f5548fcd6011f4853e2f9af2df839b416d5f548dd8f2c2219a05068"
+    },
+    {
+      "path": "Benchmarks/terminal-bench-2.1/adapter/tests/test_adaptive_harness_agent.py",
+      "baseline_sha256": "8fc58c2d42803f2ba3a1dcb381e6fdb87496b546132faa0d280ddb5162eece96",
+      "sha256": "f2342a4d59c00d29b4cc9fdaa6e1bc7d8a508e7f5c895da6b2ad0a0eaf9ff1f1"
+    }
+  ]
+}

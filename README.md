@@ -228,6 +228,32 @@ It can mutate the selected project. Preview/apply permissions, JSONL streaming,
 and a typed task-to-exit-status mapping remain pending; process success still
 requires inspection of the native terminal result for benchmark classification.
 
+For isolated benchmarks, use the explicit task mode:
+
+```sh
+microgentic benchmark run --experiment ./cell --dir ./cell/workspace
+microgentic benchmark run --experiment ./cell --contract contract.json \
+  --dir ./cell/workspace --provider ollama --model qwen3.8:27b-mxfp8 \
+  > result.json 2> diagnostics.log
+microgentic benchmark run-sequential --experiment ./cell \
+  --dir ./cell/workspace --artifact answer.txt --expected-artifact expected.txt
+```
+
+Benchmark mode requires `--experiment`. It reads `task.md` by default, or an
+explicit `--goal` or `--contract`. A contract takes precedence over a goal.
+It always writes the complete JSON summary to stdout. Personal setup, `--config`,
+stdin, and TUI history do not affect the run. Use file inputs instead of `--prompt`.
+Each run starts with fresh task context; sequential attempts retain their declared
+artifact through the existing retry policy. Provider environment variables still
+supply server URLs and credentials.
+
+Benchmark mode uses the pre-UX task prompting, validation authority, DONE/FAIL
+rules, runtime defaults, and research controls. The default provider remains
+oMLX; adapters select their provider explicitly. `--dir` defaults to the current
+directory, as the original tool root did. Existing advanced `run` forms and the
+compatibility executable remain available. See [benchmark mode evidence](MICROGENTIC-BENCHMARK-MODE.md)
+for the preservation boundary and deterministic comparison with the pre-UX source.
+
 The temporary `adaptive-agent-harness` executable preserves old flags and JSON
 output. Its library import remains `adaptive_agent_harness`. No `mg` executable
 or shell alias is installed. Users can opt into `alias mg=microgentic` themselves.
@@ -245,8 +271,11 @@ cargo run -- --help
 The main commands are:
 
 - `run` — execute one natural agent attempt
-- `run-sequential` — execute bounded natural attempts against one retained
+- `benchmark run` — execute an isolated task contract with historical defaults
+  and JSON output
+- `benchmark run-sequential` — execute bounded task attempts against one retained
   artifact
+- `run-sequential` — retain the existing advanced launch form
 - `analyze-trace` — summarize one or more JSONL traces
 - `render-transcript` — render traces as a self-contained causal HTML report
 - `resolve-contract` — validate and resolve a run contract without invoking a

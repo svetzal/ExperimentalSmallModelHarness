@@ -1,0 +1,100 @@
+{
+  "schema_version": "microgentic_benchmark_mode_check.v1",
+  "baseline_sha256": "1f7d8463aa963393ac1d4aa6072b3ba67b539ddeb5fe9bbebba6501395af9b4d",
+  "current_sha256": "bb1d03a1f1505c2cf7544f742f490824adcb612fe5939daf699ef56d037bf546",
+  "results": [
+    {
+      "case": "contract",
+      "provider": "omlx",
+      "requests_compared": 2,
+      "provider_json_equal": true,
+      "exact_snapshots_equal": true,
+      "context_ledgers_equal": true,
+      "summary_schema_equal": true
+    },
+    {
+      "case": "contract",
+      "provider": "ollama",
+      "requests_compared": 2,
+      "provider_json_equal": true,
+      "exact_snapshots_equal": true,
+      "context_ledgers_equal": true,
+      "summary_schema_equal": true
+    },
+    {
+      "case": "goal",
+      "provider": "omlx",
+      "requests_compared": 2,
+      "provider_json_equal": true,
+      "exact_snapshots_equal": true,
+      "context_ledgers_equal": true,
+      "summary_schema_equal": true
+    },
+    {
+      "case": "goal",
+      "provider": "ollama",
+      "requests_compared": 2,
+      "provider_json_equal": true,
+      "exact_snapshots_equal": true,
+      "context_ledgers_equal": true,
+      "summary_schema_equal": true
+    },
+    {
+      "case": "sequential",
+      "provider": "omlx",
+      "requests_compared": 4,
+      "provider_json_equal": true,
+      "exact_snapshots_equal": true,
+      "context_ledgers_equal": true,
+      "summary_schema_equal": true
+    },
+    {
+      "case": "sequential",
+      "provider": "ollama",
+      "requests_compared": 4,
+      "provider_json_equal": true,
+      "exact_snapshots_equal": true,
+      "context_ledgers_equal": true,
+      "summary_schema_equal": true
+    }
+  ],
+  "pre_ux_revision": "bfe3529338caeac4c18bb06554915e9c99c528c1",
+  "implementation_parent_revision": "d44b418acaaedf913536ce7bca766e467dc824a5",
+  "baseline_build": "cargo build --locked --bin adaptive-agent-harness (archived pre-UX source)",
+  "validation": {
+    "rust": {
+      "command": "cargo test --locked --all-targets",
+      "passed": 389,
+      "ignored": 2,
+      "failed": 0
+    },
+    "format": {
+      "command": "cargo fmt --all --check",
+      "passed": true
+    },
+    "clippy": {
+      "command": "cargo clippy --locked --all-targets -- -D warnings",
+      "passed": true
+    },
+    "pier_adapters": {
+      "passed": 14,
+      "failed": 0,
+      "tests": [
+        "scripts/test_microgentic_adapter.py",
+        "scripts/test_factorial_cell.py",
+        "scripts/test_harness_cell.py"
+      ]
+    },
+    "harbor_adapters": {
+      "passed": 15,
+      "failed": 0,
+      "tests": [
+        "adapter/tests/test_adaptive_harness_agent.py"
+      ]
+    },
+    "adapter_patch_reverse_check": true,
+    "markdownlint": "clean",
+    "live_model_trials": false,
+    "container_packaging_checked": false
+  }
+}

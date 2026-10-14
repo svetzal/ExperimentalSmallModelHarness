@@ -204,6 +204,19 @@ after a nonzero process exit. Harbor used `--max-tool-iterations`; Pier
 used `--max-model-interactions`. These were concrete migration points identified
 by source review, not newly executed benchmark results.
 
+- [x] **Separate benchmark task mode from conversation UX.** Add
+  `microgentic benchmark run` and `benchmark run-sequential` with file contracts,
+  historical runtime defaults, and unconditional JSON summaries. Ignore personal
+  setup, stdin, and TUI history. Keep existing advanced launch forms available.
+  Maintained Pier and Harbor adapters now select this mode explicitly. Compare
+  provider requests and context ledgers with the pre-UX source before release.
+  See [benchmark mode evidence](MICROGENTIC-BENCHMARK-MODE.md). Container installation
+  and live efficacy measurements remain under the broader gates below.
+- [ ] **Give rapid attempts distinct trace filenames.** The deterministic
+  sequential fixture exposed a pre-existing collision when two attempts start
+  within one second. Preserve atomic trace creation while making each filename
+  unique. Fix this separately from benchmark mode preservation, then remove
+  fixture pacing and check rapid sequential attempts through the public binary.
 - [ ] **Define the adapter boundary before changing commands.** Map benchmark
   task input, project root, provider/model, permissions, probe contract, budgets,
   context policy, output, trace destination, and cancellation to the public

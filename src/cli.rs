@@ -16,7 +16,7 @@ use crate::retry::{SequentialRunConfig, run_sequential};
 use crate::trace_analysis::analyze_trace;
 use crate::transcript::{RenderTranscriptConfig, render_transcript};
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -289,6 +289,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn benchmark_grammar_preserves_file_intake_and_runtime_defaults() {
+        assert!(
+            command_definition()
+                .try_get_matches_from(["microgentic", "benchmark", "run"])
+                .is_err()
+        );
+        let matches = command_definition()
+            .try_get_matches_from([
+                "microgentic",
+                "benchmark",
+                "run",
+                "--experiment",
+                "cell",
+                "--goal",
+                "unused.md",
+                "--contract",
+                "contract.json",
+            ])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        let Some(Command::Benchmark {
+            command: BenchmarkCommand::Run(run),
+        }) = cli.command
+        else {
+            panic!("expected benchmark run");
+        };
+        let config = run.into_config().unwrap();
+        assert_eq!(config.provider, Provider::Omlx);
+        assert_eq!(config.model, DEFAULT_MODEL);
+        assert_eq!(config.max_iterations, 10);
+        assert_eq!(config.max_model_interactions, 75);
+        assert_eq!(config.goal_file, PathBuf::from("unused.md"));
+        assert_eq!(config.contract_file, Some(PathBuf::from("contract.json")));
+        assert!(config.reasoning_effort.is_none());
+        assert!(config.max_tokens.is_none());
+
+        let matches = command_definition()
+            .try_get_matches_from([
+                "microgentic",
+                "benchmark",
+                "run-sequential",
+                "--experiment",
+                "cell",
+                "--artifact",
+                "answer.txt",
+                "--expected-artifact",
+                "expected.txt",
+            ])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        let Some(Command::Benchmark {
+            command: BenchmarkCommand::RunSequential(args),
+        }) = cli.command
+        else {
+            panic!("expected benchmark sequential run");
+        };
+        assert_eq!(args.run.goal, Some(PathBuf::from("task.md")));
+        assert_eq!(args.max_attempts, 8);
+        assert_eq!(args.max_failed_repair_cycles, 8);
+        assert_eq!(args.max_consecutive_unchanged_attempts, 2);
+        // The everyday surface still rejects two authoritative input files.
+        assert!(
+            command_definition()
+                .try_get_matches_from([
+                    "microgentic",
+                    "run",
+                    "--goal",
+                    "task.md",
+                    "--contract",
+                    "contract.json"
+                ])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn everyday_grammar_has_no_positional_prompt_or_required_experiment() {
         assert!(
             Cli::try_parse_from(["microgentic"])
@@ -489,31 +565,14 @@ enum Command {
         session_state: PathBuf,
     },
 
-    /// Run bounded natural attempts on one retained worker artifact.
-    RunSequential {
-        #[command(flatten)]
-        run: RunArgs,
-
-        /// Root-relative worker artifact whose state is retained between attempts.
-        #[arg(long)]
-        artifact: PathBuf,
-
-        /// Expected artifact file, relative to the experiment root unless absolute.
-        #[arg(long)]
-        expected_artifact: PathBuf,
-
-        /// Maximum number of naturally completed attempts.
-        #[arg(long, default_value_t = 8)]
-        max_attempts: usize,
-
-        /// Stop after this many completed failed edit-to-probe cycles.
-        #[arg(long, default_value_t = 8)]
-        max_failed_repair_cycles: usize,
-
-        /// Stop after this many consecutive attempts leave the artifact unchanged.
-        #[arg(long, default_value_t = 2)]
-        max_consecutive_unchanged_attempts: usize,
+    /// Run isolated task contracts with historical defaults and JSON output. [Mutates]
+    Benchmark {
+        #[command(subcommand)]
+        command: BenchmarkCommand,
     },
+
+    /// Run bounded natural attempts on one retained worker artifact.
+    RunSequential(SequentialArgs),
 
     /// Summarize context assembly and tool payload pressure from trace JSONL files.
     AnalyzeTrace {
@@ -654,6 +713,65 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+#[command(
+    after_help = "Examples:\n  microgentic benchmark run --experiment ./cell --dir ./cell/workspace\n  microgentic benchmark run --experiment ./cell --contract contract.json --provider ollama --model qwen3.8:27b-mxfp8\n\nUses task.md by default. Ignores stdin, personal setup, and conversation history. Outputs the complete JSON summary. Provider environment variables still select server URLs and credentials."
+)]
+enum BenchmarkCommand {
+    /// Run one isolated task contract. [Mutates]
+    Run(RunArgs),
+    /// Run bounded natural attempts on one retained worker artifact. [Mutates]
+    RunSequential(SequentialArgs),
+}
+
+#[derive(Debug, Args)]
+struct SequentialArgs {
+    #[command(flatten)]
+    run: RunArgs,
+
+    /// Root-relative worker artifact whose state is retained between attempts.
+    #[arg(long)]
+    artifact: PathBuf,
+
+    /// Expected artifact file, relative to the experiment root unless absolute.
+    #[arg(long)]
+    expected_artifact: PathBuf,
+
+    /// Maximum number of naturally completed attempts.
+    #[arg(long, default_value_t = 8)]
+    max_attempts: usize,
+
+    /// Stop after this many completed failed edit-to-probe cycles.
+    #[arg(long, default_value_t = 8)]
+    max_failed_repair_cycles: usize,
+
+    /// Stop after this many consecutive attempts leave the artifact unchanged.
+    #[arg(long, default_value_t = 2)]
+    max_consecutive_unchanged_attempts: usize,
+}
+
+// Reuse every runtime control while giving benchmark intake its historical grammar.
+// Keep this in one command factory so parsing and help cannot diverge.
+fn command_definition() -> clap::Command {
+    fn benchmark_run(command: clap::Command) -> clap::Command {
+        command
+            .mut_arg("experiment", |arg| arg.required(true))
+            .mut_arg("prompt", |arg| arg.hide(true))
+            .mut_arg("json", |arg| arg.hide(true))
+            .mut_arg("goal", |arg| {
+                arg.conflicts_with(clap::builder::Resettable::<clap::Id>::Reset).default_value("task.md")
+            })
+            .after_help("Example:\n  microgentic benchmark run --experiment ./cell --dir ./cell/workspace --contract contract.json\n\nInput comes from --contract or --goal (default: task.md). A contract takes precedence over a goal. JSON output is unconditional; stdin, --config, and TUI history are ignored. --prompt is unavailable in benchmark mode. Runtime controls retain their historical meanings.")
+    }
+    Cli::command().mut_subcommand("benchmark", |command| {
+        command
+            .mut_subcommand("run", benchmark_run)
+            .mut_subcommand("run-sequential", |command| {
+                benchmark_run(command).after_help("Example:\n  microgentic benchmark run-sequential --experiment ./cell --dir ./cell/workspace --artifact answer.txt --expected-artifact expected.txt\n\nUses the same isolated file intake and JSON output as benchmark run. Retains the selected artifact between bounded task attempts.")
+            })
+    })
+}
+
 #[derive(Debug, Args)]
 #[command(
     after_help = "Examples:\n  microgentic setup\n  microgentic setup --provider ollama --model qwen3.8:27b-mxfp8 --reasoning-effort low --apply\n\nCredentials and server URLs remain in OMLX_HOST/OMLX_API_KEY or OLLAMA_HOST. No provider call is made during setup."
@@ -691,7 +809,7 @@ pub async fn run() -> Result<()> {
 }
 
 async fn dispatch(legacy: bool) -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::from_arg_matches(&command_definition().get_matches())?;
     let Some(command) = cli.command else {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             bail!("interactive mode needs a terminal; try: echo 'Hello!' | microgentic run");
@@ -724,21 +842,33 @@ async fn dispatch(legacy: bool) -> Result<()> {
             let config = prepare_run_with_mode(run, cli.config.as_deref(), true, true)?;
             crate::conversation::run_worker(config, prompt, session_state).await?;
         }
-        Command::RunSequential {
-            run,
-            artifact,
-            expected_artifact,
-            max_attempts,
-            max_failed_repair_cycles,
-            max_consecutive_unchanged_attempts,
-        } => {
+        Command::Benchmark { command } => match command {
+            BenchmarkCommand::Run(run) => {
+                let summary = run_agent(prepare_benchmark_run(run)?).await?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            }
+            BenchmarkCommand::RunSequential(args) => {
+                let agent = prepare_benchmark_run(args.run)?;
+                let summary = run_sequential(SequentialRunConfig {
+                    agent,
+                    artifact: args.artifact,
+                    expected_artifact: args.expected_artifact,
+                    max_attempts: args.max_attempts,
+                    max_failed_repair_cycles: args.max_failed_repair_cycles,
+                    max_consecutive_unchanged_attempts: args.max_consecutive_unchanged_attempts,
+                })
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            }
+        },
+        Command::RunSequential(args) => {
             let summary = run_sequential(SequentialRunConfig {
-                agent: prepare_run(run, cli.config.as_deref(), legacy)?,
-                artifact,
-                expected_artifact,
-                max_attempts,
-                max_failed_repair_cycles,
-                max_consecutive_unchanged_attempts,
+                agent: prepare_run(args.run, cli.config.as_deref(), legacy)?,
+                artifact: args.artifact,
+                expected_artifact: args.expected_artifact,
+                max_attempts: args.max_attempts,
+                max_failed_repair_cycles: args.max_failed_repair_cycles,
+                max_consecutive_unchanged_attempts: args.max_consecutive_unchanged_attempts,
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -948,6 +1078,31 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     })
+}
+
+fn prepare_benchmark_run(mut run: RunArgs) -> Result<AgentRunConfig> {
+    if run.prompt.is_some() {
+        bail!(
+            "benchmark mode reads task files; use --goal task.md or --contract contract.json instead of --prompt"
+        );
+    }
+    let experiment = run
+        .experiment
+        .as_ref()
+        .context("benchmark mode requires --experiment")?;
+    run.experiment = Some(absolute(experiment)?);
+    if let Some(trace) = &mut run.trace_dir {
+        *trace = absolute(trace)?;
+    }
+    let root = absolute(&run.dir)?
+        .canonicalize()
+        .context("opening --dir project directory")?;
+    if !root.is_dir() {
+        bail!("--dir must name a project directory");
+    }
+    // No personal defaults, stdin intake, prompt files, or conversation state.
+    std::env::set_current_dir(root)?;
+    run.into_config()
 }
 
 fn prepare_run(run: RunArgs, config_path: Option<&Path>, legacy: bool) -> Result<AgentRunConfig> {
