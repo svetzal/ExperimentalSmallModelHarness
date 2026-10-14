@@ -123,3 +123,23 @@ fn tui_streams_and_keeps_native_history_without_leaking_into_runs() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn tui_chats_naturally_and_can_perform_work_when_requested() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/tui_dialogue.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_microgentic"))
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -199,7 +199,12 @@ traces outside that root under `$XDG_STATE_HOME/microgentic/runs`, or
 `~/.local/state/microgentic/runs`. Each run has a separate directory. Results go
 to stdout; logs go to stderr. `--json` returns the existing full run summary.
 
-In the TUI, Enter sends a task, Alt-Enter inserts a newline, Page Up/Down scroll,
+The TUI opens a conversation with no assumed engineering task. Greetings,
+questions, and discussion receive natural replies. The conversation supplies
+requests for work; tools are available when those requests or answers need them.
+Quoted commands remain discussion text, and replies do not require DONE/FAIL.
+
+In the TUI, Enter sends a message, Alt-Enter inserts a newline, Page Up/Down scroll,
 Ctrl-C requests cancellation, and Esc exits when idle. The view shows defaults,
 elapsed time, streamed replies, thinking status, tool activity, and trace locations.
 Follow-up prompts retain actual user messages, completed assistant responses, and
@@ -211,6 +216,8 @@ provider/model/effort. State is saved outside the project in a unique
 `session-*/conversation.json` under the run-state directory. Previous task-scoped
 system/probe/repair instructions and incomplete streamed replies are not replayed.
 Each prompt gets fresh task validation state and the existing runtime budgets.
+Conversational shell checks are observations; they do not become executor-owned
+acceptance probes. Task and benchmark `run` contracts keep their existing rules.
 Older complete exchanges are omitted when retained history exceeds half the
 input allowance; the TUI and traces report the omission. Plain and benchmark
 `run` invocations never load this history. Durable resume and detailed tool

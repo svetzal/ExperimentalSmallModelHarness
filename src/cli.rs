@@ -721,7 +721,7 @@ async fn dispatch(legacy: bool) -> Result<()> {
                 .context("conversation worker requires --prompt")?;
             let session_state = absolute(&session_state)?;
             // The TUI already resolved and sealed its settings at session entry.
-            let config = prepare_run(run, cli.config.as_deref(), true)?;
+            let config = prepare_run_with_mode(run, cli.config.as_deref(), true, true)?;
             crate::conversation::run_worker(config, prompt, session_state).await?;
         }
         Command::RunSequential {
@@ -950,10 +950,15 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     })
 }
 
-fn prepare_run(
+fn prepare_run(run: RunArgs, config_path: Option<&Path>, legacy: bool) -> Result<AgentRunConfig> {
+    prepare_run_with_mode(run, config_path, legacy, false)
+}
+
+fn prepare_run_with_mode(
     mut run: RunArgs,
     config_path: Option<&Path>,
     legacy: bool,
+    conversational: bool,
 ) -> Result<AgentRunConfig> {
     let root = absolute(&run.dir)?
         .canonicalize()
@@ -1010,7 +1015,14 @@ fn prepare_run(
             }
         }
     } else if !advanced || run.prompt.is_some() {
-        let (prompt, suffix) = prompt_document(run.prompt.take(), input)?;
+        let (prompt, suffix) = if conversational {
+            (
+                crate::conversation::message_document(prompt_text(run.prompt.take(), input)?),
+                ".json",
+            )
+        } else {
+            prompt_document(run.prompt.take(), input)?
+        };
         let base = if let Some(experiment) = &run.experiment {
             absolute(experiment)?
         } else {

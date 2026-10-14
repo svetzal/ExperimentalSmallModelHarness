@@ -36,6 +36,12 @@ earlier conversation prompts. Stream presentation observes the existing runtime;
 benchmark entry points never load ambient conversation history. The deterministic
 boundary checks are in `MICROGENTIC-CONVERSATION.md`.
 
+An open TUI has no assumed engineering task. The user's conversation supplies
+work requests; ordinary replies can finish without task status tokens. Preserve
+quoted examples as data and keep observational shell checks separate from
+executor-owned acceptance probes. Benchmark task prompting, probe authority, and
+terminal rules remain on the existing task path. See `MICROGENTIC-CHAT.md`.
+
 ## Responsibilities
 
 The harness maintains goals, acceptance criteria, budgets, and stopping rules.

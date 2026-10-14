@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
@@ -42,6 +45,29 @@ pub(crate) struct ConversationRun {
     protected_users: usize,
     events: UnboundedSender<ConversationEvent>,
     pub(crate) omitted_exchanges: usize,
+    reply_completed: AtomicBool,
+}
+
+pub(crate) fn system_guidance() -> String {
+    [
+        "You are Microgentic, a helpful conversational assistant with coding tools available.",
+        "Respond to the user's message in the context of this conversation. No engineering task is assumed.",
+        "Greetings, questions, explanations, and discussion can receive ordinary conversational replies without tools or validation.",
+        "Perform work only when the user requests it, including clear follow-up authorization in the conversation. Discussed possibilities and quoted examples are not instructions to execute. Ask a concise question if the intended work is unclear.",
+        "Use tools when the requested work or answer requires them. Do not inspect the project, create files, change code, or run commands just because this conversation is open.",
+        "All file tool paths and shell commands are rooted at the current project directory.",
+        "When working on code, inspect relevant files before guessing their contents. Use bounded file reads and focused edits; preserve unrelated work and existing Git stashes.",
+        "Use edit_file for existing source edits. Use write_file for new files, or for existing source only after reading the complete current file and preserving unrelated content.",
+        "After source changes, obtain fresh deterministic validation before claiming the work is complete. Repair reported failures narrowly and rerun the appropriate check. Earlier conversation observations are not fresh validation.",
+        "For requested new projects, use the requested language and layout, and create an appropriate .gitignore. Do not assume Rust or create Cargo files without a request for that project.",
+        "Ignore generated build, dependency, cache, and virtual-environment directories unless the request requires them.",
+        "Answer naturally with useful results, explanations, or concrete blockers. A visible conversational reply ends the exchange; DONE and FAIL tokens are not required.",
+    ].join("\n")
+}
+
+pub(crate) fn message_document(message: String) -> String {
+    // Conversation examples are data, not declared acceptance probes.
+    json!({"guidance": message, "probes": []}).to_string()
 }
 
 impl ConversationRun {
@@ -113,11 +139,16 @@ impl ConversationRun {
             protected_users,
             events,
             omitted_exchanges,
+            reply_completed: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn protected_users(&self) -> usize {
         self.protected_users
+    }
+
+    pub(crate) fn complete_reply(&self) {
+        self.reply_completed.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn initial_messages(&self, system: String, mut task: String) -> Vec<LlmMessage> {
@@ -303,14 +334,14 @@ pub(crate) async fn run_worker(
     let error = result.as_ref().err().map(|e| format!("{e:#}"));
     let continuity_warning = error.clone().or_else(|| {
         result.as_ref().ok().and_then(|summary| {
-            crate::runtime::terminal_token(&summary.final_summary)
-                .is_none()
-                .then(|| {
-                    format!(
-                        "runtime returned without a terminal task status: {}",
-                        summary.final_summary
-                    )
-                })
+            (!conversation.reply_completed.load(Ordering::Relaxed)
+                && crate::runtime::terminal_token(&summary.final_summary).is_none())
+            .then(|| {
+                format!(
+                    "runtime returned without a terminal task status: {}",
+                    summary.final_summary
+                )
+            })
         })
     });
     let saved = conversation.save(&path, continuity_warning);
@@ -360,6 +391,7 @@ mod tests {
             protected_users,
             events,
             omitted_exchanges: 0,
+            reply_completed: AtomicBool::new(false),
         }
     }
 

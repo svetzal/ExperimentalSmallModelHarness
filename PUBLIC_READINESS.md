@@ -298,6 +298,10 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
 
 ### P1: friendly TUI
 
+- [x] **Start with conversation.** No engineering work is assumed at launch or
+  for an ordinary greeting/question. Preserve messages literally and let the
+  conversation request work. Use natural reply completion without DONE/FAIL;
+  keep quoted commands separate from executor-owned acceptance probes.
 - [x] **Stream the ongoing conversation.** Display full reply chunks as they
   arrive, thinking/progress status, and tool activity through a private event seam
   on the existing runtime. Permit drafting during generation. Forward cancellation

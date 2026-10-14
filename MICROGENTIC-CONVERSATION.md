@@ -2,6 +2,11 @@
 
 Date: 2026-10-13. Source baseline: `84b6fe4`.
 
+This note records the continuity slice committed as `0a65b21`.
+The [conversational entry correction](MICROGENTIC-CHAT.md) replaces its default
+coding-task framing with natural conversation; retained history and streaming
+continue through the same worker path.
+
 ## Behavior and boundary
 
 The initial TUI started separate ordinary workers and waited for a complete JSON

@@ -562,7 +562,11 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             gateway,
             advisor_model,
             &resolved_contract.guidance,
-            profile.run_guidance(&resolved_contract.guidance),
+            if conversation.is_some() {
+                resolved_contract.guidance.clone()
+            } else {
+                profile.run_guidance(&resolved_contract.guidance)
+            },
             catalog.as_ref(),
             &trace,
         )
@@ -671,7 +675,11 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     if let Some((spec, _, _)) = &acceptance_ledger {
         scope.configure_acceptance_ledger(spec.clone())?;
     }
-    let system_prompt = tool_surface.adapt_system_guidance(profile.system_guidance());
+    let system_prompt = tool_surface.adapt_system_guidance(if conversation.is_some() {
+        crate::conversation::system_guidance()
+    } else {
+        profile.system_guidance()
+    });
     let tools = tools_for_profile(&scope, profile);
     let repair_tools = tools
         .iter()
@@ -712,7 +720,11 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     );
     let worker_message =
         worker_message_with_declared_probes(&worker_message, &resolved_contract.probes);
-    let worker_message = match crate::stash::entry_prompt(&stash_baseline) {
+    let worker_message = match conversation
+        .is_none()
+        .then(|| crate::stash::entry_prompt(&stash_baseline))
+        .flatten()
+    {
         Some(guidance) => format!("{worker_message}\n\n{guidance}"),
         None => worker_message,
     };
@@ -1264,11 +1276,13 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
                     )?;
                     pending_reasoning_checkpoint_delivery = Some(metadata);
                 }
-                messages.push(LlmMessage::user(hidden_only_no_action_prompt(
+                messages.push(LlmMessage::user(if conversation.is_some() {
+                    "Your previous response contained thinking but no visible reply. Respond naturally to the user's message. Use tools only if the conversation calls for them, and explain any concrete blocker.".to_string()
+                } else { hidden_only_no_action_prompt(
                     consecutive_hidden_only_no_action_turns,
                     tool_calls_this_turn,
                     reasoning_checkpoint.as_ref(),
-                )));
+                ) }));
                 continue;
             }
             if tool_calls_this_turn > 0 {
@@ -1292,15 +1306,16 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
                         }),
                     )?;
                     final_response_only_next_turn = true;
-                    messages.push(LlmMessage::user(successful_validation_done_prompt(
-                        validation,
+                    messages.push(LlmMessage::user(successful_validation_reply_prompt(
+                        validation, &trace,
                     )));
                     continue;
                 }
-                messages.push(LlmMessage::user(
-                    "You used tools but produced no final text. Continue from the current project state. \
-                     If validation passed, reply exactly DONE. If validation failed, fix the cause and validate again.",
-                ));
+                messages.push(LlmMessage::user(if conversation.is_some() {
+                    "You used tools but produced no visible reply. Respond to the user's message using the observations; do additional work only when the conversation calls for it."
+                } else { "You used tools but produced no final text. Continue from the current project state. \
+                     If validation passed, reply exactly DONE. If validation failed, fix the cause and validate again."
+                }));
                 continue;
             }
             let empty_response_decision = EmptyResponseDecision {
@@ -1308,7 +1323,11 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
                     turn_decision,
                     crate::runtime::RuntimeDecision::HardStopEmptyResponse
                 ),
-                prompt: empty_response_prompt(consecutive_empty_responses),
+                prompt: if conversation.is_some() {
+                    "Your last response was empty. Answer the user's message naturally or explain what information you need. Tools and engineering work are not required for ordinary conversation.".into()
+                } else {
+                    empty_response_prompt(consecutive_empty_responses)
+                },
             };
             if thinking_chars_this_turn > 0 {
                 trace.event(
@@ -1355,7 +1374,10 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             continue;
         }
         final_summary = response.clone();
-        if is_done_response(&final_summary) {
+        let conversational_reply = conversation.is_some() && !response.trim().is_empty();
+        if (conversation.is_none() && is_done_response(&final_summary))
+            || (conversational_reply && policy.total_tool_calls > 0)
+        {
             let current = crate::stash::capture(&tool_root).await;
             let comparison = crate::stash::compare(&stash_baseline, &current);
             trace.event(
@@ -1385,7 +1407,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             messages.push(LlmMessage::user(profile.post_write_validation_nudge(true)));
             continue;
         }
-        if is_done_response(&final_summary)
+        if (is_done_response(&final_summary) || conversational_reply)
             && !scope.runtime_state_snapshot().requested_probes_satisfied()
         {
             trace.event(
@@ -1401,7 +1423,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             )));
             continue;
         }
-        if is_done_response(&final_summary) && config.acceptance_ledger {
+        if (is_done_response(&final_summary) || conversational_reply) && config.acceptance_ledger {
             let acceptance = scope.acceptance_ledger_snapshot();
             if !acceptance.is_complete() {
                 trace.event(
@@ -1418,6 +1440,17 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
                 )));
                 continue;
             }
+        }
+        if conversational_reply && policy.validation_repair.is_none() {
+            if let Some(session) = &conversation {
+                session.complete_reply();
+            }
+            trace.event(
+                "session.reply.completed",
+                serde_json::json!({"turn": turn, "completion": "visible_conversation_reply"}),
+            )?;
+            exhausted_iterations = false;
+            break;
         }
         if is_terminal_response(&final_summary) {
             if let Some(token) = crate::runtime::terminal_token(&final_summary) {
@@ -1441,8 +1474,8 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
                 }),
             )?;
             final_response_only_next_turn = true;
-            messages.push(LlmMessage::user(successful_validation_done_prompt(
-                validation,
+            messages.push(LlmMessage::user(successful_validation_reply_prompt(
+                validation, &trace,
             )));
             continue;
         }
@@ -1899,6 +1932,19 @@ fn successful_validation_done_prompt(validation: &SuccessfulValidationSnapshot) 
          Reply exactly DONE if the requested task is complete, or exactly FAIL with one concise blocker.",
         command = validation.command,
         command_family = validation.command_family,
+    )
+}
+
+fn successful_validation_reply_prompt(
+    validation: &SuccessfulValidationSnapshot,
+    trace: &TraceRecorder,
+) -> String {
+    if !trace.is_conversation() {
+        return successful_validation_done_prompt(validation);
+    }
+    format!(
+        "Fresh deterministic validation passed after the source edits.\nPassing command: {}\nCommand family: {}\nDo not call more tools or broaden the work. Respond naturally to the user with the result and checks performed, or explain a concrete blocker. No DONE or FAIL token is required.",
+        validation.command, validation.command_family
     )
 }
 
@@ -2949,8 +2995,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         "scope": "in_turn",
                     }),
                 )?;
-                current_messages.push(LlmMessage::user(successful_validation_done_prompt(
+                current_messages.push(LlmMessage::user(successful_validation_reply_prompt(
                     &validation,
+                    trace,
                 )));
                 final_response_only_after_validation = Some(validation);
                 requested_validation_pending_after_write = false;

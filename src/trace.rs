@@ -79,6 +79,10 @@ impl TraceRecorder {
         }
     }
 
+    pub(crate) fn is_conversation(&self) -> bool {
+        self.conversation.is_some()
+    }
+
     pub(crate) fn reply_started(&self) {
         if let Some(conversation) = &self.conversation {
             conversation.emit(crate::conversation::ConversationEvent::ReplyStarted);

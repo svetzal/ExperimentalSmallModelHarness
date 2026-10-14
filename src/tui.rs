@@ -152,7 +152,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
         requested_exit.store(true, Ordering::Relaxed);
     });
     let mut view = View {
-        history: "Give Microgentic a coding task, then follow up in this conversation.\nTasks can edit files and execute project commands.\nConfigure defaults with microgentic setup outside this view.\n".into(),
+        history: "Talk to Microgentic. Ask for work when you're ready.\nWhen requested, Microgentic can edit files and run project commands.\nConfigure defaults with microgentic setup outside this view.\n".into(),
         status: "Ready".into(),
         ..View::default()
     };

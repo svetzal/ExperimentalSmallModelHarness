@@ -1,0 +1,23 @@
+{
+  "schema_version": "microgentic_conversation_isolation_check.v1",
+  "baseline_sha256": "d2ee45079af039a1ee67305f7f3cc91245474f3b2fee3ebc7f84cf80bb558607",
+  "current_sha256": "6af12ff534f64e0a8d87dc68da66486b9ee7caef31c142cdcea9d69e3ccfca50",
+  "results": [
+    {
+      "provider": "omlx",
+      "requests_compared": 2,
+      "provider_json_equal": true,
+      "exact_snapshots_equal": true,
+      "context_ledgers_equal": true,
+      "summary_schema_equal": true
+    },
+    {
+      "provider": "ollama",
+      "requests_compared": 2,
+      "provider_json_equal": true,
+      "exact_snapshots_equal": true,
+      "context_ledgers_equal": true,
+      "summary_schema_equal": true
+    }
+  ]
+}
