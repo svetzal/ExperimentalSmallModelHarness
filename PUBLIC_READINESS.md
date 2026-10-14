@@ -1,7 +1,8 @@
 # Microgentic public CLI readiness checklist
 
-Date: 2026-10-13. Status: initial CLI implementation; remaining proposals are
-identified below. See [migration evidence](MICROGENTIC-CLI-MIGRATION.md).
+Started: 2026-10-13. Reviewed: 2026-10-14. Status: v0.1.0 published with
+Homebrew installation and an ongoing streaming conversation. Remaining proposals
+are identified below. See [migration evidence](MICROGENTIC-CLI-MIGRATION.md).
 
 Build Microgentic as an adaptive coding agent optimized for small models that
 need extra help staying on task. Give it a small, simple, fast interface with
@@ -58,7 +59,130 @@ Source starting points: [CLI](src/cli.rs), [agent](src/agent.rs),
 [tools](src/tools.rs), [runtime](src/runtime.rs),
 [context assembly](src/initial_context.rs), and [tracing](src/trace.rs).
 
-## CLI UX review: adaptive-agent-harness
+## Next improvements after v0.1.0
+
+Review recorded on 2026-10-14 in the primary product checkout, at source revision
+`f5cd06cd4d15665d9dfe9aa1457cec7f14fafc57`. This order supersedes the original
+implementation sequence below. The broader checklist remains the release backlog.
+
+The published foundation includes the Microgentic name, everyday command grammar,
+saved provider/model/effort defaults, ongoing streamed conversation, conditional
+evidence footers, isolated benchmark commands, native release checks, and Homebrew.
+Publication does not complete the broader usability gates.
+
+This review inspected the installed command's top-level, setup, and run help.
+It also inspected configuration, command dispatch, conversation entry, context
+assembly, standalone planning, and trace creation. No provider or local model
+was started. These findings describe interface and source behavior, not task efficacy.
+
+### 1. Return trustworthy results
+
+**Next implementation slice.** Give users and shell scripts a clear account of
+what finished, what changed, and what was checked. The current `run` dispatcher
+prints `final_summary` and returns success even when the summary reports failure.
+Trace creation also uses second-resolution filenames with exclusive creation.
+Rapid attempts sharing a trace directory can therefore fail before work starts.
+
+- [ ] Create unique trace filenames without sleeps or overwriting prior evidence.
+  Test rapid and concurrent creation in one directory. Remove sequential-fixture
+  pacing.
+- [ ] Add a typed terminal outcome at the runtime boundary. Distinguish a completed
+  reply, verified task completion, incomplete work, provider/environment failure,
+  and cancellation. Use recorded runtime decisions and executor results;
+  a model's prose must not establish successful checks.
+- [ ] Present the same outcome in plain output, JSON, and the TUI. Report changed
+  paths, check results, checks not run, stop reason, and evidence location when
+  relevant. Describe changes relative to the starting workspace, including
+  pre-existing edits.
+  An ordinary chat reply needs neither a task scorecard nor an evidence footer.
+- [ ] Map public `run` outcomes to documented exit codes. Exercise returned `FAIL`,
+  provider failure, exhausted budgets, unchecked completion, and cancellation
+  through the installed binary. Check redirected stdout and stderr separately.
+- [ ] Preserve benchmark task behavior and existing summary fields. Treat any
+  benchmark exit-code change as an explicit adapter migration with reader tests.
+  Compare resolved requests, controls, and terminal evidence with deterministic
+  fixtures.
+
+Start with trace uniqueness as a separate small commit, then implement the shared
+outcome. Streaming JSONL and downstream cancellation follow once terminal results
+have a stable meaning. Keep existing stop, validation, recovery, and patience
+policies.
+
+Source seams: [trace creation](src/trace.rs), [run summary](src/agent.rs),
+[command dispatch](src/cli.rs), and [conversation events](src/conversation.rs).
+
+### 2. Make setup lead to a working provider
+
+The current setup saves defaults without contacting the provider. Users must know
+the exact model ID and configure the endpoint through environment variables.
+Worker and in-run advisories share provider selection; standalone planning still
+constructs an oMLX gateway.
+
+- [ ] Resolve one effective provider configuration for everyday commands and TUI.
+  Route standalone planning through the same selection with explicit overrides.
+  Keep benchmark configuration explicit and independent of personal defaults.
+- [ ] Add bounded connectivity checks and actual model discovery for oMLX and Ollama.
+  Let setup review the selected endpoint, model, and effort before saving.
+  Help and local configuration inspection must remain offline.
+- [ ] Report unavailable servers, missing models, credential problems, and unknown
+  capabilities with an actionable next step. Do not infer effort support from
+  an accepted flag or imply that model discovery proves tool/streaming support.
+- [ ] Test endpoint/override precedence and secret redaction with scripted servers.
+  Confirm that a saved choice reaches both `run` and the TUI unchanged.
+
+Begin with the existing two providers and one saved default. Add named profiles
+and hosted gateways after this workflow works; neither is a prerequisite for it.
+Source seams: [preferences](src/preferences.rs), [setup](src/cli.rs),
+[acceptance planning](src/acceptance_plan.rs), and
+[interaction planning](src/acceptance_interactions.rs).
+
+### 3. Understand the project and the request
+
+Plain `run` still enters the historical task runtime; the TUI uses conversational
+guidance and natural reply completion. Project instructions are currently supplied
+through an explicit initial-context catalog rather than automatic `AGENTS.md` discovery.
+
+- [ ] Specify everyday behavior for greetings, explanations, reviews, and edits
+  across `run` and TUI. Keep stdin reference material distinct from instructions.
+  Make any prompt or completion-policy change explicit; preserve benchmark mode.
+- [ ] Add bounded hierarchical `AGENTS.md` discovery through the existing context
+  assembler. Define the ancestor boundary and nested-directory applicability.
+  Record paths, hashes, exclusions, precedence, and included text in trace evidence.
+- [ ] Treat project guidance as input. It must not silently change credential
+  destinations, grant shell permissions, or replace declared validation authority.
+  Detect changed guidance between exchanges and account for context limits.
+- [ ] Offer reviewable project checks without treating quoted shell commands or
+  inferred checks as executor-owned acceptance probes. Report unchecked work honestly.
+- [ ] Test an existing dirty repository with nested guidance, ignored files,
+  follow-up requests, and explicit benchmark isolation using scripted gateways.
+
+This slice changes model context. Register the hypothesis and comparison cell
+before making capability claims; preserve exact provider requests for causal review.
+Source seams: [prompt intake](src/cli.rs), [conversation](src/conversation.rs),
+[context assembly](src/initial_context.rs), and [contracts](src/contract.rs).
+
+### 4. Make coding effects reviewable
+
+The TUI streams replies and tool activity, but it has no approval view, final diff,
+or durable resume command. Agent tools still use the existing execution authority.
+
+- [ ] Define inspection, approved changes, and autonomous execution consistently
+  across CLI and TUI. Include shell, network, and validation effects.
+- [ ] Retain concrete proposals for approval and reject stale workspace state.
+  Show proposed changes, command effects, fresh checks, and the final diff.
+  Non-interactive runs must fail clearly when required authority is missing.
+- [ ] Build compact tool/check detail and understandable activity states around
+  the shared outcome. Test keyboard behavior, narrow terminals, and cancellation.
+- [ ] Add durable sessions after checkpoint fidelity and ownership are defined.
+  Resume must preserve completed work, detect external changes, and avoid tool replay.
+
+These are wider usability gates. Defer additional platforms, a daemon, MCP,
+and extensive TUI styling until the everyday workflows above are dependable.
+
+## Original CLI UX review: adaptive-agent-harness
+
+The following review records the 2026-10-13 pre-UX baseline. Its findings remain
+historical evidence; current implementation status is tracked above and below.
 
 ### Findings, most user pain first
 
@@ -196,13 +320,13 @@ remain unchanged. Container installation and future registered cells need the
 broader gates below.
 
 At the review baseline, the DeepSWE/Pier and Terminal-Bench/Harbor adapters under
-`../Benchmarks/deep-swe/adapter/adaptive_harness_agent.py` and
-`../Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py` launched
-`adaptive-agent-harness run` with `--experiment`, `--contract`, `--trace-dir`,
-model budgets, and policy flags. They also inspected `run.failed` trace records
-after a nonzero process exit. Harbor used `--max-tool-iterations`; Pier
-used `--max-model-interactions`. These were concrete migration points identified
-by source review, not newly executed benchmark results.
+`~/Work/Sandbox2/Benchmarks/deep-swe/adapter/adaptive_harness_agent.py` and
+`~/Work/Sandbox2/Benchmarks/terminal-bench-2.1/adapter/adaptive_harness_agent.py`
+launched `adaptive-agent-harness run` with `--experiment`, `--contract`,
+`--trace-dir`, model budgets, and policy flags. They also inspected `run.failed`
+trace records after a nonzero process exit. Harbor used `--max-tool-iterations`;
+Pier used `--max-model-interactions`. These were concrete migration points
+identified by source review, not newly executed benchmark results.
 
 - [x] **Separate benchmark task mode from conversation UX.** Add
   `microgentic benchmark run` and `benchmark run-sequential` with file contracts,
@@ -264,6 +388,10 @@ by source review, not newly executed benchmark results.
   show explicit per-run overrides and reject unsupported effort choices. Use a
   credential store or environment reference; mask secrets in output and
   diagnostics.
+- [x] **Save the initial everyday defaults.** Setup reviews/saves provider,
+  model, and effort; TUI and ordinary `run` read those defaults. Endpoints and
+  credentials remain environment settings. Connectivity and model discovery
+  are still pending.
 - [ ] **Establish the support matrix.** Retain oMLX and Ollama first. Assess the
   OpenAI gateway in the pinned Mojentic dependency as the next integration.
   Treat custom OpenAI-compatible endpoints as separately tested profiles;
@@ -546,11 +674,15 @@ alias mg=microgentic
 
 Use `microgentic` in official examples and automation so they work independently
 of a user's aliases. The Cargo package and primary executable now use the chosen
-name, with the old executable retained for compatibility. Package/repository and
-brand/domain availability checks remain release preparation work. Preserved CLI
-review evidence keeps its original names.
+name, with the old executable retained for compatibility. The upstream is now
+`svetzal/microgentic`; v0.1.0 is published through `svetzal/tap`. Brand/domain
+availability remains separate preparation work. Preserved CLI review evidence
+keeps its original names.
 
 ## First implementation slices and release gate
+
+The sequence below records the initial plan. Use the post-v0.1.0 priorities above
+for the next product work. The remaining usability gate still applies.
 
 1. **Command/session contract:** project root, intake, permission semantics,
    typed outcomes, shell composition, output channels, and adapter migration.
