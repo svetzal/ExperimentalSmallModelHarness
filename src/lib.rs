@@ -5,6 +5,7 @@ pub mod agent;
 pub mod baseline;
 pub mod cli;
 pub mod contract;
+mod conversation;
 pub mod initial_context;
 pub mod preferences;
 pub mod profile;

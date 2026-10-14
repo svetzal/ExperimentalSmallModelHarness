@@ -5,16 +5,24 @@ use serde_json::{Value, json};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct TraceRecorder {
     path: PathBuf,
     file: Mutex<File>,
+    conversation: Option<Arc<crate::conversation::ConversationRun>>,
 }
 
 impl TraceRecorder {
     pub fn create(dir: &Path) -> Result<Self> {
+        Self::create_for_conversation(dir, None)
+    }
+
+    pub(crate) fn create_for_conversation(
+        dir: &Path,
+        conversation: Option<Arc<crate::conversation::ConversationRun>>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating trace directory {}", dir.display()))?;
         let filename = format!("run-{}.jsonl", Utc::now().format("%Y%m%dT%H%M%SZ"));
@@ -27,6 +35,7 @@ impl TraceRecorder {
         Ok(Self {
             path,
             file: Mutex::new(file),
+            conversation,
         })
     }
 
@@ -40,6 +49,11 @@ impl TraceRecorder {
     }
 
     pub fn value_event(&self, kind: &str, mut payload: Value) -> Result<()> {
+        if kind == "llm.context_assembly.ledger"
+            && let Some(conversation) = &self.conversation
+        {
+            conversation.label_ledger(&mut payload);
+        }
         let credential_redacted =
             crate::recovery::redact_value(&mut payload, &crate::recovery::credentials());
         let record = TraceEvent {
@@ -53,7 +67,31 @@ impl TraceRecorder {
         serde_json::to_writer(&mut *file, &record)?;
         file.write_all(b"\n")?;
         file.flush()?;
+        if let Some(conversation) = &self.conversation {
+            conversation.observe(kind, &record.payload);
+        }
         Ok(())
+    }
+
+    pub(crate) fn conversation_checkpoint(&self, messages: &[mojentic::llm::models::LlmMessage]) {
+        if let Some(conversation) = &self.conversation {
+            conversation.checkpoint(messages);
+        }
+    }
+
+    pub(crate) fn reply_started(&self) {
+        if let Some(conversation) = &self.conversation {
+            conversation.emit(crate::conversation::ConversationEvent::ReplyStarted);
+        }
+    }
+
+    pub(crate) fn stream_content(&self, text: &str) {
+        if let Some(conversation) = &self.conversation {
+            conversation
+                .emit(crate::conversation::ConversationEvent::Content { text: text.into() });
+        } else {
+            eprint!("{text}");
+        }
     }
 }
 

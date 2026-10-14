@@ -480,6 +480,15 @@ enum Command {
     /// Run a prompt from stdin or --prompt using the existing runtime. [Mutates]
     Run(RunArgs),
 
+    /// Internal isolated worker for the terminal conversation.
+    #[command(hide = true)]
+    ConversationWorker {
+        #[command(flatten)]
+        run: RunArgs,
+        #[arg(long)]
+        session_state: PathBuf,
+    },
+
     /// Run bounded natural attempts on one retained worker artifact.
     RunSequential {
         #[command(flatten)]
@@ -701,6 +710,19 @@ async fn dispatch(legacy: bool) -> Result<()> {
                 summary.final_summary
             };
             writeln!(std::io::stdout().lock(), "{output}")?;
+        }
+        Command::ConversationWorker { run, session_state } => {
+            if run.experiment.is_some() || run.goal.is_some() || run.contract.is_some() {
+                bail!("conversation workers cannot accept benchmark contracts or experiments");
+            }
+            let prompt = run
+                .prompt
+                .clone()
+                .context("conversation worker requires --prompt")?;
+            let session_state = absolute(&session_state)?;
+            // The TUI already resolved and sealed its settings at session entry.
+            let config = prepare_run(run, cli.config.as_deref(), true)?;
+            crate::conversation::run_worker(config, prompt, session_state).await?;
         }
         Command::RunSequential {
             run,

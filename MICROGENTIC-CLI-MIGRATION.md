@@ -2,6 +2,10 @@
 
 Date: 2026-10-13. Baseline source: `bfe3529`.
 
+This note records the initial implementation committed as `84b6fe4`. The later
+[TUI conversation slice](MICROGENTIC-CONVERSATION.md) adds retained native history
+and streamed presentation; the independent-task limitation below is historical.
+
 ## Scope and decision
 
 Implement the Microgentic name and initial everyday grammar around the existing

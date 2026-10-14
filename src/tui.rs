@@ -1,4 +1,5 @@
-//! Small terminal front end. Each request invokes the unchanged public run path.
+//! Terminal conversation with native history and a live worker event stream.
+use crate::conversation::ConversationEvent;
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -18,6 +19,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthChar;
 
@@ -42,6 +45,10 @@ struct ActiveRun {
     started: Instant,
     cancelled: bool,
     result: JoinHandle<std::io::Result<Output>>,
+    events: UnboundedReceiver<ConversationEvent>,
+    activity: String,
+    streamed_text: String,
+    terminal_reported: bool,
 }
 
 #[derive(Default)]
@@ -145,11 +152,12 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
         requested_exit.store(true, Ordering::Relaxed);
     });
     let mut view = View {
-        history: "Give Microgentic a coding task. Each task runs independently; previous messages are shown for reference.\nTasks can edit files and execute project commands.\nConfigure defaults with microgentic setup outside this view.\n".into(),
+        history: "Give Microgentic a coding task, then follow up in this conversation.\nTasks can edit files and execute project commands.\nConfigure defaults with microgentic setup outside this view.\n".into(),
         status: "Ready".into(),
         ..View::default()
     };
     let mut active: Option<ActiveRun> = None;
+    let mut session_state = None;
     let mut last_draw = None;
     let outcome: Result<()> = async {
         loop {
@@ -162,25 +170,25 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                     break;
                 }
             }
+            if let Some(run) = &mut active {
+                while let Ok(event) = run.events.try_recv() {
+                    apply_event(&mut view, run, event);
+                }
+            }
             if active.as_ref().is_some_and(|run| run.result.is_finished()) {
                 let run = active.take().expect("completed run exists");
                 match run.result.await.context("waiting for agent run")? {
-                    Ok(output) if output.status.success() => {
-                        let summary: serde_json::Value = serde_json::from_slice(&output.stdout)
-                            .context("decoding agent result")?;
-                        view.history.push_str(&format!(
-                            "\nMicrogentic: {}\nEvidence: {}\n",
-                            summary["final_summary"].as_str().unwrap_or("No summary"),
-                            summary["trace_file"].as_str().unwrap_or("unknown")
-                        ));
-                        view.status = "Finished. Enter another task or Esc to quit.".into();
+                    Ok(output) if output.status.success() && run.terminal_reported => {
+                        view.status = "Ready for your next message. Esc to quit.".into();
                     }
                     Ok(output) => {
-                        view.history.push_str(&format!(
-                            "\nRun error: {}\n",
-                            String::from_utf8_lossy(&output.stderr)
-                        ));
-                        view.status = "Stopped; see the error above.".into();
+                        if !run.terminal_reported {
+                            view.history.push_str(&format!(
+                                "\n[Request stopped; any unfinished reply is incomplete]\nRun error: {}\n",
+                                String::from_utf8_lossy(&output.stderr)
+                            ));
+                        }
+                        view.status = "Stopped. You can follow up or Esc to quit.".into();
                     }
                     Err(error) => {
                         view.history.push_str(&format!("\nRun error: {error}\n"));
@@ -191,11 +199,11 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
             }
             if let Some(run) = &active {
                 view.status = format!(
-                    "{} · {}s elapsed · Ctrl-C to cancel",
+                    "{} · {}s · Ctrl-C to cancel",
                     if run.cancelled {
                         "Cancellation requested"
                     } else {
-                        "Working"
+                        &run.activity
                     },
                     run.started.elapsed().as_secs()
                 );
@@ -216,7 +224,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 continue;
             }
             match event::read()? {
-                Event::Paste(text) if active.is_none() => view
+                Event::Paste(text) => view
                     .input
                     .extend(text.chars().filter(|ch| !ch.is_control() || *ch == '\n')),
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
@@ -237,7 +245,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                     KeyCode::PageUp => view.scroll = view.scroll.saturating_add(8),
                     KeyCode::PageDown => view.scroll = view.scroll.saturating_sub(8),
                     KeyCode::Enter
-                        if active.is_none() && key.modifiers.contains(KeyModifiers::ALT) =>
+                        if key.modifiers.contains(KeyModifiers::ALT) =>
                     {
                         view.input.push('\n')
                     }
@@ -246,10 +254,13 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                         view.history.push_str(&format!("\nYou: {prompt}\n"));
                         view.scroll = 0;
                         let mut command = tokio::process::Command::new(std::env::current_exe()?);
+                        let state = match &session_state {
+                            Some(state) => state,
+                            None => session_state.insert(create_session(&root)?),
+                        };
                         command
-                            .arg("--config")
-                            .arg(&path)
-                            .args(["run", "--prompt", &prompt, "--json"])
+                            .args(["conversation-worker", "--prompt", &prompt, "--session-state"])
+                            .arg(state)
                             .args([
                                 "--provider",
                                 prefs.provider.as_str(),
@@ -264,12 +275,31 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                             command.args(["--reasoning-effort", effort]);
                         }
                         match command.spawn() {
-                            Ok(child) => {
+                            Ok(mut child) => {
+                                let (sender, events) = unbounded_channel();
+                                let stdout = child.stdout.take().context("opening worker stream")?;
+                                let reader = tokio::spawn(async move {
+                                    let mut lines = BufReader::new(stdout).lines();
+                                    while let Some(line) = lines.next_line().await? {
+                                        let event = serde_json::from_str(&line).map_err(std::io::Error::other)?;
+                                        let _ = sender.send(event);
+                                    }
+                                    Ok::<_, std::io::Error>(())
+                                });
+                                let pid = child.id();
                                 active = Some(ActiveRun {
-                                    pid: child.id(),
+                                    pid,
                                     started: Instant::now(),
                                     cancelled: false,
-                                    result: tokio::spawn(child.wait_with_output()),
+                                    result: tokio::spawn(async move {
+                                        let output = child.wait_with_output().await?;
+                                        reader.await.map_err(std::io::Error::other)??;
+                                        Ok(output)
+                                    }),
+                                    events,
+                                    activity: "Working".into(),
+                                    streamed_text: String::new(),
+                                    terminal_reported: false,
                                 })
                             }
                             Err(error) => view
@@ -277,12 +307,11 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                                 .push_str(&format!("\nCould not start run: {error}\n")),
                         }
                     }
-                    KeyCode::Backspace if active.is_none() => {
+                    KeyCode::Backspace => {
                         view.input.pop();
                     }
                     KeyCode::Char(ch)
-                        if active.is_none()
-                            && !key
+                        if !key
                                 .modifiers
                                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                     {
@@ -303,6 +332,68 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
         let _ = run.result.await;
     }
     outcome
+}
+
+fn create_session(root: &std::path::Path) -> Result<PathBuf> {
+    let state = crate::preferences::state_root()?;
+    std::fs::create_dir_all(&state)?;
+    if state.canonicalize()?.starts_with(root) {
+        anyhow::bail!(
+            "Microgentic state must be outside the project; set XDG_STATE_HOME to another directory"
+        );
+    }
+    Ok(tempfile::Builder::new()
+        .prefix("session-")
+        .tempdir_in(state)?
+        .keep()
+        .join("conversation.json"))
+}
+
+fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
+    match event {
+        ConversationEvent::ReplyStarted => {
+            view.history.push_str("\nMicrogentic: ");
+            if !run.streamed_text.is_empty() && !run.streamed_text.ends_with('\n') {
+                run.streamed_text.push('\n');
+            }
+            run.activity = "Waiting for response".into();
+        }
+        ConversationEvent::Content { text } => {
+            view.history.push_str(&text);
+            run.streamed_text.push_str(&text);
+            run.activity = "Replying".into();
+        }
+        ConversationEvent::Activity { message } => {
+            if message.starts_with("Using ")
+                || message.ends_with("finished")
+                || message.ends_with("reported an error")
+                || message.starts_with("Context shortened")
+            {
+                view.history.push_str(&format!("\n  {message}\n"));
+            }
+            run.activity = message;
+        }
+        ConversationEvent::Finished { summary } => {
+            let final_summary = summary["final_summary"].as_str().unwrap_or("No summary");
+            if run.streamed_text.is_empty() || !run.streamed_text.contains(final_summary) {
+                view.history
+                    .push_str(&format!("\nResult: {final_summary}\n"));
+            }
+            view.history.push_str(&format!(
+                "\nEvidence: {}\n",
+                summary["trace_file"].as_str().unwrap_or("unknown")
+            ));
+            view.status = "Ready for your next message. Esc to quit.".into();
+            run.terminal_reported = true;
+        }
+        ConversationEvent::Failed { message } => {
+            view.history.push_str(&format!(
+                "\n[Request stopped; unfinished reply is incomplete]\n{message}\n"
+            ));
+            view.status = "Stopped. You can follow up or Esc to quit.".into();
+            run.terminal_reported = true;
+        }
+    }
 }
 
 fn interrupt(run: &mut ActiveRun) {

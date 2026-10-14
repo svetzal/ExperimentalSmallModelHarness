@@ -28,6 +28,14 @@ contracts instead of inheriting personal setup defaults. Prove migration fidelit
 with provider requests after tool feedback, not only matching option names.
 See `MICROGENTIC-CLI-MIGRATION.md` for the implementation boundary and checks.
 
+Conversation continuity retains native user, assistant, and tool history, while
+each request resolves fresh task authority and validation state. Never replay old
+system/probe/repair instructions as new task policy or incomplete streams as
+completed responses. Repair pruning must protect the current user task as well as
+earlier conversation prompts. Stream presentation observes the existing runtime;
+benchmark entry points never load ambient conversation history. The deterministic
+boundary checks are in `MICROGENTIC-CONVERSATION.md`.
+
 ## Responsibilities
 
 The harness maintains goals, acceptance criteria, budgets, and stopping rules.

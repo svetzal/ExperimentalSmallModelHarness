@@ -285,6 +285,20 @@ pub fn default_repair_exit_thinking_tokens() -> usize {
 }
 
 pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
+    run_agent_entry(config, None).await
+}
+
+pub(crate) async fn run_agent_in_conversation(
+    config: AgentRunConfig,
+    conversation: Arc<crate::conversation::ConversationRun>,
+) -> Result<AgentRunSummary> {
+    run_agent_entry(config, Some(conversation)).await
+}
+
+async fn run_agent_entry(
+    config: AgentRunConfig,
+    conversation: Option<Arc<crate::conversation::ConversationRun>>,
+) -> Result<AgentRunSummary> {
     let tool_root = PathBuf::from(".")
         .canonicalize()
         .context("canonicalizing harness cwd")?;
@@ -318,9 +332,14 @@ pub async fn run_agent(config: AgentRunConfig) -> Result<AgentRunSummary> {
             evidence.clone(),
         )?),
     };
-    let result =
-        run_agent_with_gateway_inner(config, gateway.as_ref(), tool_root, Some(evidence.clone()))
-            .await;
+    let result = run_agent_with_gateway_inner(
+        config,
+        gateway.as_ref(),
+        tool_root,
+        Some(evidence.clone()),
+        conversation,
+    )
+    .await;
     let settled = evidence.settle().await;
     signal.abort();
     match result {
@@ -361,7 +380,7 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     gateway: &G,
     tool_root: PathBuf,
 ) -> Result<AgentRunSummary> {
-    run_agent_with_gateway_inner(config, gateway, tool_root, None).await
+    run_agent_with_gateway_inner(config, gateway, tool_root, None, None).await
 }
 
 async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
@@ -369,6 +388,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     gateway: &G,
     tool_root: PathBuf,
     recovery_evidence: Option<Arc<crate::recovery::Evidence>>,
+    conversation: Option<Arc<crate::conversation::ConversationRun>>,
 ) -> Result<AgentRunSummary> {
     let mut completion_config = agent_completion_config(
         config.max_model_interactions,
@@ -431,7 +451,29 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         .trace_dir
         .clone()
         .unwrap_or_else(|| experiment_dir.join("traces"));
-    let trace = Arc::new(TraceRecorder::create(&trace_dir)?);
+    let trace = Arc::new(TraceRecorder::create_for_conversation(
+        &trace_dir,
+        conversation.clone(),
+    )?);
+    if let Some(session) = &conversation {
+        trace.event(
+            "session.context.retained",
+            serde_json::json!({
+                "protected_user_messages": session.protected_users(),
+                "omitted_oldest_exchanges": session.omitted_exchanges,
+                "scope": "tui-conversation",
+                "task_policy": "fresh-per-request",
+            }),
+        )?;
+        if session.omitted_exchanges > 0 {
+            session.emit(crate::conversation::ConversationEvent::Activity {
+                message: format!(
+                    "Context shortened: {} oldest exchanges omitted",
+                    session.omitted_exchanges
+                ),
+            });
+        }
+    }
     if let Some(evidence) = recovery_evidence {
         evidence.bind(trace.clone());
     }
@@ -712,10 +754,18 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             }),
         )?;
     }
-    let mut messages = vec![
-        LlmMessage::system(system_prompt),
-        LlmMessage::user(worker_message),
-    ];
+    let protected_users = conversation
+        .as_ref()
+        .map_or(1, |session| session.protected_users());
+    let mut messages = if let Some(session) = &conversation {
+        session.initial_messages(system_prompt, worker_message)
+    } else {
+        vec![
+            LlmMessage::system(system_prompt),
+            LlmMessage::user(worker_message),
+        ]
+    };
+    trace.conversation_checkpoint(&messages);
 
     let mut final_summary = String::new();
     let mut final_response_only_next_turn = false;
@@ -887,7 +937,11 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             }
         }
         messages = turn_result.messages;
-        let consumed_reasoning_checkpoints = remove_prior_reasoning_checkpoints(&mut messages);
+        let consumed_reasoning_checkpoints = if conversation.is_some() {
+            remove_prior_reasoning_checkpoints_preserving(&mut messages, protected_users)
+        } else {
+            remove_prior_reasoning_checkpoints(&mut messages)
+        };
         trace.event(
             "agent.turn.finished",
             serde_json::json!({
@@ -1042,7 +1096,8 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         }
         if authoritative_constrained_handoff {
             authoritative_constrained_repair_active = true;
-            let removed_user_messages = prune_superseded_agent_loop_guidance(&mut messages);
+            let removed_user_messages =
+                prune_superseded_agent_loop_guidance(&mut messages, protected_users);
             trace.event(
                 "agent.validation.constrained_handoff_context_pruned",
                 serde_json::json!({
@@ -1482,6 +1537,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         harness_source_state,
     };
     trace.event("run.finished", &summary)?;
+    trace.conversation_checkpoint(&messages);
     Ok(summary)
 }
 
@@ -2294,6 +2350,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             repair_exit_thinking_tokens,
             validation_repair_active,
         })?;
+        trace.reply_started();
         let mut stream = gateway.complete_stream(
             model,
             &current_messages,
@@ -2399,7 +2456,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                             "preview": limit_preview(&chunk, 120),
                         }),
                     )?;
-                    eprint!("{}", chunk);
+                    trace.stream_content(&chunk);
                 }
                 Ok(StreamChunk::ToolCalls(tool_calls)) => {
                     last_observable_progress = Instant::now();
@@ -2724,6 +2781,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     (!call_reasoning.is_empty()).then_some(call_reasoning);
                 current_messages.push(assistant);
             }
+            trace.conversation_checkpoint(&current_messages);
             trace.event(
                 "agent.stream.finished",
                 serde_json::json!({
@@ -2898,6 +2956,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 requested_validation_pending_after_write = false;
             }
         }
+        trace.conversation_checkpoint(&current_messages);
         coalesce_retained_file_observations(
             &mut current_messages,
             trace,
@@ -2914,6 +2973,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             transcript_policy,
             context_window_tokens,
         )?;
+        trace.conversation_checkpoint(&current_messages);
         if constrained_repair_handoff_required {
             trace.event(
                 "agent.validation.constrained_handoff_started",
@@ -2951,15 +3011,18 @@ fn tool_result_requires_repair(result: &ToolCallRunResult) -> bool {
         .is_some_and(|repair| !repair.is_null())
 }
 
-fn prune_superseded_agent_loop_guidance(messages: &mut Vec<LlmMessage>) -> usize {
-    let mut initial_user_retained = false;
+fn prune_superseded_agent_loop_guidance(
+    messages: &mut Vec<LlmMessage>,
+    protected_users: usize,
+) -> usize {
+    let mut users_retained = 0;
     let before = messages.len();
     messages.retain(|message| {
         if message.role != MessageRole::User {
             return true;
         }
-        if !initial_user_retained {
-            initial_user_retained = true;
+        if users_retained < protected_users {
+            users_retained += 1;
             return true;
         }
         false
@@ -5762,6 +5825,26 @@ fn remove_prior_reasoning_checkpoints(messages: &mut Vec<LlmMessage>) -> usize {
     before - messages.len()
 }
 
+fn remove_prior_reasoning_checkpoints_preserving(
+    messages: &mut Vec<LlmMessage>,
+    protected_users: usize,
+) -> usize {
+    let mut users_seen = 0;
+    let before = messages.len();
+    messages.retain(|message| {
+        if message.role != MessageRole::User {
+            return true;
+        }
+        users_seen += 1;
+        users_seen <= protected_users
+            || !message
+                .content
+                .as_deref()
+                .is_some_and(|text| text.contains(REASONING_CHECKPOINT_PREFIX))
+    });
+    before - messages.len()
+}
+
 fn action_boundary_interrupt_prompt(decision: &ActionBoundaryNoActionDecision) -> String {
     action_boundary_interrupt_prompt_text(
         &decision.interrupt,
@@ -5938,6 +6021,34 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn conversation_tasks_survive_repair_pruning_and_checkpoint_cleanup() {
+        let mut messages = vec![
+            LlmMessage::system("system"),
+            LlmMessage::user("old task"),
+            LlmMessage::assistant("old answer"),
+            LlmMessage::user("new task"),
+            LlmMessage::user("automatic repair instruction"),
+        ];
+        assert_eq!(prune_superseded_agent_loop_guidance(&mut messages, 2), 1);
+        assert_eq!(
+            messages.last().unwrap().content.as_deref(),
+            Some("new task")
+        );
+        messages[3] = LlmMessage::user(format!("Task quoting {REASONING_CHECKPOINT_PREFIX}"));
+        messages.push(LlmMessage::user(format!(
+            "{REASONING_CHECKPOINT_PREFIX} generated tail"
+        )));
+        assert_eq!(
+            remove_prior_reasoning_checkpoints_preserving(&mut messages, 2),
+            1
+        );
+        assert_eq!(messages.len(), 4);
+        // Single-run repair still keeps exactly its original first task.
+        assert_eq!(prune_superseded_agent_loop_guidance(&mut messages, 1), 1);
+        assert_eq!(messages[1].content.as_deref(), Some("old task"));
+    }
 
     #[test]
     fn throughput_lookup_isolates_providers_even_for_the_same_model() {

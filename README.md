@@ -201,9 +201,20 @@ to stdout; logs go to stderr. `--json` returns the existing full run summary.
 
 In the TUI, Enter sends a task, Alt-Enter inserts a newline, Page Up/Down scroll,
 Ctrl-C requests cancellation, and Esc exits when idle. The view shows defaults,
-elapsed time, results, and trace locations. Each task starts an independent run;
-previous displayed messages are not yet a retained conversation. Detailed live
-tool views and durable session resume remain preparation work.
+elapsed time, streamed replies, thinking status, tool activity, and trace locations.
+Follow-up prompts retain actual user messages, completed assistant responses, and
+native tool request/result pairs. You can draft your next message while a reply
+streams; Enter submits it after the current request settles.
+
+Each TUI invocation starts a new conversation, scoped to its project and resolved
+provider/model/effort. State is saved outside the project in a unique
+`session-*/conversation.json` under the run-state directory. Previous task-scoped
+system/probe/repair instructions and incomplete streamed replies are not replayed.
+Each prompt gets fresh task validation state and the existing runtime budgets.
+Older complete exchanges are omitted when retained history exceeds half the
+input allowance; the TUI and traces report the omission. Plain and benchmark
+`run` invocations never load this history. Durable resume and detailed tool
+inspection remain preparation work.
 
 Run still uses the existing editing, shell, validation, and stop policies.
 It can mutate the selected project. Preview/apply permissions, JSONL streaming,
@@ -215,7 +226,8 @@ output. Its library import remains `adaptive_agent_harness`. No `mg` executable
 or shell alias is installed. Users can opt into `alias mg=microgentic` themselves.
 
 See [CLI migration evidence](MICROGENTIC-CLI-MIGRATION.md) for deterministic
-checks and benchmark adapter changes.
+checks and benchmark adapter changes, and [TUI conversation evidence](MICROGENTIC-CONVERSATION.md)
+for continuity, streaming, cancellation, and isolation checks.
 
 List the available commands:
 

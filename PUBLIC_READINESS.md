@@ -269,6 +269,11 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
 
 ### P1: shared session engine
 
+- [x] **Retain native TUI conversation context.** Follow-ups receive prior user
+  prompts, completed assistant responses, and tool request/result pairs. Keep
+  task-scoped system/probe/repair instructions separate. Scope stored history to
+  project and model settings; new TUI invocations and benchmark runs stay isolated.
+  Bound history by dropping complete oldest exchanges and report the omissions.
 - [ ] **Create a presentation-neutral session API.** Expose typed state, events,
   commands, and outcomes to CLI and TUI. Keep provider calls, validation,
   context policy, and stop authority in the runtime. Adapt existing trace events
@@ -293,6 +298,11 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
 
 ### P1: friendly TUI
 
+- [x] **Stream the ongoing conversation.** Display full reply chunks as they
+  arrive, thinking/progress status, and tool activity through a private event seam
+  on the existing runtime. Permit drafting during generation. Forward cancellation
+  to the owned worker, retain completed context, and label unfinished replies.
+  Deterministic PTY checks cover both gateways; broader resume/steering stays below.
 - [x] **Implement launch behavior.** Bare `microgentic` opens the conversation
   TUI when stdin and stdout are terminals. `run` uses the plain interface even
   on a terminal. Missing prompts and redirected bare invocations return clear
