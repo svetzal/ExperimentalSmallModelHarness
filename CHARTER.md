@@ -1,6 +1,12 @@
-# Charter for the adaptive agent harness
+# Microgentic charter
 
 ## Purpose
+
+Microgentic's primary development checkout is `~/Work/Projects/Personal/microgentic`.
+The upstream repository is `svetzal/microgentic`. Keep `~/Work/Sandbox2/Harness`
+as a separate benchmark integration clone. General-purpose product development
+can proceed independently of registered experiments; preserve their pinned evidence.
+Versioned releases and Homebrew packages follow `RELEASING.md`.
 
 This Rust application studies how an adaptive harness can make smaller local
 models useful. It changes the size, context, validation, and feedback of work

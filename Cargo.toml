@@ -2,10 +2,11 @@
 name = "microgentic"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 default-run = "microgentic"
 description = "An adaptive coding agent optimized for small models"
 license = "MIT"
-repository = "https://github.com/svetzal/ExperimentalSmallModelHarness"
+repository = "https://github.com/svetzal/microgentic"
 
 # Keep the library import and historical executable during the migration.
 [lib]

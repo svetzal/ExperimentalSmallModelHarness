@@ -379,17 +379,23 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
 - [ ] **Ship completions and a companion skill.** Supply completions through
   setup. Provide `init` for globally scoped guidance, with `--local` for project
   scope and concrete installation previews. Use shared install infrastructure.
-- [ ] **Package a standalone product.** Set Cargo metadata and minimum Rust
-  version, use a suitable released Mojentic dependency, declare platform support,
-  and publish versioned packages with checksums. Embed version/revision provenance;
-  installed binaries cannot rely on the build machine's Git checkout through
-  `CARGO_MANIFEST_DIR`.
+- [x] **Promote the project home.** Rename the upstream to `svetzal/microgentic`.
+  Use `~/Work/Projects/Personal/microgentic` for product development and keep
+  `~/Work/Sandbox2/Harness` as a separate benchmark integration clone.
+- [x] **Add the initial release pipeline.** Build and test versioned packages
+  for Apple Silicon, Intel Mac, and Linux x86-64. Embed source revision provenance,
+  preserve binary and archive checksums, and check a copied executable while its
+  source checkout is unavailable. Publish through `svetzal/tap`; see `RELEASING.md`.
+- [ ] **Complete standalone packaging.** Move from the locked Mojentic Git
+  revision to a compatible released dependency after gateway checks pass.
+  Expand packages to Windows and Linux ARM through native platform gates.
 - [ ] **Document the lifecycle.** Cover install, first task, provider switch,
   change review, interruption/resume, troubleshooting, and uninstall. Add
   contribution, issue, security-reporting, and compatibility policies.
-- [ ] **Automate release checks.** Add CI for formatting, tests, lint, CLI
+- [x] **Automate initial release checks.** Add CI for formatting, tests, lint, CLI
   contracts, gateway mocks, packaging, and terminal lifecycle. Test the installed
-  artifact on a clean machine and name unsupported platforms openly.
+  artifact on native runners and name unsupported platforms openly. Additional
+  gateway packaging and compatibility expansion remain preparation work.
 
 ### P2: extensions after a usable alpha
 

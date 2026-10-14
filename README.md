@@ -4,6 +4,34 @@ An adaptive coding agent optimized for small models that need extra help staying
 on task. Microgentic provides a small terminal interface over an experimental
 runtime for inspecting, editing, validating, and repairing scoped artifacts.
 
+## Install and start
+
+```sh
+brew install svetzal/tap/microgentic
+microgentic setup --apply
+microgentic
+```
+
+Run an oMLX or Ollama server before sending your first message. Setup lets you
+select the provider, model, and effort level. It makes no provider request.
+The TUI opens a conversation in your current project; ask for work when ready.
+
+For a single prompt, use the normal shell input and output channels:
+
+```sh
+echo 'Explain this project' | microgentic run
+microgentic run --prompt 'Review this diff' < changes.diff > review.txt
+```
+
+Version `0.1.0` packages support Apple Silicon and Intel Macs on macOS 15 or later,
+and Linux x86-64 with glibc 2.35 or later. Downloadable binaries and checksums are
+available from [GitHub Releases](https://github.com/svetzal/microgentic/releases).
+The Homebrew package also includes the compatibility executable. `mg` remains
+an optional shell alias; no `mg` command is installed.
+
+Uninstall with `brew uninstall microgentic`. Configuration and traces remain in
+their documented XDG locations for future upgrades or reinstalls.
+
 The harness is built in Rust on top of
 [Mojentic](https://github.com/svetzal/mojentic-ru). It emphasizes deterministic
 validation, strict workspace boundaries, traceable runtime decisions, and
@@ -13,9 +41,9 @@ runtime generalizes beyond one task or domain.
 
 ## Status
 
-This is a research project under active development, not a stable library or
-production service. Runtime policies, contracts, trace schemas, and command-line
-interfaces may change as experiments reveal better boundaries.
+Microgentic is an early release under active development. Runtime policies,
+contracts, trace schemas, and command-line interfaces may change as experiments
+reveal better boundaries.
 
 The [Microgentic public CLI readiness checklist](PUBLIC_READINESS.md) records
 preparation for an adaptive coding agent optimized for small models, with a
@@ -25,6 +53,8 @@ to the user-focused control surface.
 
 ## Capabilities
 
+- Ongoing terminal conversations with streamed replies and retained context
+- Provider setup and prompt runs through stdin or `--prompt`
 - Typed run contracts for scope, guidance, probes, budgets, and terminal rules
 - Scoped filesystem and tool execution
 - Mutation-aware validation freshness
@@ -37,9 +67,10 @@ to the user-focused control surface.
 
 ## Requirements
 
-- Rust with Cargo and support for the 2024 edition
-- An oMLX or Ollama server with a Qwen model installed
-- Network access for Cargo to fetch the Git-pinned Mojentic prototype
+- An oMLX or Ollama server with a model installed; Qwen models are the benchmark
+  defaults
+- For source builds: Rust 1.99 or later and network access for the locked Mojentic
+  Git dependency
 
 ## Provider configuration
 

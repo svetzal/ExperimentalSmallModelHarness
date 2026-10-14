@@ -69,6 +69,9 @@ def exercise(provider):
     host = f"http://127.0.0.1:{server.server_port}"
     env = dict(os.environ, TERM="xterm-256color", XDG_STATE_HOME=str(state),
                OMLX_HOST=host, OLLAMA_HOST=host, OMLX_API_KEY="test-key")
+    # The generated fixture must build inside its own project, independently
+    # of the harness's optional shared Cargo cache directory.
+    env.pop("CARGO_TARGET_DIR", None)
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 200, 0, 0))

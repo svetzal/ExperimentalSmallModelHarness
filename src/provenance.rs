@@ -21,19 +21,18 @@ use serde::{Deserialize, Serialize};
 /// For experiment consumers comparing evidence across harness versions:
 ///
 /// - `git_head` is `Some(<40-hex commit sha>)` when the harness manifest
-///   directory is a git checkout and `git rev-parse HEAD` succeeds. It is
-///   `None` when git is unavailable or the manifest directory is not a git
-///   checkout (a released binary or a shallow copy, for example) — this is a
-///   deterministic "we don't know", not an error.
+///   directory is a git checkout and `git rev-parse HEAD` succeeds.
+///   Release packages embed their checked-out revision at build time and do
+///   not inspect the build machine's checkout at runtime. For development
+///   builds it is `None` when Git or the manifest checkout is unavailable.
 /// - `git_dirty` is `Some(true)` when `git status --short` reports any
 ///   pending changes, `Some(false)` when the checkout is clean, and `None`
 ///   under the same unavailability conditions as `git_head`. A run recorded
 ///   with `git_dirty: Some(true)` was produced by a working tree that does
 ///   not exactly match `git_head` and should be treated as provisional
 ///   evidence.
-/// - `source_state_note` is a short, fixed human-readable string
-///   ("git metadata captured" or "not a git checkout or git unavailable")
-///   that disambiguates the `None` case without requiring consumers to infer
+/// - `source_state_note` identifies live Git metadata, an embedded release
+///   revision, or unavailable checkout metadata. Consumers do not need to infer
 ///   intent from absent fields.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct HarnessSourceState {
@@ -49,14 +48,18 @@ pub struct HarnessSourceState {
     pub source_state_note: String,
 }
 
-/// Capture the current harness source state.
+/// Capture the current harness source state, or the embedded release revision.
 ///
-/// Shells out to `git` against `CARGO_MANIFEST_DIR`; any failure (git
+/// Release packages use compiled metadata. Development builds shell out to
+/// `git` against `CARGO_MANIFEST_DIR`; any failure (git
 /// missing, not a checkout, non-zero exit) deterministically yields `None`
 /// fields rather than an error, since provenance is best-effort metadata and
 /// must never fail a run.
 pub fn capture() -> HarnessSourceState {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(revision) = option_env!("MICROGENTIC_RELEASE_REVISION") {
+        return release_source_state(manifest_dir, revision);
+    }
     let git_head = std::process::Command::new("git")
         .arg("-C")
         .arg(manifest_dir)
@@ -88,9 +91,29 @@ pub fn capture() -> HarnessSourceState {
     }
 }
 
+fn release_source_state(manifest_dir: &Path, revision: &str) -> HarnessSourceState {
+    HarnessSourceState {
+        manifest_dir: manifest_dir.display().to_string(),
+        git_head: Some(revision.to_string()),
+        git_dirty: Some(false),
+        source_state_note: "release revision embedded at build time".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_provenance_survives_an_absent_build_checkout() {
+        let state = release_source_state(Path::new("/nonexistent/build/checkout"), &"b".repeat(40));
+        assert_eq!(state.git_head, Some("b".repeat(40)));
+        assert_eq!(state.git_dirty, Some(false));
+        assert_eq!(
+            state.source_state_note,
+            "release revision embedded at build time"
+        );
+    }
 
     #[test]
     fn captures_a_deterministic_note_for_the_current_checkout() {
