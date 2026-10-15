@@ -300,3 +300,22 @@ fn tui_wraps_replies_at_words_and_keeps_their_indentation() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn calculate_answers_batches_and_stays_out_of_benchmark_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/calculator_tool.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_microgentic"))
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -39,6 +39,8 @@ pub(super) struct ToolLine {
     pub(super) name: String,
     pub(super) summary: String,
     pub(super) state: CallState,
+    /// A short result shown after the summary, such as `= 1340`.
+    pub(super) result: Option<String>,
 }
 
 impl ToolLine {
@@ -48,6 +50,7 @@ impl ToolLine {
             name: name.to_owned(),
             summary: summarize(name, arguments),
             state: CallState::Running,
+            result: None,
         }
     }
 
@@ -83,6 +86,9 @@ impl ToolLine {
         if !self.summary.is_empty() {
             out.push(Role::Muted, &format!(" {}", self.summary));
         }
+        if let Some(result) = &self.result {
+            out.push(Role::Plain, &format!(" {result}"));
+        }
         if self.state == CallState::Stopped {
             out.push(Role::Muted, " · stopped");
         }
@@ -106,6 +112,7 @@ fn presenter(name: &str) -> Presenter {
         "shell_command" => shell_command,
         "execute_probe" => execute_probe,
         "submit_acceptance_evidence" => submit_acceptance_evidence,
+        "calculate" => calculate,
         _ => generic,
     }
 }
@@ -218,6 +225,45 @@ fn shell_command(arguments: &Value) -> String {
         summary.push_str(&format!(" (in {})", elide_start(cwd, PATH_CELLS / 2)));
     }
     summary
+}
+
+/// The first expression, and how many more a batch holds.
+fn calculate(arguments: &Value) -> String {
+    let expressions = calculate_expressions(text(arguments, "expression").unwrap_or_default());
+    match expressions.as_slice() {
+        [] => String::new(),
+        [only] => one_line(only, TEXT_CELLS),
+        [first, rest @ ..] => format!("{} +{} more", one_line(first, TEXT_CELLS), rest.len()),
+    }
+}
+
+fn calculate_expressions(input: &str) -> Vec<&str> {
+    input
+        .split(['\n', ';'])
+        .map(str::trim)
+        .filter(|expression| !expression.is_empty())
+        .collect()
+}
+
+/// Whether a tool works on the project, so its use earns the evidence footer.
+pub(super) fn touches_project(name: &str) -> bool {
+    name != "calculate"
+}
+
+/// A short result to show after a finished call, chosen per tool. Only a
+/// single calculation shows its value; a batch keeps its `+N more`.
+pub(super) fn result_note(name: &str, ok: bool, preview: &str) -> Option<String> {
+    if name != "calculate" || !ok {
+        return None;
+    }
+    let value: Value = serde_json::from_str(preview).ok()?;
+    match value["results"].as_array()?.as_slice() {
+        [only] => {
+            let (_, result) = only.as_str()?.rsplit_once(" = ")?;
+            Some(format!("= {}", one_line(result, VALUE_CELLS)))
+        }
+        _ => None,
+    }
 }
 
 fn execute_probe(arguments: &Value) -> String {
@@ -487,6 +533,40 @@ mod tests {
         let long = summarize("shell_command", &json!({"command": "echo ".repeat(40)}));
         assert!(long.ends_with('…') && long.starts_with("echo echo"));
         assert_eq!(cells(&long), TEXT_CELLS);
+    }
+
+    #[test]
+    fn calculations_show_the_expression_and_a_single_result() {
+        assert_eq!(
+            summarize("calculate", &json!({"expression": "1474 / 1.1"})),
+            "1474 / 1.1"
+        );
+        assert_eq!(
+            summarize(
+                "calculate",
+                &json!({"expression": "140+90+70\n1474/1.1; 2^10"})
+            ),
+            "140+90+70 +2 more"
+        );
+        assert_eq!(summarize("calculate", &json!({})), "");
+        let single = json!({"results": ["1474 / 1.1 = 1340"]}).to_string();
+        assert_eq!(
+            result_note("calculate", true, &single).as_deref(),
+            Some("= 1340")
+        );
+        let batch = json!({"results": ["1 + 1 = 2", "2 * 3 = 6"]}).to_string();
+        assert_eq!(result_note("calculate", true, &batch), None);
+        assert_eq!(result_note("calculate", false, "{\"error\": \"x\"}"), None);
+        assert_eq!(result_note("read_file", true, &single), None);
+        assert_eq!(
+            result_note("calculate", true, "{\"results\": [\"trunc"),
+            None
+        );
+        let mut line = ToolLine::started("c1", "calculate", &json!({"expression": "1474 / 1.1"}));
+        line.state = CallState::Succeeded;
+        line.result = result_note("calculate", true, &single);
+        assert_eq!(rendered(&line, 0).0, "  ✓ calculate 1474 / 1.1 = 1340\n");
+        assert!(!touches_project("calculate") && touches_project("read_file"));
     }
 
     #[test]

@@ -202,7 +202,12 @@ def exercise(provider):
         assert "copperfern" not in json.dumps(requests[5]["messages"])
         for control in (["temperature", "max_tokens"] if provider == "omlx" else ["options", "think"]):
             assert requests[0].get(control) == requests[5].get(control), control
-        assert requests[0]["tools"] == requests[5]["tools"]
+        conversation_tools = requests[0]["tools"]
+        if Path(binary).name == "adaptive-agent-harness":
+            # The compatibility executable's run keeps its historical tool set;
+            # only everyday runs and conversations add calculate.
+            conversation_tools = [t for t in conversation_tools if t["function"]["name"] != "calculate"]
+        assert conversation_tools == requests[5]["tools"]
 
         # Opening a second TUI starts a new conversation, never auto-resumes.
         os.close(master)

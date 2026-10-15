@@ -153,7 +153,19 @@ impl History {
 
     /// Resolve the matching running call in place. Calls may finish in any
     /// order; a report with no matching call is ignored.
+    #[cfg(test)]
     pub(super) fn finish_tool(&mut self, call_id: &str, name: &str, ok: bool) {
+        self.finish_tool_with_result(call_id, name, ok, None);
+    }
+
+    /// Resolve a call and attach a short result its presenter chose to show.
+    pub(super) fn finish_tool_with_result(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        ok: bool,
+        result: Option<String>,
+    ) {
         let running = self.entries.iter_mut().find_map(|entry| match entry {
             Entry::Tool(line) if line.answers(call_id, name) => Some(line),
             _ => None,
@@ -164,6 +176,7 @@ impl History {
             } else {
                 CallState::Failed
             };
+            line.result = result;
             self.revision += 1;
         }
     }

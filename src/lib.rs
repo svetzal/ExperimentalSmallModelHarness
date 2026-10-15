@@ -3,6 +3,7 @@ pub mod acceptance_ledger;
 pub mod acceptance_plan;
 pub mod agent;
 pub mod baseline;
+pub mod calculator;
 pub mod cli;
 pub mod contract;
 mod conversation;

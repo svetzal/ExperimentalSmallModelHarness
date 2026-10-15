@@ -95,6 +95,19 @@ impl TraceRecorder {
         }
     }
 
+    /// Report a finished tool call, with the start of its result, to an open
+    /// conversation view.
+    pub(crate) fn tool_finished(
+        &self,
+        call: &mojentic::llm::models::LlmToolCall,
+        ok: bool,
+        content: &str,
+    ) {
+        if let Some(conversation) = &self.conversation {
+            conversation.tool_finished(call, ok, content);
+        }
+    }
+
     pub(crate) fn is_conversation(&self) -> bool {
         self.conversation.is_some()
     }

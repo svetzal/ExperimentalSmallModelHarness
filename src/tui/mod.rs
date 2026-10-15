@@ -42,7 +42,7 @@ use thinking::Ending;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
-use tool_lines::{SPINNER_FRAME, ToolLine, spinner};
+use tool_lines::{SPINNER_FRAME, ToolLine, result_note, spinner, touches_project};
 use wrap::{first_row, wrap};
 
 /// About 30 frames a second while the launch animation plays.
@@ -677,13 +677,21 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             name,
             arguments,
         } => {
-            run.used_project_tools = true;
+            // Evidence follows project work; arithmetic alone is not that.
+            run.used_project_tools |= touches_project(&name);
             view.history
                 .start_tool(ToolLine::started(&call_id, &name, &arguments));
             run.activity = tool_activity(&view.history);
         }
-        ConversationEvent::ToolFinished { call_id, name, ok } => {
-            view.history.finish_tool(&call_id, &name, ok);
+        ConversationEvent::ToolFinished {
+            call_id,
+            name,
+            ok,
+            preview,
+        } => {
+            let note = result_note(&name, ok, &preview);
+            view.history
+                .finish_tool_with_result(&call_id, &name, ok, note);
             run.activity = tool_activity(&view.history);
         }
         ConversationEvent::ContextUsage {
@@ -851,6 +859,7 @@ mod tests {
                 call_id: "b".into(),
                 name: "shell_command".into(),
                 ok: false,
+                preview: String::new(),
             },
         );
         assert_eq!(run.activity, "Using read_file");
@@ -861,6 +870,7 @@ mod tests {
                 call_id: "a".into(),
                 name: "read_file".into(),
                 ok: true,
+                preview: String::new(),
             },
         );
         for event in [
@@ -897,6 +907,7 @@ mod tests {
             call_id: id.into(),
             name: name.into(),
             ok: true,
+            preview: String::new(),
         }
     }
 

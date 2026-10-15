@@ -64,6 +64,7 @@ to the user-focused control surface.
 - Bounded repair and retained-artifact retry policies
 - Throughput-aware patience for slow local models
 - Domain profiles that keep task-specific policy out of the runtime core
+- A `calculate` tool for exact arithmetic in conversations and everyday runs
 
 ## Requirements
 
@@ -410,6 +411,31 @@ The main commands are:
 - `summarize-matrix` — reproduce the preserved benchmark baseline
 
 Use `cargo run -- <command> --help` for command-specific options.
+
+### Calculator tool
+
+Small models make arithmetic slips, so conversations and everyday `run`
+invocations offer a `calculate` tool. It takes one `expression` string,
+with several expressions separated by newlines or `;`, and returns one line
+per expression, such as `1474 / 1.1 = 1340`. It supports `+ - * / // %`,
+`^` or `**` for powers, parentheses, `sqrt abs round floor ceil min max ln
+log10 log2 exp`, and `pi` and `e`. It also accepts `×`, `÷`, the Unicode
+minus, `_` digit separators, scientific notation, and a trailing `=`.
+Commas separate function arguments inside a call; outside one, a comma
+followed by three digits groups thousands, so `1,474` is 1474.
+
+Decimals stay exact through `+ - * /` and integer powers, so `0.1 + 0.2` is
+`0.3`. Roots, logarithms, fractional powers, and integers beyond 128 bits use
+floating point and show 12 significant digits. Powers associate to the right
+(`2^3^2` is 512), unary minus binds looser than a power (`-2^2` is -4), and
+`%` and `//` are floored as in Python. Errors give the column and a hint,
+such as `unknown name "pace"; calculate only evaluates numbers, so substitute
+the value`. The evaluator is a small pure parser in `src/calculator.rs` with a
+4,000-character input limit; it cannot run code or read files.
+
+Benchmark runs, runs with an experiment, goal or contract, and the
+`adaptive-agent-harness` compatibility executable do not offer the tool, so
+their provider requests are unchanged.
 
 ### Request recovery
 

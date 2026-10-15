@@ -120,6 +120,10 @@ pub struct AgentRunConfig {
     /// Generate and retain a proposal-derived acceptance coverage ledger before
     /// the worker loop. Coverage is advisory and never replaces declared probes.
     pub acceptance_ledger: bool,
+    /// Offer the `calculate` tool. Everyday `run` and the TUI conversation set
+    /// it; benchmark and historical runs leave it off so their provider
+    /// requests stay identical.
+    pub calculator: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -680,7 +684,10 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     } else {
         profile.system_guidance()
     });
-    let tools = tools_for_profile(&scope, profile);
+    let mut tools = tools_for_profile(&scope, profile);
+    if config.calculator {
+        tools.push(Box::new(crate::calculator::CalculateTool));
+    }
     let repair_tools = tools
         .iter()
         .filter(|tool| {
@@ -2918,6 +2925,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     "message_count_after_append": current_messages.len(),
                 }),
             )?;
+            trace.tool_finished(call, tool_result.ok, &tool_result.content);
             if let Some(decision) =
                 inspection_loop_tracker.observe(turn, depth, call, &tool_result, profile)
             {
@@ -9014,6 +9022,7 @@ mod tests {
             initial_context_catalog_file: None,
             semantic_advisor_model: None,
             acceptance_ledger: false,
+            calculator: false,
         };
         let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
 
@@ -10626,6 +10635,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: true,
+                    calculator: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10667,6 +10677,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    calculator: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10708,6 +10719,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    calculator: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10774,6 +10786,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    calculator: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10814,6 +10827,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    calculator: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10854,6 +10868,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    calculator: false,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10890,6 +10905,7 @@ mod tests {
                     initial_context_catalog_file: Some(PathBuf::from("context-catalog.json")),
                     semantic_advisor_model: Some("context-curator-model".to_string()),
                     acceptance_ledger: false,
+                    calculator: false,
                 },
                 gateway,
                 self.workspace.clone(),

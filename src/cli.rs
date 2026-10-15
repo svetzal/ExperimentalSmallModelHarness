@@ -280,6 +280,7 @@ impl RunArgs {
             initial_context_catalog_file: self.initial_context_catalog,
             semantic_advisor_model: self.semantic_advisor_model,
             acceptance_ledger: self.acceptance_ledger,
+            calculator: false,
         })
     }
 }
@@ -1213,7 +1214,11 @@ fn prepare_run_with_mode(
         *trace = absolute(trace)?;
     }
     std::env::set_current_dir(root)?;
-    run.into_config()
+    let mut config = run.into_config()?;
+    // Everyday runs and the conversation get the calculator; advanced and
+    // historical invocations keep their exact tool set.
+    config.calculator = conversational || (!legacy && !advanced);
+    Ok(config)
 }
 
 fn setup(args: SetupArgs, explicit_path: Option<&Path>) -> Result<()> {

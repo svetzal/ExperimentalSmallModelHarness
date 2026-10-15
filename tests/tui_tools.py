@@ -37,6 +37,7 @@ def exercise(provider):
             ("read_file", dict(path="notes.txt", line_start=1, line_end=2)),
         ]),
         ("", [("read_file", dict(path="missing.txt"))]),
+        ("", [("calculate", dict(expression="1474 / 1.1"))]),
         ("All done.", []),
     ]
 
@@ -117,14 +118,15 @@ def exercise(provider):
         assert len(spinner_glyphs) >= 2, f"the spinner did not animate: {spinner_glyphs}"
 
         final = frames()[-1]
-        for line in ("✓ shell_command sleep 1", "✓ read_file notes.txt:1-2", "✗ read_file missing.txt"):
+        for line in ("✓ shell_command sleep 1", "✓ read_file notes.txt:1-2", "✗ read_file missing.txt",
+                     "✓ calculate 1474 / 1.1 = 1340"):
             assert line.encode() in final, (line, final)
         region = final.split(b"Ready for your next message")[0].split(b"Microgentic:")[-1]
         assert not RUNNING.search(region), ("a call still spins after the run finished", region)
         assert b"finished" not in seen, "a separate finished line appeared"
         assert not re.search(rb"H {2}Using ", seen), "a separate Using line appeared in the history"
         assert b"Evidence:" in final
-        assert len(requests) == 3
+        assert len(requests) == 4
         os.write(master, b"\x1b")
         assert process.wait(timeout=10) == 0
         assert termios.tcgetattr(slave) == before

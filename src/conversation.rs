@@ -37,6 +37,8 @@ pub(crate) enum ConversationEvent {
         call_id: String,
         name: String,
         ok: bool,
+        /// The start of the tool's result, for presenters that show it.
+        preview: String,
     },
     /// The runtime's token estimate for the next model request, and the
     /// context window when the model table or provider gives one.
@@ -246,15 +248,25 @@ impl ConversationRun {
         });
     }
 
+    /// Tell the view a call finished. The preview is redacted like traces and
+    /// bounded, because presenters show at most a short result.
+    pub(crate) fn tool_finished(
+        &self,
+        call: &mojentic::llm::models::LlmToolCall,
+        ok: bool,
+        content: &str,
+    ) {
+        let mut preview = Value::String(content.chars().take(VIEW_PREVIEW_CHARS).collect());
+        crate::recovery::redact_value(&mut preview, &crate::recovery::credentials());
+        self.emit(ConversationEvent::ToolFinished {
+            call_id: call.id.clone().unwrap_or_default(),
+            name: call.name.clone(),
+            ok,
+            preview: preview.as_str().unwrap_or_default().to_owned(),
+        });
+    }
+
     pub(crate) fn observe(&self, kind: &str, payload: &Value) {
-        if kind == "llm.context_assembly.appended" && payload["component"] == "tool_result" {
-            self.emit(ConversationEvent::ToolFinished {
-                call_id: payload["tool_call_id"].as_str().unwrap_or_default().into(),
-                name: payload["tool_name"].as_str().unwrap_or("tool").into(),
-                ok: payload["ok"] == true,
-            });
-            return;
-        }
         let message = match kind {
             "llm.stream.thinking" => {
                 format!("Thinking · {} characters", payload["total_thinking_chars"])
@@ -334,6 +346,9 @@ fn progress_label(state: &str) -> &'static str {
         _ => "Working",
     }
 }
+
+/// Longest tool-result preview, in characters, sent to the view.
+const VIEW_PREVIEW_CHARS: usize = 400;
 
 /// Longest string, in characters, sent to the view in tool arguments.
 const VIEW_ARGUMENT_CHARS: usize = 2_000;
