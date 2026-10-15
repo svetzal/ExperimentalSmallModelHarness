@@ -42,6 +42,25 @@ Provider fixtures use mock HTTP servers. Do not start local models for routine
 checks. Preserve model patience and let the runtime own stop policy during live
 runs. Local-model comparisons stay within Qwen unless the user requests otherwise.
 
+## Local install and CI
+
+Install locally with Cargo, not by waiting for a published release:
+
+```sh
+git worktree add --detach /tmp/mg-install <commit>
+cargo install --locked --path /tmp/mg-install --target-dir target/install --force
+git worktree remove /tmp/mg-install
+```
+
+Install from a committed revision that passed the gates, not from a working tree
+that another agent may be editing. `~/.cargo/bin` comes before Homebrew on the
+PATH here, so the Cargo build replaces the Homebrew one without an uninstall.
+
+Every push and tag starts GitHub Actions. Let those runs finish, including for
+intermediate versions; never cancel them. Do not wait on them either: push, then
+continue local work and local installs. Check a run's result later, when its
+outcome decides the next step (for example, before updating the Homebrew tap).
+
 ## Release process
 
 See `RELEASING.md`. Public binaries need an embedded source revision, native
