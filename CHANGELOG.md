@@ -10,6 +10,13 @@ The release workflow publishes each version's section as its GitHub release note
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-15
+
+Everyday `microgentic run` now behaves like the conversation: it ends on the
+model's first visible answer. The conversation view gains a context panel.
+Benchmark mode and task runs with a contract, goal, or experiment are
+unchanged; their provider requests are identical to 0.3.0.
+
 ### Added
 
 - A context panel in the conversation view. Ctrl-O or `/context` opens it to
@@ -21,6 +28,23 @@ The release workflow publishes each version's section as its GitHub release note
   message `new` or `kept` against the previous request. It updates with every
   request, including tool loops. Alt-Page Up/Down scroll it. Provider requests
   are unchanged.
+- A user guide, published at vetzal.ca/microgentic. It covers install, setup,
+  the conversation, shell use, providers, project guidance, tools, commands,
+  file locations, traces, and benchmark mode.
+
+### Changed
+
+- An everyday `microgentic run` sends your prompt as written and finishes on
+  the first visible reply. It no longer wraps the prompt in the benchmark task
+  template or asks the model to continue after it has answered. A plain
+  question now takes one model request instead of ten. Tools still work, and a
+  request for work still does the work.
+- Shell code blocks in an everyday `--prompt` are treated as part of the
+  discussion, as in the conversation. They no longer become checks the run must
+  pass. Task runs keep the previous behaviour.
+- Plain `run` output has no blank lines around the reply. `--json` output is
+  unchanged.
+- The launch animation plays in about 1.7 seconds.
 
 ## [0.3.0] - 2026-10-15
 
@@ -117,7 +141,8 @@ experimental harness into a small terminal interface for everyday use.
 - A successful process exit still needs inspection of the native terminal
   result when classifying benchmark outcomes.
 
-[Unreleased]: https://github.com/svetzal/microgentic/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/svetzal/microgentic/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/svetzal/microgentic/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/svetzal/microgentic/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/svetzal/microgentic/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/svetzal/microgentic/releases/tag/v0.1.0
