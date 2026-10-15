@@ -261,17 +261,22 @@ their start.
 Type a command that starts with `/` in the input. Commands run in the TUI and
 are never sent to the model:
 
-- `/model` shows the current provider and model and asks the provider for its
-  available models. `/model <id>` switches to that model for this session.
-  It switches models within the current provider only.
-- `/effort` shows the current reasoning effort and the accepted values.
-  `/effort <level>` sets it for this session. The levels are `disabled`,
-  `enabled`, `low`, `medium`, `high`, and `xhigh`. `default` returns to the
-  model's own setting.
+- `/model` shows the current provider and model, asks the provider for its
+  available models, and opens a picker with the current model selected. If
+  the provider cannot list models, the error appears instead.
+  `/model <id>` switches directly. Either way the switch is for this session
+  and within the current provider only.
+- `/effort` shows the current reasoning effort and opens a picker of the
+  accepted values. `/effort <level>` sets it directly. The levels are
+  `disabled`, `enabled`, `low`, `medium`, `high`, and `xhigh`. `default`
+  returns to the model's own setting.
 - `/clear` starts a new conversation. The earlier session file and its traces
   stay on disk.
 - `/help` lists the commands.
 
+In a picker, Up and Down move (wrapping at the ends), Home and End jump to the
+first and last option, Enter chooses, and Esc or Ctrl-C closes it without a
+change. The selected option has a `›` marker, so it shows without colour.
 While you type a command, the bottom line shows matching commands, and Tab
 completes a unique match. An unknown command shows an error and sends nothing.
 To send a message that starts with `/`, type `//`; Microgentic removes one `/`.

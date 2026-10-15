@@ -13,6 +13,10 @@ use unicode_width::UnicodeWidthChar;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub(super) const SPINNER_FRAME: Duration = Duration::from_millis(90);
 
+pub(super) fn spinner(frame: usize) -> &'static str {
+    SPINNER[frame % SPINNER.len()]
+}
+
 /// Longest path, in cells, before its start is elided.
 const PATH_CELLS: usize = 48;
 /// Longest command or free text, in cells, before its end is elided.
@@ -62,7 +66,7 @@ impl ToolLine {
     /// distinct glyphs, so the state reads without colour.
     pub(super) fn render(&self, frame: usize, out: &mut Styled) {
         let (role, marker) = match self.state {
-            CallState::Running => (Role::Working, SPINNER[frame % SPINNER.len()]),
+            CallState::Running => (Role::Working, spinner(frame)),
             CallState::Succeeded => (Role::Success, "✓"),
             CallState::Failed => (Role::Failure, "✗"),
             CallState::Stopped => (Role::Muted, "–"),

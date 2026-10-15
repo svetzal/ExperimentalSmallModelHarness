@@ -1,6 +1,7 @@
 //! Session-only settings and the commands that change them.
 use super::View;
 use super::commands::{Command, EFFORT_CHOICES, help_text};
+use super::picker::{Panel, Picker, Purpose};
 use super::styled::Role;
 use crate::agent::Provider;
 use crate::preferences::Preferences;
@@ -55,19 +56,16 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
         }
         Command::ShowModel => {
             let provider = session.settings.provider;
-            let mut text = format!(
+            if session.model_listing.is_none() {
+                session.model_listing = Some(tokio::spawn(available_models(provider)));
+            }
+            // The picker opens when the provider answers.
+            view.panel = Some(Panel::Loading("Loading models…".into()));
+            format!(
                 "Model: {} on {}. Switch for this session with /model <id>.\n",
                 session.settings.model,
                 provider.as_str()
-            );
-            if session.model_listing.is_none() {
-                session.model_listing = Some(tokio::spawn(available_models(provider)));
-                text.push_str(&format!(
-                    "Asking {} for available models.\n",
-                    provider.as_str()
-                ));
-            }
-            text
+            )
         }
         Command::SetModel(model) if model == session.settings.model => {
             format!("Already using {model}.\n")
@@ -76,11 +74,25 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
             let note = session.change_settings(|settings| settings.model = model.clone());
             format!("Model set to {model} for this session.{note}\n")
         }
-        Command::ShowEffort => format!(
-            "Effort: {}. Choose with /effort <level>: {}. default uses the model's own setting.\n",
-            effort_label(&session.settings),
-            EFFORT_CHOICES.join(", ")
-        ),
+        Command::ShowEffort => {
+            let current = session
+                .settings
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("default");
+            view.panel = Picker::new(
+                Purpose::Effort,
+                "Choose reasoning effort for this session",
+                EFFORT_CHOICES.map(String::from).to_vec(),
+                current,
+            )
+            .map(Panel::Choose);
+            format!(
+                "Effort: {}. Choose with /effort <level>: {}. default uses the model's own setting.\n",
+                effort_label(&session.settings),
+                EFFORT_CHOICES.join(", ")
+            )
+        }
         Command::SetEffort(effort) if effort == session.settings.reasoning_effort => {
             format!("Effort is already {}.\n", effort_label(&session.settings))
         }
@@ -95,7 +107,9 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
     view.history.push(Role::System, &output);
 }
 
-/// Show the provider's model list once its request settles.
+/// Open the model picker once the provider's list arrives. An empty list or
+/// an error is reported in the history instead. Nothing is shown when the
+/// user cancelled the loading notice.
 pub(super) async fn finish_model_listing(view: &mut View, session: &mut Session) {
     let Some(listing) = session
         .model_listing
@@ -103,28 +117,33 @@ pub(super) async fn finish_model_listing(view: &mut View, session: &mut Session)
     else {
         return;
     };
+    let result = listing.await.map_err(|error| error.to_string()).flatten();
+    if !matches!(view.panel, Some(Panel::Loading(_))) {
+        return;
+    }
     let provider = session.settings.provider.as_str();
-    view.history.start_line();
-    match listing.await.map_err(|error| error.to_string()).flatten() {
-        Ok(models) if models.is_empty() => view
-            .history
-            .push(Role::System, &format!("{provider} reported no models.\n")),
-        Ok(models) => {
-            let mut text = format!("Available models from {provider}:\n");
-            for model in models {
-                let current = if model == session.settings.model {
-                    " (current)"
-                } else {
-                    ""
-                };
-                text.push_str(&format!("  {model}{current}\n"));
+    view.panel = None;
+    match result {
+        Ok(models) => match Picker::new(
+            Purpose::Model,
+            &format!("Choose a model from {provider} for this session"),
+            models,
+            &session.settings.model,
+        ) {
+            Some(picker) => view.panel = Some(Panel::Choose(picker)),
+            None => {
+                view.history.start_line();
+                view.history
+                    .push(Role::System, &format!("{provider} reported no models.\n"));
             }
-            view.history.push(Role::System, &text);
+        },
+        Err(error) => {
+            view.history.start_line();
+            view.history.push(
+                Role::Error,
+                &format!("Could not list models from {provider}: {error}\n"),
+            );
         }
-        Err(error) => view.history.push(
-            Role::Error,
-            &format!("Could not list models from {provider}: {error}\n"),
-        ),
     }
 }
 
@@ -173,6 +192,7 @@ mod tests {
             input: String::new(),
             scroll: 3,
             status: Status::new(Phase::Ready, "Ready"),
+            panel: None,
         };
         view.history.reset();
         view

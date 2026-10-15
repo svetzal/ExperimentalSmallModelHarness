@@ -104,6 +104,9 @@ def exercise(provider):
         assert len(requests) == count + 1
         return requests[-1]
 
+    def press(keys):
+        os.write(master, keys)
+
     def effort_control(request):
         return request.get("reasoning_effort" if provider == "omlx" else "think")
 
@@ -120,7 +123,15 @@ def exercise(provider):
         wait_for(b"Unknown effort \"extreme\"")
         type_line("/model")
         wait_for(b"Model: test-model on " + provider.encode())
-        wait_for(b"other-model")
+        wait_for(b"Choose a model from " + provider.encode())
+        picker = wait_for(b"Enter choose | Esc cancel")  # the hint ends the picker's frame
+        assert "› test-model (current)".encode() in picker and b"  other-model" in picker, picker
+        press(b"\x1b")  # Esc closes the picker without a change.
+        wait_for(b"Enter send")
+        type_line("/effort")
+        wait_for("› low (current)".encode())
+        press(b"\x1b[B\x1b")  # Down, then Esc: still no change.
+        wait_for(b"Enter send")
         assert not requests, "a command reached the provider"
         assert len(listings) == 1, listings
 
@@ -129,7 +140,9 @@ def exercise(provider):
         follow = exchange("Second message.")
         assert "First message." in history_text(follow), "ordinary follow-ups lost their history"
 
-        type_line("/model other-model")
+        type_line("/model")
+        wait_for("› test-model (current)".encode())
+        press(b"\x1b[B\r")  # Down to other-model, then Enter.
         # The header row is drawn before the history in the same frame.
         shown = wait_for(b"Model set to other-model for this session.")
         assert b"| other-model | effort: low" in shown, "the header kept the old model"
@@ -138,7 +151,9 @@ def exercise(provider):
         assert effort_control(switched) == "low"
         assert "First message." not in history_text(switched), "history crossed a model change"
 
-        type_line("/effort high")
+        type_line("/effort")
+        wait_for("› low (current)".encode())
+        press(b"\x1b[B\x1b[B\r")  # low -> medium -> high, then Enter.
         shown = wait_for(b"Effort set to high for this session.")
         assert b"| other-model | effort: high" in shown, "the header kept the old effort"
         raised = exchange("After the effort change.")

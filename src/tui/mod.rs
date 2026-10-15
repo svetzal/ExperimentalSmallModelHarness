@@ -1,6 +1,7 @@
 //! Terminal conversation with native history and a live worker event stream.
 mod commands;
 mod history;
+mod picker;
 mod session;
 mod styled;
 mod tool_lines;
@@ -20,6 +21,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use history::History;
+use picker::{Outcome, Panel, PickerKey, Purpose};
 use session::{Session, finish_model_listing, run_command};
 use std::io::{Write, stdout};
 use std::path::PathBuf;
@@ -33,7 +35,7 @@ use styled::{Palette, Role, Styled, first_row, fit_from_end, wrap};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
-use tool_lines::{SPINNER_FRAME, ToolLine};
+use tool_lines::{SPINNER_FRAME, ToolLine, spinner};
 
 struct Screen;
 impl Screen {
@@ -105,6 +107,71 @@ struct View {
     input: String,
     scroll: usize,
     status: Status,
+    /// A loading notice or picker above the input. While open, it owns the
+    /// arrow keys, Enter, and Esc.
+    panel: Option<Panel>,
+}
+
+/// Give a key to the open panel. Returns false when no panel is open, so the
+/// key keeps its usual meaning.
+fn handle_panel_key(view: &mut View, session: &mut Session, key: event::KeyEvent) -> bool {
+    let Some(panel) = &mut view.panel else {
+        return false;
+    };
+    let picker_key = match key.code {
+        KeyCode::Esc => PickerKey::Cancel,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => PickerKey::Cancel,
+        KeyCode::Up => PickerKey::Up,
+        KeyCode::Down => PickerKey::Down,
+        KeyCode::Home => PickerKey::Home,
+        KeyCode::End => PickerKey::End,
+        KeyCode::Enter => PickerKey::Choose,
+        _ => return true,
+    };
+    let outcome = match panel {
+        Panel::Loading(_) if picker_key == PickerKey::Cancel => Outcome::Cancelled,
+        Panel::Loading(_) => Outcome::Open,
+        Panel::Choose(picker) => picker.handle(picker_key),
+    };
+    match outcome {
+        Outcome::Open => {}
+        Outcome::Cancelled => view.panel = None,
+        Outcome::Chosen(choice) => {
+            let purpose = match view.panel.take() {
+                Some(Panel::Choose(picker)) => picker.purpose,
+                _ => return true,
+            };
+            let command = match purpose {
+                Purpose::Model => Command::SetModel(choice),
+                Purpose::Effort => Command::SetEffort((choice != "default").then_some(choice)),
+            };
+            run_command(view, session, command);
+        }
+    }
+    true
+}
+
+/// The bottom line: the open panel's keys, or command hints and key help.
+fn hints(view: &View) -> Styled {
+    match &view.panel {
+        Some(Panel::Loading(_)) => Styled::default().with(Role::Muted, "Esc cancel"),
+        Some(Panel::Choose(_)) => Styled::default().with(
+            Role::Muted,
+            "↑/↓ move | Home/End first/last | Enter choose | Esc cancel",
+        ),
+        None => footer(&view.input),
+    }
+}
+
+fn panel_rows(panel: &Panel, height: usize, frame: usize) -> Vec<Styled> {
+    match panel {
+        Panel::Loading(label) => vec![
+            Styled::default()
+                .with(Role::Working, spinner(frame))
+                .with(Role::System, &format!(" {label}")),
+        ],
+        Panel::Choose(picker) => picker.rows(height),
+    }
 }
 
 fn header(root: &std::path::Path, prefs: &Preferences) -> Styled {
@@ -252,14 +319,20 @@ fn draw(view: &View, header: &Styled, frame: usize, palette: Palette) -> Result<
         .with(Role::Plain, &view.input);
     let input_rows = wrap(&input, width);
     let input_height = input_rows.len().min(4);
-    let status_row = lines.saturating_sub(input_height as u16 + 2);
+    let panel = view
+        .panel
+        .as_ref()
+        .map(|panel| panel_rows(panel, usize::from(lines / 2).min(9), frame))
+        .unwrap_or_default();
+    let panel_height = panel.len() as u16;
+    let status_row = lines.saturating_sub(input_height as u16 + panel_height + 2);
     // Rules frame the conversation; very short terminals drop them first.
     let lower_rule_row = status_row.saturating_sub(1);
     if lower_rule_row > 2 {
         put(2, &rule)?;
         put(lower_rule_row, &rule)?;
     }
-    let body_height = usize::from(lines.saturating_sub(6 + input_height as u16));
+    let body_height = usize::from(lines.saturating_sub(6 + input_height as u16 + panel_height));
     let history = wrap(&view.history.render(frame), width);
     let end = history.len().saturating_sub(view.scroll.min(history.len()));
     let start = end.saturating_sub(body_height);
@@ -267,6 +340,9 @@ fn draw(view: &View, header: &Styled, frame: usize, palette: Palette) -> Result<
         put(3 + index as u16, row)?;
     }
     put(status_row, &first_row(&view.status.line(), width))?;
+    for (index, row) in panel.iter().enumerate() {
+        put(status_row + 1 + index as u16, &first_row(row, width))?;
+    }
     for (index, row) in input_rows[input_rows.len() - input_height..]
         .iter()
         .enumerate()
@@ -276,10 +352,7 @@ fn draw(view: &View, header: &Styled, frame: usize, palette: Palette) -> Result<
             row,
         )?;
     }
-    put(
-        lines.saturating_sub(1),
-        &first_row(&footer(&view.input), width),
-    )?;
+    put(lines.saturating_sub(1), &first_row(&hints(view), width))?;
     out.flush()?;
     Ok(())
 }
@@ -310,6 +383,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
         input: String::new(),
         scroll: 0,
         status: Status::new(Phase::Ready, "Ready"),
+        panel: None,
     };
     view.history.reset();
     let mut active: Option<ActiveRun> = None;
@@ -375,7 +449,9 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
             let header = header(&session.root, &session.settings);
             // The spinner frame joins the signature only while a call runs, so
             // an idle screen does not redraw.
-            let frame = view.history.has_running().then(|| {
+            let animating =
+                view.history.has_running() || matches!(view.panel, Some(Panel::Loading(_)));
+            let frame = animating.then(|| {
                 (spinner_epoch.elapsed().as_millis() / SPINNER_FRAME.as_millis()) as usize
             });
             let signature = (
@@ -385,6 +461,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 view.input.clone(),
                 view.scroll,
                 view.status.clone(),
+                view.panel.clone(),
                 terminal::size()?,
             );
             if last_draw.as_ref() != Some(&signature) {
@@ -399,6 +476,9 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 Event::Paste(text) => view
                     .input
                     .extend(text.chars().filter(|ch| !ch.is_control() || *ch == '\n')),
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && handle_panel_key(&mut view, &mut session, key) => {}
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Esc => {
                         if active.is_none() {
@@ -590,6 +670,7 @@ mod tests {
             input: String::new(),
             scroll: 3,
             status: Status::new(Phase::Ready, "Ready"),
+            panel: None,
         };
         view.history.reset();
         view
@@ -720,6 +801,111 @@ mod tests {
         assert!(
             history_text(&view).contains("  – list_tree src depth 2 · stopped\n[Request stopped")
         );
+    }
+
+    fn key(code: KeyCode) -> event::KeyEvent {
+        event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn the_effort_picker_changes_effort_or_cancels_without_change() {
+        let mut view = view();
+        let mut session = session();
+        run_command(&mut view, &mut session, Command::ShowEffort);
+        assert!(matches!(view.panel, Some(Panel::Choose(_))));
+        // The current value ("low") starts selected; Down moves to "medium".
+        assert!(handle_panel_key(
+            &mut view,
+            &mut session,
+            key(KeyCode::Down)
+        ));
+        assert!(handle_panel_key(
+            &mut view,
+            &mut session,
+            key(KeyCode::Enter)
+        ));
+        assert!(view.panel.is_none());
+        assert_eq!(session.settings.reasoning_effort.as_deref(), Some("medium"));
+        assert!(history_text(&view).contains("Effort set to medium for this session."));
+
+        run_command(&mut view, &mut session, Command::ShowEffort);
+        handle_panel_key(&mut view, &mut session, key(KeyCode::Home));
+        handle_panel_key(&mut view, &mut session, key(KeyCode::Esc));
+        assert!(view.panel.is_none());
+        assert_eq!(session.settings.reasoning_effort.as_deref(), Some("medium"));
+
+        run_command(&mut view, &mut session, Command::ShowEffort);
+        handle_panel_key(&mut view, &mut session, key(KeyCode::Home));
+        handle_panel_key(&mut view, &mut session, key(KeyCode::Enter));
+        assert_eq!(
+            session.settings.reasoning_effort, None,
+            "default unsets effort"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_closes_an_open_panel_and_other_keys_are_held() {
+        let mut view = view();
+        let mut session = session();
+        run_command(&mut view, &mut session, Command::ShowEffort);
+        assert!(handle_panel_key(
+            &mut view,
+            &mut session,
+            key(KeyCode::Char('x'))
+        ));
+        assert!(view.panel.is_some() && view.input.is_empty());
+        let ctrl_c = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_panel_key(&mut view, &mut session, ctrl_c));
+        assert!(view.panel.is_none());
+        assert!(
+            !handle_panel_key(&mut view, &mut session, ctrl_c),
+            "a closed panel took a key"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_model_picker_opens_when_the_listing_arrives() {
+        let mut view = view();
+        let mut session = session();
+        session.model_listing = Some(tokio::spawn(async {
+            Ok(vec!["first".to_owned(), "second".to_owned()])
+        }));
+        run_command(&mut view, &mut session, Command::ShowModel);
+        assert!(matches!(view.panel, Some(Panel::Loading(_))));
+        while !session.model_listing.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        finish_model_listing(&mut view, &mut session).await;
+        handle_panel_key(&mut view, &mut session, key(KeyCode::Down));
+        handle_panel_key(&mut view, &mut session, key(KeyCode::Enter));
+        assert_eq!(session.settings.model, "second");
+        assert!(
+            session.state.is_none(),
+            "a model change kept the old conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_or_failed_listing_never_opens_a_picker() {
+        let mut view = view();
+        let mut session = session();
+        session.model_listing = Some(tokio::spawn(async { Ok(vec!["first".to_owned()]) }));
+        run_command(&mut view, &mut session, Command::ShowModel);
+        handle_panel_key(&mut view, &mut session, key(KeyCode::Esc));
+        while !session.model_listing.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        finish_model_listing(&mut view, &mut session).await;
+        assert!(view.panel.is_none());
+
+        session.model_listing = Some(tokio::spawn(async { Err("refused".to_owned()) }));
+        run_command(&mut view, &mut session, Command::ShowModel);
+        while !session.model_listing.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        finish_model_listing(&mut view, &mut session).await;
+        assert!(view.panel.is_none());
+        assert!(history_text(&view).ends_with("Could not list models from omlx: refused\n"));
     }
 
     #[tokio::test]
