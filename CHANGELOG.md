@@ -42,6 +42,13 @@ The release workflow publishes each version's section as its GitHub release note
 
 ### Changed
 
+- The context panel shows each element's inclusion reason and residency
+  state (pinned, the turn that added it, the last reference, demoted), and
+  marks the tools as pinned. With a known window, the panel header and the
+  status gauge use it instead of "window unknown".
+- The status bar's `📜` count is now the standing items in the latest
+  request, read from the worker's residency record; today these are the
+  guidance files. It still sits beside the gauge and drops first.
 - The conversation view draws each frame as one synchronized update (DEC mode
   2026). Terminals that support it no longer show a half-drawn frame; others
   ignore it.

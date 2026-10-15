@@ -44,6 +44,9 @@ pub(crate) struct ContextSnapshot {
     pub(crate) elements: Vec<ContextElement>,
     /// The tool descriptors sent beside the messages.
     pub(crate) tools: Vec<ToolOffer>,
+    /// The run records tool descriptors as pinned residents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) tools_pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +68,60 @@ pub(crate) struct ContextElement {
     /// Not in the previous request of this exchange. For the first request,
     /// everything that is not retained conversation history.
     pub(crate) new: bool,
+    /// Why the element is in the request and its residency state, when the
+    /// run records residency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) residency: Option<ElementResidency>,
+}
+
+/// An element's residency, from the context ledger that preceded the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ElementResidency {
+    pub(crate) reason: String,
+    pub(crate) pinned: bool,
+    pub(crate) activated_turn: u64,
+    pub(crate) last_referenced_turn: Option<u64>,
+    pub(crate) demoted: bool,
+}
+
+impl ElementResidency {
+    fn from_item(item: &Value) -> Option<Self> {
+        Some(Self {
+            reason: item["inclusion_reason"].as_str()?.to_owned(),
+            pinned: item["pinned"].as_bool().unwrap_or(false),
+            activated_turn: item["activated_turn"].as_u64().unwrap_or(1),
+            last_referenced_turn: item["last_referenced_turn"].as_u64(),
+            demoted: item["demoted"].as_bool().unwrap_or(false),
+        })
+    }
+}
+
+/// Attach the ledger's residency records to the elements they describe. The
+/// system message's base prompt and guidance section are separate elements;
+/// any other message's record goes on its first element.
+pub(crate) fn attach_residency(snapshot: &mut ContextSnapshot, items: &[Value]) {
+    let at = |index: usize| {
+        items
+            .iter()
+            .filter(move |item| item["component_index"].as_u64() == Some(index as u64))
+    };
+    let mut previous_message = 0;
+    for element in &mut snapshot.elements {
+        let index = element.message - 1;
+        let first_part = element.message != previous_message;
+        previous_message = element.message;
+        element.residency = match element.kind {
+            ElementKind::SystemPrompt => at(index)
+                .find(|item| item["kind"] == "base_prompt")
+                .and_then(ElementResidency::from_item),
+            ElementKind::ProjectGuidance => at(index)
+                .find(|item| item["kind"] == "root_guidance")
+                .and_then(ElementResidency::from_item),
+            _ if first_part => at(index).next().and_then(ElementResidency::from_item),
+            _ => None,
+        };
+    }
+    snapshot.tools_pinned = items.iter().any(|item| item["kind"] == "tool_descriptor");
 }
 
 /// What an element is. The view names each kind in words, so the panel
@@ -190,6 +247,7 @@ pub(crate) fn build(
                 omitted_chars,
                 reasoning_chars: if part == 0 { reasoning_chars } else { 0 },
                 new,
+                residency: None,
             });
         }
     }
@@ -221,6 +279,7 @@ pub(crate) fn build(
         omitted_exchanges: facts.omitted_exchanges,
         elements,
         tools,
+        tools_pinned: false,
     };
     (snapshot, seen)
 }
@@ -618,5 +677,47 @@ mod tests {
             .map(|t| t.to_string().len())
             .sum();
         assert_eq!(snapshot.estimated_tokens, (messages + tools).div_ceil(4));
+    }
+
+    #[test]
+    fn residency_records_attach_to_the_elements_they_describe() {
+        let payload = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": format!("Base.{SECTION_HEADING}Rules.")},
+                {"role": "user", "content": "Do it."},
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        });
+        let facts = RequestFacts {
+            request: 1,
+            protected_users: 1,
+            current_prompt: "Do it.",
+            omitted_exchanges: 0,
+            window_tokens: None,
+        };
+        let (mut snapshot, _) = build(&payload, &facts, &HashSet::new());
+        let items = vec![
+            json!({"id": "base_prompt", "kind": "base_prompt", "component_index": 0, "inclusion_reason": "base_system_prompt", "pinned": true, "activated_turn": 1}),
+            json!({"id": "guidance:AGENTS.md", "kind": "root_guidance", "component_index": 0, "inclusion_reason": "project_guidance_discovered", "pinned": true, "activated_turn": 1}),
+            json!({"id": "prompt", "kind": "conversation_turn", "component_index": 1, "inclusion_reason": "current_user_prompt", "pinned": true, "activated_turn": 1}),
+            json!({"id": "tool:read_file", "kind": "tool_descriptor", "component_index": null, "inclusion_reason": "active_tool_surface", "pinned": true, "activated_turn": 1}),
+        ];
+        attach_residency(&mut snapshot, &items);
+        let reasons: Vec<_> = snapshot
+            .elements
+            .iter()
+            .map(|element| element.residency.as_ref().map(|r| r.reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                Some("base_system_prompt"),
+                Some("project_guidance_discovered"),
+                Some("current_user_prompt"),
+            ]
+        );
+        assert!(snapshot.tools_pinned);
+        assert!(snapshot.elements[2].residency.as_ref().unwrap().pinned);
     }
 }

@@ -357,6 +357,7 @@ mod tests {
             status: Status::new(Phase::Ready, "Ready"),
             panel: None,
             context: None,
+            standing: None,
             guidance_shown: Default::default(),
             context_panel: Default::default(),
         };

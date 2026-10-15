@@ -1573,3 +1573,65 @@ fn tui_context_panel_shows_the_latest_request_omlx() {
 fn tui_context_panel_shows_the_latest_request_ollama() {
     context_panel(Wire::Ollama);
 }
+
+// ---------------------------------------------------------------- residency
+
+/// The worker's discovered window reaches the gauge and the panel, which
+/// also shows why each element is in the request and its residency state.
+/// The conversation asks the provider once.
+fn discovered_window_and_residency(wire: Wire) {
+    let workspace = Workspace::new();
+    workspace.write("AGENTS.md", "ROOT-RULE: be brief.\n");
+    let provider = MockProvider::start(wire, |request| {
+        Reply::Stream(vec![content(&format!("REPLY-{}", request.number))])
+    });
+    provider.advertise_window(Some(100_000));
+    let mut session = open_session(microgentic(), workspace, provider, 40, 200);
+    session.tui.send(b"\x0f"); // Ctrl-O
+    session.tui.wait_text("No request yet.");
+    let screen = session.exchange("First message.", "REPLY-1");
+    let bar = screen.row(38);
+    let (standing, gauge) = (bar.find("📜 1").unwrap(), bar.find("ctx:[").unwrap());
+    assert!(
+        standing < gauge,
+        "the standing count sits beside the gauge: {bar}"
+    );
+    assert!(
+        bar.trim_end().ends_with("%"),
+        "a known window shows a percentage: {bar}"
+    );
+    let rows = panel_rows(&screen);
+    panel_row(&rows, "of 100.0k tokens");
+    for line in [
+        "base system prompt · pinned · since turn 1",
+        "project guidance discovered · pinned · since turn 1",
+        "current user prompt · pinned · since turn 1",
+    ] {
+        panel_row(&rows, line);
+    }
+    assert!(panel_row(&rows, "Tools offered:").ends_with("· pinned"));
+
+    session.exchange("Second message.", "REPLY-2");
+    let metadata_requests = match wire {
+        Wire::Omlx => session.provider.gets().len(),
+        Wire::Ollama => session.provider.shows().len(),
+    };
+    assert_eq!(
+        metadata_requests, 1,
+        "the conversation asked for the window again"
+    );
+    let state = session.session_state();
+    assert_eq!(state["context_window"]["tokens"], 100_000);
+    assert_eq!(state["context_window"]["source"], "provider");
+    session.tui.quit();
+}
+
+#[test]
+fn tui_shows_the_discovered_window_and_residency_omlx() {
+    discovered_window_and_residency(Wire::Omlx);
+}
+
+#[test]
+fn tui_shows_the_discovered_window_and_residency_ollama() {
+    discovered_window_and_residency(Wire::Ollama);
+}

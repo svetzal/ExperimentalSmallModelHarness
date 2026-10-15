@@ -129,6 +129,9 @@ struct View {
     /// The latest context estimate for this conversation; `None` until the
     /// first request and after a new conversation starts.
     context: Option<ContextUsage>,
+    /// Standing items in the latest request, from the worker's residency
+    /// record; `None` until then, when the view's own guidance count shows.
+    standing: Option<usize>,
     /// Nested guidance files the model has been shown in this conversation.
     guidance_shown: std::collections::BTreeSet<String>,
     /// What the model received in its latest request, beside the conversation.
@@ -139,6 +142,7 @@ impl View {
     /// The conversation is starting over, so its context no longer applies.
     fn forget_context(&mut self) {
         self.context = None;
+        self.standing = None;
         self.context_panel.forget();
     }
 }
@@ -249,7 +253,7 @@ fn bar_state<'a>(view: &View, session: &'a Session) -> BarState<'a> {
             .and_then(|name| name.to_str())
             .unwrap_or("/"),
         git: session.git.as_ref(),
-        guidance: session.guidance_count(),
+        standing: view.standing.unwrap_or_else(|| session.guidance_count()),
         context: view.context.or(window.map(|window| ContextUsage {
             used_tokens: 0,
             window_tokens: Some(window),
@@ -508,6 +512,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
         status: Status::new(Phase::Ready, "Ready"),
         panel: None,
         context: None,
+        standing: None,
         guidance_shown: Default::default(),
         context_panel: Default::default(),
     };
@@ -799,11 +804,15 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
         ConversationEvent::ContextUsage {
             used_tokens,
             window_tokens,
+            standing_items,
         } => {
             view.context = Some(ContextUsage {
                 used_tokens,
                 window_tokens,
             });
+            if standing_items.is_some() {
+                view.standing = standing_items;
+            }
         }
         ConversationEvent::ContextSnapshot { snapshot } => {
             view.context_panel.receive(snapshot);
@@ -890,6 +899,7 @@ mod tests {
             status: Status::new(Phase::Ready, "Ready"),
             panel: None,
             context: None,
+            standing: None,
             guidance_shown: Default::default(),
             context_panel: Default::default(),
         };
@@ -1266,6 +1276,7 @@ mod tests {
             ConversationEvent::ContextUsage {
                 used_tokens: 81_265,
                 window_tokens: Some(262_144),
+                standing_items: None,
             },
         );
         assert!(bar_text(&view, &session).ends_with("ctx:[███·······]31%"));
@@ -1285,6 +1296,7 @@ mod tests {
             ConversationEvent::ContextUsage {
                 used_tokens: 12_400,
                 window_tokens: None,
+                standing_items: None,
             },
         );
         assert!(bar_text(&view, &session).ends_with("ctx: 12.4k"));

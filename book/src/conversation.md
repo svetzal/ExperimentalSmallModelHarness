@@ -67,13 +67,14 @@ The status bar is below the input:
 | 🧠 | The reasoning effort (`default` when unset) |
 | 📁 | The project folder |
 | 🌿 | The Git branch, changed files (`●`), untracked files (`…`), and commits ahead (`↑`) or behind (`↓`) |
-| 📜 | The number of project guidance files in context |
+| 📜 | Standing items in context: the project guidance files in the latest request. Before the first request, the files Microgentic found |
 | `ctx:` | The estimated size of the latest request, as a part of the context window |
 
-The context gauge is green below 60%, yellow to 85%, and red above. When the
-window size is unknown, the gauge shows only the token estimate, for example
-`ctx: 12.4k`. On a narrow terminal, the Git, folder, and effort parts are
-removed first.
+The context gauge is green below 60%, yellow to 85%, and red above. Microgentic
+asks the provider for the model's context window once per conversation. When
+the window is still unknown, the gauge shows only the token estimate, for
+example `ctx: 12.4k`. On a narrow terminal, the `📜` count goes first, then
+the Git, folder, and effort parts.
 
 ## Tool activity
 
@@ -106,15 +107,19 @@ requests is not sent; only replies and tool calls are.
 Older exchanges omitted: none
 ──────────────────────────────────────────────────────
 1. system · system prompt · ~502 tok · new
+  base system prompt · pinned · since turn 1
   You are Microgentic, a helpful conversational assistant
   … 1,703 more chars
 2. user · retained user prompt · ~4 tok · kept
+  retained conversation user prompt · since turn 1
   Add a slower pace to the launch animation.
 3. assistant · assistant reply · ~40 tok · kept
+  retained assistant text · since turn 1
   Here is the change: const PACE: f64 = 0.88;
 4. user · current user prompt · ~4 tok · new
+  current user prompt · pinned · since turn 1
   Write the file.
-Tools offered: 6 · ~1.1k tok
+Tools offered: 6 · ~1.1k tok · pinned
   list_tree ~104, read_file ~85, write_file ~105, ...
 ```
 
@@ -123,7 +128,9 @@ The header tells you:
 - which exchange and which request in it the panel shows. One message can need
   several requests when the model uses tools.
 - the model, the number of messages, and the estimated size against the context
-  window. The window shows as unknown when Microgentic does not know it.
+  window. The window comes from `--context-window-tokens`, the provider, or
+  Microgentic's model table, in that order. It shows as unknown when none of
+  them gives it.
 - whether the model's earlier thinking was sent. It is not sent by default. If
   the model worked something out only in its thinking, the next request does
   not have it.
@@ -150,6 +157,13 @@ name each call, and tool results name the call they answer. The kinds are:
 | consolidated reads, written by the harness | The request that goes with merged file reads. The model did not write it |
 | reasoning checkpoint, not verbatim | The end of the model's earlier thinking, sent again after a long think |
 | harness instruction (repair or loop) | An instruction Microgentic added during the exchange |
+
+Below each heading, a muted line says why the message is in the request and
+its residency state: `pinned` for parts that always stay (the system prompt,
+project guidance, your current message, and the tools), `since turn N` for the
+turn of the exchange that added it, `last referenced turn N` for nested
+guidance the model has used since, and `demoted` for a result Microgentic
+shortened or merged. The trace records the same residency for every request.
 
 Each heading ends with `new` or `kept`. `new` means the previous request in
 this exchange did not have that message. On the first request of an exchange,

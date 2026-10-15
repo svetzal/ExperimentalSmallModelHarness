@@ -47,7 +47,8 @@ reads guidance. Guidance text cannot change them.
 ## See what loaded
 
 - In the conversation, `/guidance` lists the files with their size and status.
-- The status bar shows `📜` and the number of files in context.
+- The status bar shows `📜` and the number of standing items in context, which
+  today are the guidance files in the latest request.
 - Each trace has a `context.guidance.discovered` event. It records every
   candidate file's path, SHA-256, size, and whether it was included, cut, left
   out, or held as nested guidance.

@@ -300,19 +300,22 @@ non-empty value to turn colour off; bold and dim text remain.
 A status bar sits below the input, above the key hints:
 
 ```text
-🤖 qwen3.8:27b-mxfp8  🧠 low  📁 microgentic  🌿 main ●3 …2 ↑1  ctx:[███·······]31%
+🤖 qwen3.8:27b-mxfp8  🧠 low  📁 microgentic  🌿 main ●3 …2 ↑1  📜 2  ctx:[███·······]31%
 ```
 
 It shows the model, the reasoning effort (`default` when unset), the project
 folder, and the git branch with its changed-file count (`●`), untracked-file
 count (`…`), and commits ahead (`↑`) or behind (`↓`) its upstream. Git is read
 when the view opens, after each exchange, and after `/clear`; outside a
-repository the git segment is left out. The `ctx:` gauge is the runtime's token
-estimate for the latest model request against the model's context window: green
-below 60%, yellow up to 85%, red above. When the window size is unknown, the
-gauge shows only the estimate, such as `ctx: 12.4k`. A new conversation resets
-it. On a narrow terminal the git, folder, and effort segments drop out in that
-order, so the model and context stay visible.
+repository the git segment is left out. `📜` counts the standing items in the
+latest request, which today are the project guidance files. The `ctx:` gauge is
+the runtime's token estimate for the latest model request against the model's
+context window: green below 60%, yellow up to 85%, red above. The window comes
+from `--context-window-tokens`, the provider (asked once per conversation), or
+the built-in model table. When it is unknown, the gauge shows only the
+estimate, such as `ctx: 12.4k`. A new conversation resets it. On a narrow
+terminal the `📜`, git, folder, and effort segments drop out in that order, so
+the model and context stay visible.
 
 Each tool call is one line under the reply that requested it, and the line
 changes in place. A spinner shows while the call runs, `✓` when it succeeds,
@@ -375,7 +378,10 @@ thinking from earlier requests was sent and how many older exchanges were left
 out. Each element is marked `new` when the previous request of the exchange did
 not have it, or `kept` when it did. On the first request of an exchange,
 everything except the retained history is `new`. Summarized and consolidated
-elements say `not verbatim`, because the harness rewrote them. The panel
+elements say `not verbatim`, because the harness rewrote them. Under each
+element a muted line gives its inclusion reason and residency state (`pinned`,
+`since turn N`, `last referenced turn N`, `demoted`), and the tools line says
+`pinned`. The panel
 updates with each request, including requests inside a tool loop, and keeps
 showing the last one after the reply. Alt-Page Up/Down (or Shift-Page Up/Down)
 scroll it; a new request returns it to the newest rows. The panel needs a

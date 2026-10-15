@@ -7,7 +7,7 @@ use super::status_bar::compact_tokens;
 use super::styled::{Role, Row, Styled};
 use super::tool_lines::summarize;
 use super::wrap::wrap;
-use crate::context_snapshot::{ContextElement, ContextSnapshot, ElementKind};
+use crate::context_snapshot::{ContextElement, ContextSnapshot, ElementKind, ElementResidency};
 use std::cell::Cell;
 
 /// Narrowest terminal, in columns, that shows the panel beside the conversation.
@@ -222,9 +222,14 @@ fn body(snapshot: &ContextSnapshot) -> Styled {
     out.push(
         Role::Folder,
         &format!(
-            "Tools offered: {} · ~{} tok\n",
+            "Tools offered: {} · ~{} tok{}\n",
             snapshot.tools.len(),
-            compact_tokens(tool_tokens)
+            compact_tokens(tool_tokens),
+            if snapshot.tools_pinned {
+                " · pinned"
+            } else {
+                ""
+            }
         ),
     );
     if snapshot.tools.is_empty() {
@@ -260,6 +265,9 @@ fn element_text(element: &ContextElement, same_message: bool, out: &mut Styled) 
         out.push(Role::Muted, "kept");
     }
     out.push(Role::Plain, "\n");
+    if let Some(residency) = &element.residency {
+        out.push(Role::Muted, &format!("  {}\n", residency_line(residency)));
+    }
     let call_verb = if element.role == "tool" {
         "answers"
     } else {
@@ -297,6 +305,22 @@ fn element_text(element: &ContextElement, same_message: bool, out: &mut Styled) 
             &format!("  … {} more chars\n", thousands(element.omitted_chars)),
         );
     }
+}
+
+/// Why an element is in the request and its residency state, in words.
+fn residency_line(residency: &ElementResidency) -> String {
+    let mut parts = vec![residency.reason.replace('_', " ")];
+    if residency.pinned {
+        parts.push("pinned".into());
+    }
+    parts.push(format!("since turn {}", residency.activated_turn));
+    if let Some(turn) = residency.last_referenced_turn {
+        parts.push(format!("last referenced turn {turn}"));
+    }
+    if residency.demoted {
+        parts.push("demoted".into());
+    }
+    parts.join(" · ")
 }
 
 fn kind_label(kind: ElementKind) -> &'static str {
@@ -366,6 +390,7 @@ mod tests {
             omitted_chars: 0,
             reasoning_chars: 0,
             new: false,
+            residency: None,
         }
     }
 
@@ -423,6 +448,7 @@ mod tests {
                 name: "read_file".into(),
                 tokens: 150,
             }],
+            tools_pinned: false,
         }
     }
 
@@ -537,6 +563,42 @@ Tools offered: 1 · ~150 tok
         );
         assert!(text.contains("Earlier reasoning: retained."), "{text}");
         assert!(text.contains("Older exchanges omitted: 2"), "{text}");
+    }
+
+    #[test]
+    fn residency_shows_why_each_element_is_there_and_its_state() {
+        let mut snapshot = snapshot();
+        let residency = |reason: &str, pinned, last, demoted| ElementResidency {
+            reason: reason.into(),
+            pinned,
+            activated_turn: 2,
+            last_referenced_turn: last,
+            demoted,
+        };
+        snapshot.elements[0].residency = Some(residency("base_system_prompt", true, None, false));
+        snapshot.elements[5].residency = Some(residency(
+            "retained_summarized_tool_result",
+            false,
+            Some(3),
+            true,
+        ));
+        snapshot.tools_pinned = true;
+        let mut panel = ContextPanel::default();
+        panel.begin_exchange(true);
+        panel.receive(snapshot);
+        let text = rows_text(&panel.rows(200, 100)).join("\n");
+        assert!(
+            text.contains("1. system · system prompt · ~5 tok · kept\n  base system prompt · pinned · since turn 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  retained summarized tool result · since turn 2 · last referenced turn 3 · demoted\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Tools offered: 1 · ~150 tok · pinned"),
+            "{text}"
+        );
     }
 
     #[test]

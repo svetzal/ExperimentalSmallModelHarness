@@ -52,6 +52,10 @@ pub(crate) enum ConversationEvent {
     ContextUsage {
         used_tokens: usize,
         window_tokens: Option<usize>,
+        /// Standing items in the request (guidance files now, skills later),
+        /// when the run records residency.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        standing_items: Option<usize>,
     },
     /// What the model received in the request just assembled, bounded for
     /// the view's context panel.
@@ -109,6 +113,8 @@ struct RequestTracking {
     previous: HashSet<u64>,
     /// From the latest context ledger, which precedes each request.
     window_tokens: Option<usize>,
+    /// The latest ledger's residency records, for the panel.
+    residency: Vec<Value>,
 }
 
 /// Fingerprints of retained history, redacted as the trace recorder redacts
@@ -379,7 +385,9 @@ impl ConversationRun {
             omitted_exchanges: self.omitted_exchanges,
             window_tokens: requests.window_tokens,
         };
-        let (snapshot, seen) = crate::context_snapshot::build(payload, &facts, &requests.previous);
+        let (mut snapshot, seen) =
+            crate::context_snapshot::build(payload, &facts, &requests.previous);
+        crate::context_snapshot::attach_residency(&mut snapshot, &requests.residency);
         requests.previous = seen;
         drop(requests);
         self.emit(ConversationEvent::ContextSnapshot { snapshot });
@@ -403,10 +411,10 @@ impl ConversationRun {
             "llm.context_assembly.ledger" => {
                 if let Some(usage) = context_usage(payload) {
                     if let ConversationEvent::ContextUsage { window_tokens, .. } = &usage {
-                        self.requests
-                            .lock()
-                            .expect("request tracking poisoned")
-                            .window_tokens = *window_tokens;
+                        let mut requests = self.requests.lock().expect("request tracking poisoned");
+                        requests.window_tokens = *window_tokens;
+                        requests.residency =
+                            payload["residency"].as_array().cloned().unwrap_or_default();
                     }
                     self.emit(usage);
                 }
@@ -471,6 +479,9 @@ fn context_usage(ledger: &Value) -> Option<ConversationEvent> {
             .as_u64()
             .or_else(|| ledger["context_window_tokens"].as_u64())
             .and_then(|window| usize::try_from(window).ok()),
+        standing_items: ledger["standing_context"]["items"]
+            .as_u64()
+            .and_then(|items| usize::try_from(items).ok()),
     })
 }
 
@@ -624,6 +635,24 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn a_known_window_and_standing_items_reach_the_view() {
+        let usage = context_usage(&json!({
+            "estimated_tokens": 26_214,
+            "context_window_tokens": null,
+            "known_window": {"tokens": 262_144, "source": "provider"},
+            "standing_context": {"items": 2},
+        }));
+        assert!(matches!(
+            usage,
+            Some(ConversationEvent::ContextUsage {
+                used_tokens: 26_214,
+                window_tokens: Some(262_144),
+                standing_items: Some(2),
+            })
+        ));
+    }
+
+    #[test]
     fn ledgers_report_context_use_without_inventing_a_window() {
         let known =
             context_usage(&json!({"estimated_tokens": 81_265, "context_window_tokens": 262_144}));
@@ -631,7 +660,8 @@ mod tests {
             known,
             Some(ConversationEvent::ContextUsage {
                 used_tokens: 81_265,
-                window_tokens: Some(262_144)
+                window_tokens: Some(262_144),
+                standing_items: None,
             })
         ));
         let unknown =
@@ -640,7 +670,8 @@ mod tests {
             unknown,
             Some(ConversationEvent::ContextUsage {
                 used_tokens: 1_200,
-                window_tokens: None
+                window_tokens: None,
+                standing_items: None,
             })
         ));
         assert!(context_usage(&json!({"pressure_band": "green"})).is_none());

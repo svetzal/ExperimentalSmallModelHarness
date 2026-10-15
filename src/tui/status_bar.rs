@@ -149,8 +149,9 @@ pub(super) struct BarState<'a> {
     pub(super) folder: &'a str,
     pub(super) git: Option<&'a GitStatus>,
     pub(super) context: Option<ContextUsage>,
-    /// How many project guidance files are in the model's context.
-    pub(super) guidance: usize,
+    /// Standing items in the model's context: guidance files now, skills
+    /// later.
+    pub(super) standing: usize,
 }
 
 /// The segments that fit in `width` cells, in order. When they do not all
@@ -178,11 +179,12 @@ pub(super) fn status_segments(state: &BarState, width: usize) -> Vec<Styled> {
     if let Some(git) = state.git {
         segments.push((1, git_segment(git)));
     }
-    if state.guidance > 0 {
-        // The first segment to drop on a narrow terminal.
+    if state.standing > 0 {
+        // Beside the gauge, and the first segment to drop on a narrow
+        // terminal.
         segments.push((
             0,
-            Styled::default().with(Role::Muted, &format!("📜 {}", state.guidance)),
+            Styled::default().with(Role::Muted, &format!("📜 {}", state.standing)),
         ));
     }
     if let Some(context) = state.context {
@@ -352,7 +354,7 @@ mod tests {
                 used_tokens: 9_000,
                 window_tokens: Some(100_000),
             }),
-            guidance: 0,
+            standing: 0,
         }
     }
 
@@ -404,7 +406,7 @@ mod tests {
     #[test]
     fn the_guidance_hint_is_the_first_segment_to_drop() {
         let with_guidance = BarState {
-            guidance: 2,
+            standing: 2,
             ..state(None)
         };
         let full = status_bar(&with_guidance, 200);
