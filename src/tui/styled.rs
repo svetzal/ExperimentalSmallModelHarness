@@ -22,6 +22,7 @@ pub(super) enum Role {
     SparkDim,
     /// A letter about to land, before it takes the wordmark colour.
     Flash,
+    Thinking,
     Error,
     Prompt,
     System,
@@ -50,35 +51,38 @@ impl Palette {
     }
 
     pub(super) fn style(self, role: Role) -> ContentStyle {
-        let (colour, attribute) = match role {
-            Role::Plain => (None, None),
-            Role::AgentLabel | Role::Wordmark => (Some(Color::DarkMagenta), Some(Attribute::Bold)),
-            Role::Spark => (Some(Color::DarkMagenta), None),
-            Role::SparkDim => (Some(Color::DarkMagenta), Some(Attribute::Dim)),
+        let (colour, attributes): (Option<Color>, &[Attribute]) = match role {
+            Role::Plain => (None, &[]),
+            Role::AgentLabel | Role::Wordmark => (Some(Color::DarkMagenta), &[Attribute::Bold]),
+            Role::Spark => (Some(Color::DarkMagenta), &[]),
+            Role::SparkDim => (Some(Color::DarkMagenta), &[Attribute::Dim]),
             // Bold default foreground: bright on dark themes, dark on light ones.
-            Role::Flash => (None, Some(Attribute::Bold)),
-            Role::UserLabel | Role::Prompt => (Some(Color::DarkCyan), Some(Attribute::Bold)),
-            Role::Muted => (None, Some(Attribute::Dim)),
-            Role::System => (None, Some(Attribute::Italic)),
-            Role::Success => (Some(Color::DarkGreen), Some(Attribute::Bold)),
-            Role::Model => (Some(Color::DarkGreen), None),
-            Role::Effort => (Some(Color::DarkYellow), None),
-            Role::Folder => (None, Some(Attribute::Bold)),
-            Role::Branch => (Some(Color::DarkCyan), None),
+            Role::Flash => (None, &[Attribute::Bold]),
+            Role::UserLabel | Role::Prompt => (Some(Color::DarkCyan), &[Attribute::Bold]),
+            Role::Muted => (None, &[Attribute::Dim]),
+            Role::System => (None, &[Attribute::Italic]),
+            // The model's thinking: dim and italic, so it reads apart from replies
+            // with or without colour.
+            Role::Thinking => (None, &[Attribute::Dim, Attribute::Italic]),
+            Role::Success => (Some(Color::DarkGreen), &[Attribute::Bold]),
+            Role::Model => (Some(Color::DarkGreen), &[]),
+            Role::Effort => (Some(Color::DarkYellow), &[]),
+            Role::Folder => (None, &[Attribute::Bold]),
+            Role::Branch => (Some(Color::DarkCyan), &[]),
             // Orange has no named ANSI colour; 208 reads on light and dark themes.
-            Role::Dirty => (Some(Color::AnsiValue(208)), None),
-            Role::Failure => (Some(Color::DarkRed), Some(Attribute::Bold)),
-            Role::Error => (Some(Color::DarkRed), None),
-            Role::Ready => (Some(Color::DarkGreen), Some(Attribute::Bold)),
-            Role::Working => (Some(Color::DarkYellow), Some(Attribute::Bold)),
-            Role::Stopped => (Some(Color::DarkRed), Some(Attribute::Bold)),
+            Role::Dirty => (Some(Color::AnsiValue(208)), &[]),
+            Role::Failure => (Some(Color::DarkRed), &[Attribute::Bold]),
+            Role::Error => (Some(Color::DarkRed), &[]),
+            Role::Ready => (Some(Color::DarkGreen), &[Attribute::Bold]),
+            Role::Working => (Some(Color::DarkYellow), &[Attribute::Bold]),
+            Role::Stopped => (Some(Color::DarkRed), &[Attribute::Bold]),
         };
         let mut style = ContentStyle::new();
         if self.colour {
             style.foreground_color = colour;
         }
-        if let Some(attribute) = attribute {
-            style.attributes.set(attribute);
+        for attribute in attributes {
+            style.attributes.set(*attribute);
         }
         style
     }

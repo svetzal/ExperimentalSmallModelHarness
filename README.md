@@ -283,6 +283,16 @@ directory and depth for a tree listing, the file for a write or edit, and the
 command for a shell call. Long paths keep their end, and long commands keep
 their start.
 
+While the model thinks, its thinking streams into the reply in dim italic
+text, showing the last six rows with a `…` above when earlier text scrolls
+away. When the thinking ends it shrinks: before tool calls it becomes one
+`∴` line with its last sentence, just above the calls it led to; before a
+reply it disappears, because the reply speaks for itself. If the run stops
+mid-thought, the `∴` line is marked `stopped`. The status line still shows
+how much the model has thought and for how long. Whitespace the model sends
+before tool calls no longer opens blank rows, so tool groups from successive
+model turns read as one block.
+
 Type a command that starts with `/` in the input. Commands run in the TUI and
 are never sent to the model:
 

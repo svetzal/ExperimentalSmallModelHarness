@@ -7,6 +7,7 @@ mod picker;
 mod session;
 mod status_bar;
 mod styled;
+mod thinking;
 mod tool_lines;
 
 use crate::conversation::ConversationEvent;
@@ -36,6 +37,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use styled::{Palette, Role, Styled, first_row, wrap};
+use thinking::Ending;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -329,7 +331,7 @@ fn compose(view: &View, session: &Session, frame: usize, columns: u16, lines: u1
         let rule = Styled::default().with(Role::Muted, &"─".repeat(width));
         canvas.put(usize::from(rule_row), margin, &first_row(&rule, width));
     }
-    let history = wrap(&view.history.render(frame), width);
+    let history = wrap(&view.history.render(frame, width), width);
     let end = history.len().saturating_sub(view.scroll.min(history.len()));
     let start = end.saturating_sub(usize::from(rule_row));
     for (index, row) in history[start..end].iter().enumerate() {
@@ -470,7 +472,9 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                         view.status = Status::new(Phase::Stopped, "Run could not start.");
                     }
                 }
-                // Calls that never reported a result must not spin on.
+                // Calls that never reported a result must not spin on, and
+                // thinking cut off by the run's end must not stay expanded.
+                view.history.end_thinking(Ending::Stopped);
                 view.history.stop_running();
                 session.refresh_git();
                 view.scroll = 0;
@@ -634,6 +638,8 @@ fn tool_activity(history: &History) -> String {
 fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
     match event {
         ConversationEvent::ReplyStarted => {
+            // A new model turn: thinking left open by the last turn collapses.
+            view.history.end_thinking(Ending::TurnEnded);
             view.history.start_line();
             view.history.begin_reply();
             if !run.replied {
@@ -645,6 +651,9 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
                 run.streamed_text.push('\n');
             }
             run.activity = "Waiting for response".into();
+        }
+        ConversationEvent::ThinkingDelta { text } => {
+            view.history.think(&text);
         }
         ConversationEvent::Content { text } => {
             view.history.push_reply(&text);
@@ -682,6 +691,7 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             run.activity = message;
         }
         ConversationEvent::Finished { summary } => {
+            view.history.end_thinking(Ending::TurnEnded);
             view.history.stop_running();
             let final_summary = summary["final_summary"].as_str().unwrap_or("No summary");
             if run.streamed_text.is_empty() || !run.streamed_text.contains(final_summary) {
@@ -705,6 +715,7 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             run.terminal_reported = true;
         }
         ConversationEvent::Failed { message } => {
+            view.history.end_thinking(Ending::Stopped);
             view.history.stop_running();
             view.history.start_line();
             view.history.push(
@@ -762,7 +773,7 @@ mod tests {
 
     fn history_text(view: &View) -> String {
         view.history
-            .render(0)
+            .render(0, 200)
             .runs
             .iter()
             .map(|(_, text)| text.as_str())

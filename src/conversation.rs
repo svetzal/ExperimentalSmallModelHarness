@@ -22,6 +22,10 @@ pub(crate) enum ConversationEvent {
     Content {
         text: String,
     },
+    /// A piece of the model's thinking, as the provider streams it.
+    ThinkingDelta {
+        text: String,
+    },
     /// A model-requested tool call, before it runs. `call_id` is empty when the
     /// provider gave none; the view then matches results by name and order.
     ToolStarted {

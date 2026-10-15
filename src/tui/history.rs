@@ -6,12 +6,14 @@
 //! Whitespace-only reply content never opens blank rows: it is held until
 //! visible text follows it in the same reply segment, and dropped otherwise.
 use super::styled::{Role, Styled};
+use super::thinking::{Ending, Thinking, ThinkingState};
 use super::tool_lines::{CallState, ToolLine};
 
 #[derive(Debug)]
 enum Entry {
     Text(Styled),
     Tool(ToolLine),
+    Thinking(Thinking),
 }
 
 /// Conversation history with a revision that changes on every edit, so the
@@ -45,7 +47,7 @@ impl History {
 
     fn at_line_start(&self) -> bool {
         match self.entries.last() {
-            None | Some(Entry::Tool(_)) => true,
+            None | Some(Entry::Tool(_) | Entry::Thinking(_)) => true,
             Some(Entry::Text(styled)) => styled
                 .runs
                 .last()
@@ -109,6 +111,8 @@ impl History {
             return;
         };
         let visible: String = self.held.drain(..last + ch.len_utf8()).collect();
+        // Visible reply text means the thinking before it is no longer needed.
+        self.end_thinking(Ending::Reply);
         let visible = if self.reply_visible {
             visible.as_str()
         } else {
@@ -122,6 +126,7 @@ impl History {
     pub(super) fn start_tool(&mut self, line: ToolLine) {
         // A tool block ends the reply segment; its held whitespace is dropped.
         self.begin_reply();
+        self.end_thinking(Ending::Tools);
         let existing = self.entries.iter_mut().rev().find_map(|entry| match entry {
             Entry::Tool(shown) if !line.call_id.is_empty() && shown.call_id == line.call_id => {
                 Some(shown)
@@ -155,6 +160,40 @@ impl History {
         }
     }
 
+    /// Stream thinking text into the live thinking block, starting one if
+    /// none is open.
+    pub(super) fn think(&mut self, text: &str) {
+        match self.entries.last_mut() {
+            Some(Entry::Thinking(thinking)) if thinking.state == ThinkingState::Live => {
+                thinking.text.push_str(text);
+            }
+            _ => {
+                self.begin_reply();
+                self.entries.push(Entry::Thinking(Thinking::live(text)));
+            }
+        }
+        self.revision += 1;
+    }
+
+    /// Collapse or remove the live thinking block according to what followed.
+    pub(super) fn end_thinking(&mut self, ending: Ending) {
+        let Some(index) = self.entries.iter().rposition(
+            |entry| matches!(entry, Entry::Thinking(thinking) if thinking.state == ThinkingState::Live),
+        ) else {
+            return;
+        };
+        let Entry::Thinking(thinking) = &mut self.entries[index] else {
+            return;
+        };
+        match thinking.end(ending) {
+            Some(state) => thinking.state = state,
+            None => {
+                self.entries.remove(index);
+            }
+        }
+        self.revision += 1;
+    }
+
     /// Mark calls that never reported a result, so nothing spins after a run.
     pub(super) fn stop_running(&mut self) {
         for entry in &mut self.entries {
@@ -181,10 +220,19 @@ impl History {
             .any(|entry| matches!(entry, Entry::Tool(line) if line.state == CallState::Running))
     }
 
-    /// The whole history as styled text, with spinners at `frame`.
-    pub(super) fn render(&self, frame: usize) -> Styled {
+    /// The whole history as styled text for `width` cells, with spinners at
+    /// `frame`. Tool and thinking lines always start on a fresh line.
+    pub(super) fn render(&self, frame: usize, width: usize) -> Styled {
         let mut out = Styled::default();
         for entry in &self.entries {
+            if !matches!(entry, Entry::Text(_))
+                && out
+                    .runs
+                    .last()
+                    .is_some_and(|(_, text)| !text.ends_with('\n'))
+            {
+                out.push(Role::Plain, "\n");
+            }
             match entry {
                 Entry::Text(styled) => {
                     for (role, text) in &styled.runs {
@@ -192,6 +240,7 @@ impl History {
                     }
                 }
                 Entry::Tool(line) => line.render(frame, &mut out),
+                Entry::Thinking(thinking) => thinking.render(width, &mut out),
             }
         }
         out
@@ -233,7 +282,7 @@ mod tests {
 
     fn text(history: &History) -> String {
         history
-            .render(0)
+            .render(0, 200)
             .runs
             .iter()
             .map(|(_, text)| text.as_str())
@@ -252,7 +301,7 @@ mod tests {
         history.push(Role::Plain, "lo");
         history.push(Role::Plain, "");
         assert_eq!(
-            history.render(0).runs,
+            history.render(0, 200).runs,
             [
                 (Role::AgentLabel, "Microgentic:".to_owned()),
                 (Role::Plain, " Hello".to_owned())
@@ -260,6 +309,60 @@ mod tests {
         );
         // Every edit changes the redraw signature, even one that adds nothing visible.
         assert_eq!(history.revision, 4);
+    }
+
+    fn think(history: &mut History, chunks: &[&str]) {
+        for chunk in chunks {
+            history.think(chunk);
+        }
+    }
+
+    #[test]
+    fn thinking_before_tools_collapses_to_its_last_line_above_them() {
+        let mut history = History::default();
+        history.push(Role::AgentLabel, "Microgentic: ");
+        think(
+            &mut history,
+            &["\nThe user wants", " the pacing.\nI'll search", " first.\n"],
+        );
+        assert_eq!(
+            text(&history),
+            "Microgentic: \n  The user wants the pacing.\n  I'll search first.\n"
+        );
+        history.push_reply("\n\n");
+        history.start_tool(call("c1", "shell_command", "x"));
+        history.finish_tool("c1", "shell_command", true);
+        think(&mut history, &["The constant is likely in launch.rs."]);
+        history.start_tool(call("c2", "read_file", "src/tui/launch.rs"));
+        history.finish_tool("c2", "read_file", true);
+        think(&mut history, &["I have what I need."]);
+        history.push_reply("\n\nThe pace is set by `PACE`.");
+        assert_eq!(
+            text(&history),
+            "Microgentic: \n  ∴ I'll search first.\n  ✓ shell_command\n  ∴ The constant is likely in launch.rs.\n  ✓ read_file src/tui/launch.rs\nThe pace is set by `PACE`."
+        );
+    }
+
+    #[test]
+    fn thinking_before_a_reply_is_removed() {
+        let mut history = History::default();
+        history.push(Role::AgentLabel, "Microgentic: ");
+        think(&mut history, &["Just a greeting."]);
+        history.push_reply("Hello!");
+        assert_eq!(text(&history), "Microgentic: Hello!");
+    }
+
+    #[test]
+    fn a_stopped_run_never_leaves_thinking_expanded() {
+        let mut history = History::default();
+        think(&mut history, &["One.\nTwo, still going"]);
+        history.end_thinking(Ending::Stopped);
+        assert_eq!(text(&history), "  ∴ Two, still going · stopped\n");
+        // Ending again changes nothing, and blank thinking leaves no trace.
+        history.end_thinking(Ending::Reply);
+        think(&mut history, &["\n \n"]);
+        history.end_thinking(Ending::Tools);
+        assert_eq!(text(&history), "  ∴ Two, still going · stopped\n");
     }
 
     #[test]

@@ -2538,6 +2538,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     );
                     call_thinking_chunk_count += 1;
                     call_thinking_chars += thinking.len();
+                    trace.stream_thinking(&thinking);
                     push_bounded_buffer(
                         &mut call_action_intent_buffer,
                         &thinking,

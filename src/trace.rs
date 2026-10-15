@@ -79,6 +79,15 @@ impl TraceRecorder {
         }
     }
 
+    /// Stream the model's thinking to an open conversation view. Traces keep
+    /// their own bounded previews; this does not change them.
+    pub(crate) fn stream_thinking(&self, text: &str) {
+        if let Some(conversation) = &self.conversation {
+            conversation
+                .emit(crate::conversation::ConversationEvent::ThinkingDelta { text: text.into() });
+        }
+    }
+
     /// Report a requested tool call to an open conversation view.
     pub(crate) fn tool_requested(&self, call: &mojentic::llm::models::LlmToolCall) {
         if let Some(conversation) = &self.conversation {

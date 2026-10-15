@@ -235,7 +235,7 @@ mod tests {
 
     fn history_text(view: &View) -> String {
         view.history
-            .render(0)
+            .render(0, 200)
             .runs
             .iter()
             .map(|(_, text)| text.as_str())
@@ -251,7 +251,10 @@ mod tests {
         assert!(session.state.is_none());
         assert!(history_text(&view).contains("next message starts a new conversation"));
         assert!(history_text(&view).contains("microgentic setup"));
-        assert_eq!(view.history.render(0).runs.last().unwrap().0, Role::System);
+        assert_eq!(
+            view.history.render(0, 200).runs.last().unwrap().0,
+            Role::System
+        );
 
         session.state = Some(PathBuf::from("/state/session-2/conversation.json"));
         run_command(&mut view, &mut session, Command::SetModel("second".into()));
