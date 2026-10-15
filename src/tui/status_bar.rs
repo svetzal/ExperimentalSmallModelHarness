@@ -118,7 +118,7 @@ pub(super) fn context_gauge(usage: ContextUsage) -> Styled {
         .with(role, &format!("{percent}%"))
 }
 
-fn compact_tokens(tokens: usize) -> String {
+pub(super) fn compact_tokens(tokens: usize) -> String {
     match tokens {
         0..1_000 => tokens.to_string(),
         1_000..1_000_000 => format!("{:.1}k", tokens as f64 / 1_000.0),

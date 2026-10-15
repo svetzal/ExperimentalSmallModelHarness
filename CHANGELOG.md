@@ -10,6 +10,18 @@ The release workflow publishes each version's section as its GitHub release note
 
 ## [Unreleased]
 
+### Added
+
+- A context panel in the conversation view. Ctrl-O or `/context` opens it to
+  the right of the conversation. It lists every message and tool descriptor in
+  the latest model request, in order, with its kind, an estimated token count,
+  and its first lines. It says whether the model's earlier thinking was sent
+  (by default it is not) and how many older exchanges were left out. It marks
+  summarized and consolidated tool output as not verbatim, and marks each
+  message `new` or `kept` against the previous request. It updates with every
+  request, including tool loops. Alt-Page Up/Down scroll it. Provider requests
+  are unchanged.
+
 ## [0.3.0] - 2026-10-15
 
 The agent gets a calculator and reads project guidance, and the conversation

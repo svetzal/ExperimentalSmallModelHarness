@@ -12,6 +12,16 @@ pub(super) enum Command {
     SetEffort(Option<String>),
     Clear,
     Guidance,
+    /// Show or hide the context panel.
+    Context,
+}
+
+impl Command {
+    /// Commands that only change what the view shows, never the settings a
+    /// running reply depends on.
+    pub(super) fn allowed_while_replying(&self) -> bool {
+        matches!(self, Command::Help | Command::Context)
+    }
 }
 
 /// What Enter does with the input.
@@ -38,7 +48,7 @@ impl CommandSpec {
 }
 
 /// One table drives help, footer hints, and Tab completion.
-const COMMANDS: [CommandSpec; 5] = [
+const COMMANDS: [CommandSpec; 6] = [
     CommandSpec {
         name: "/model",
         argument: Some("[id]"),
@@ -58,6 +68,11 @@ const COMMANDS: [CommandSpec; 5] = [
         name: "/guidance",
         argument: None,
         summary: "List the project guidance files and their status",
+    },
+    CommandSpec {
+        name: "/context",
+        argument: None,
+        summary: "Show or hide what the model received in its latest request (Ctrl-O)",
     },
     CommandSpec {
         name: "/help",
@@ -89,7 +104,8 @@ pub(super) fn parse_submission(input: &str) -> Submission {
         ("/help", "") => Command::Help,
         ("/clear", "") => Command::Clear,
         ("/guidance", "") => Command::Guidance,
-        ("/help" | "/clear" | "/guidance", _) => {
+        ("/context", "") => Command::Context,
+        ("/help" | "/clear" | "/guidance" | "/context", _) => {
             return Submission::Invalid(format!("{name} does not take an argument."));
         }
         ("/model", "") => Command::ShowModel,
@@ -149,9 +165,12 @@ pub(super) fn complete(input: &str) -> Option<String> {
     }
 }
 
-pub(super) fn footer(input: &str) -> Styled {
+/// Key hints, or the matching commands while one is typed. With the context
+/// panel open, its keys replace the less needed ones.
+pub(super) fn footer(input: &str, context_panel: bool) -> Styled {
     let text = match command_matches(input).as_deref() {
-        None => "Enter send | Alt-Enter newline | PgUp/PgDn scroll | Ctrl-C cancel | Esc quit | /help commands".to_owned(),
+        None if context_panel => "Enter send | PgUp/PgDn chat | Alt-PgUp/PgDn context | Ctrl-O hide | Ctrl-C cancel | Esc quit".to_owned(),
+        None => "Enter send | Alt-Enter newline | PgUp/PgDn scroll | Ctrl-C cancel | Esc quit | Ctrl-O context | /help commands".to_owned(),
         Some([]) => "No matching command. Type /help to see commands.".to_owned(),
         Some([only]) => format!("{} · {} · Tab completes", only.usage(), only.summary),
         Some(several) => format!(
@@ -205,6 +224,7 @@ mod tests {
         assert_eq!(command("/help"), Command::Help);
         assert_eq!(command("/clear"), Command::Clear);
         assert_eq!(command("/guidance"), Command::Guidance);
+        assert_eq!(command("/context"), Command::Context);
         assert_eq!(command("/model"), Command::ShowModel);
         assert_eq!(
             command("/model qwen3:8b"),
@@ -273,6 +293,10 @@ mod tests {
         );
         assert_eq!(invalid("/clear now"), "/clear does not take an argument.");
         assert_eq!(invalid("/help me"), "/help does not take an argument.");
+        assert_eq!(
+            invalid("/context all"),
+            "/context does not take an argument."
+        );
     }
 
     #[test]
@@ -304,10 +328,10 @@ mod tests {
         assert_eq!(names("/model other"), Some(vec!["/model"]));
         assert_eq!(names("/mo x"), Some(vec![]));
         assert_eq!(names("/z"), Some(vec![]));
-        let footer_text = |input: &str| rows_text(&wrap(&footer(input), 200)).remove(0);
+        let footer_text = |input: &str| rows_text(&wrap(&footer(input, false), 200)).remove(0);
         assert!(footer_text("").starts_with("Enter send"));
         assert!(footer_text("/e").starts_with("/effort [level] · Show or set"));
-        assert!(footer_text("/").contains("/model  /effort  /clear  /guidance  /help"));
+        assert!(footer_text("/").contains("/model  /effort  /clear  /guidance  /context  /help"));
         assert!(footer_text("/g").starts_with("/guidance · List the project guidance"));
         assert!(footer_text("/z").starts_with("No matching command"));
     }
@@ -316,6 +340,8 @@ mod tests {
     fn tab_completes_only_a_unique_match() {
         assert_eq!(complete("/m").as_deref(), Some("/model "));
         assert_eq!(complete("/cl").as_deref(), Some("/clear"));
+        assert_eq!(complete("/co").as_deref(), Some("/context"));
+        assert_eq!(complete("/c"), None);
         assert_eq!(complete("/"), None);
         assert_eq!(complete("/model x"), None);
         assert_eq!(complete("hello"), None);

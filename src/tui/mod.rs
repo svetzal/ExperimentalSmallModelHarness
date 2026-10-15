@@ -1,6 +1,7 @@
 //! Terminal conversation with native history and a live worker event stream.
 mod canvas;
 mod commands;
+mod context_panel;
 mod history;
 mod launch;
 mod picker;
@@ -15,6 +16,7 @@ use crate::conversation::ConversationEvent;
 use anyhow::{Context, Result};
 use canvas::Canvas;
 use commands::{Command, Submission, complete, footer, parse_submission};
+use context_panel::{ContextPanel, Split};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
@@ -126,6 +128,16 @@ struct View {
     context: Option<ContextUsage>,
     /// Nested guidance files the model has been shown in this conversation.
     guidance_shown: std::collections::BTreeSet<String>,
+    /// What the model received in its latest request, beside the conversation.
+    context_panel: ContextPanel,
+}
+
+impl View {
+    /// The conversation is starting over, so its context no longer applies.
+    fn forget_context(&mut self) {
+        self.context = None;
+        self.context_panel.forget();
+    }
 }
 
 /// Give a key to the open panel. Returns false when no panel is open, so the
@@ -168,15 +180,46 @@ fn handle_panel_key(view: &mut View, session: &mut Session, key: event::KeyEvent
 }
 
 /// The bottom line: the open panel's keys, or command hints and key help.
-fn hints(view: &View) -> Styled {
+/// When the context panel is open but does not fit, the line says so.
+fn hints(view: &View, split: Option<Split>) -> Styled {
     match &view.panel {
         Some(Panel::Loading(_)) => Styled::default().with(Role::Muted, "Esc cancel"),
         Some(Panel::Choose(_)) => Styled::default().with(
             Role::Muted,
             "↑/↓ move | Home/End first/last | Enter choose | Esc cancel",
         ),
-        None => footer(&view.input),
+        None if view.context_panel.visible && split.is_none() && !view.input.starts_with('/') => {
+            Styled::default().with(Role::Working, &context_panel::too_small_hint())
+        }
+        None => footer(&view.input, split.is_some()),
     }
+}
+
+/// Where the context panel goes, when it is open and the terminal fits it.
+fn context_split(view: &View, columns: u16, lines: u16) -> Option<Split> {
+    view.context_panel
+        .visible
+        .then(|| context_panel::split(columns, lines))
+        .flatten()
+}
+
+/// Keys for the context panel, which work whatever else is open. Returns
+/// false when the key has another meaning.
+fn handle_context_key(view: &mut View, key: event::KeyEvent, (columns, lines): (u16, u16)) -> bool {
+    // Without room for the panel, Shift- and Alt-PgUp scroll the conversation.
+    let shown = context_split(view, columns, lines).is_some();
+    let scroll_modifier = key
+        .modifiers
+        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            view.context_panel.toggle()
+        }
+        KeyCode::PageUp if shown && scroll_modifier => view.context_panel.scroll_back(),
+        KeyCode::PageDown if shown && scroll_modifier => view.context_panel.scroll_forward(),
+        _ => return false,
+    }
+    true
 }
 
 fn panel_rows(panel: &Panel, height: usize, frame: usize) -> Vec<Styled> {
@@ -226,13 +269,14 @@ fn submit(view: &mut View, session: &mut Session, active: &mut Option<ActiveRun>
             view.history.start_block();
             view.history.push(Role::UserLabel, "You:");
             view.history.push(Role::Plain, &format!(" {prompt}\n"));
+            view.context_panel.begin_exchange(session.state.is_none());
             *active = start_reply(view, session, &prompt)?;
         }
         Submission::Command(command) => {
             view.history.start_block();
             view.history
                 .push(Role::Muted, &format!("{}\n", typed.trim()));
-            if active.is_some() && command != Command::Help {
+            if active.is_some() && !command.allowed_while_replying() {
                 let name = typed.split_whitespace().next().unwrap_or_default();
                 view.history.push(Role::Error, &format!("{name} is unavailable while Microgentic is replying. Wait for the reply or press Ctrl-C to cancel it, then try again.\n"));
             } else {
@@ -317,10 +361,28 @@ fn start_reply(view: &mut View, session: &mut Session, prompt: &str) -> Result<O
 
 /// Compose the screen, top to bottom: history, a rule, the working/ready
 /// status line, any open panel, the input, the status bar, and the key hints.
+/// An open context panel takes the right side above the status bar, and the
+/// conversation wraps to the columns left of it.
 fn compose(view: &View, session: &Session, frame: usize, columns: u16, lines: u16) -> Scene {
-    let width = usize::from(columns.saturating_sub(2)).max(1);
+    let full_width = usize::from(columns.saturating_sub(2)).max(1);
+    let split = context_split(view, columns, lines);
+    let width = split.map_or(full_width, |split| split.left_columns - 2);
     let mut canvas = Canvas::new(usize::from(lines), usize::from(columns));
     let margin = usize::from(columns > 1);
+    if let Some(split) = split {
+        let height = usize::from(lines.saturating_sub(2));
+        for row in 0..height {
+            canvas.put_str(row, split.separator, "│", Role::Muted);
+        }
+        for (index, row) in view
+            .context_panel
+            .rows(split.width, height)
+            .iter()
+            .enumerate()
+        {
+            canvas.put(index, split.column, row);
+        }
+    }
     let input = Styled::default()
         .with(Role::Prompt, "> ")
         .with(Role::Plain, &view.input);
@@ -364,15 +426,20 @@ fn compose(view: &View, session: &Session, frame: usize, columns: u16, lines: u1
     {
         canvas.put(usize::from(input_top) + index, margin, row);
     }
-    let segments = status_segments(&bar_state(view, session), width);
+    // The status bar and key hints stay full width.
+    let segments = status_segments(&bar_state(view, session), full_width);
     let bar_row = usize::from(lines.saturating_sub(2));
     canvas.put(
         bar_row,
         margin,
-        &first_row(&join_segments(&segments), width),
+        &first_row(&join_segments(&segments), full_width),
     );
     let hint_row = usize::from(lines.saturating_sub(1));
-    canvas.put(hint_row, margin, &first_row(&hints(view), width));
+    canvas.put(
+        hint_row,
+        margin,
+        &first_row(&hints(view, split), full_width),
+    );
     Scene {
         rest: canvas,
         history_rows: usize::from(rule_row),
@@ -433,6 +500,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
         panel: None,
         context: None,
         guidance_shown: Default::default(),
+        context_panel: Default::default(),
     };
     view.history.reset();
     let mut active: Option<ActiveRun> = None;
@@ -539,6 +607,11 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 view.scroll,
                 view.status.clone(),
                 view.panel.clone(),
+                (
+                    view.context_panel.visible,
+                    view.context_panel.revision,
+                    view.context_panel.scroll(),
+                ),
                 terminal::size()?,
             );
             if last_draw.as_ref() != Some(&signature) {
@@ -554,10 +627,14 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
             // Any key, paste or resize skips to the resting screen, and the
             // event still has its usual effect below.
             launch_started = None;
+            let size = terminal::size()?;
             match event {
                 Event::Paste(text) => view
                     .input
                     .extend(text.chars().filter(|ch| !ch.is_control() || *ch == '\n')),
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && handle_context_key(&mut view, key, size) => {}
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press
                         && handle_panel_key(&mut view, &mut session, key) => {}
@@ -719,6 +796,9 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
                 window_tokens,
             });
         }
+        ConversationEvent::ContextSnapshot { snapshot } => {
+            view.context_panel.receive(snapshot);
+        }
         ConversationEvent::Activity { message } => {
             if message.starts_with("Context shortened") {
                 view.history.start_line();
@@ -802,6 +882,7 @@ mod tests {
             panel: None,
             context: None,
             guidance_shown: Default::default(),
+            context_panel: Default::default(),
         };
         view.history.reset();
         view
@@ -1213,6 +1294,115 @@ mod tests {
         assert!(sprouting.row_text(scene.bar_row).starts_with(" 🤖 first"));
         assert_eq!(sprouting.role_at(0, 9), Some(Role::Wordmark));
         assert_eq!(scene.rest.role_at(0, 9), Some(Role::Muted));
+    }
+
+    #[test]
+    fn the_context_panel_takes_the_right_side_above_a_full_width_status_bar() {
+        let mut view = view();
+        view.scroll = 0;
+        let session = session();
+        view.history
+            .push(Role::Plain, &format!("{}\n", "conversation ".repeat(30)));
+        view.input = "a draft ".repeat(20);
+        view.context_panel.toggle();
+        let (columns, lines) = (100, 24);
+        let split = context_panel::split(columns, lines).unwrap();
+        let scene = compose(&view, &session, 0, columns, lines);
+        assert_eq!(
+            scene.rest.find("Context of the latest request"),
+            Some((0, split.column))
+        );
+        assert_eq!(scene.rest.find("No request yet."), Some((1, split.column)));
+        for row in 0..scene.bar_row {
+            let text = scene.rest.row_text(row);
+            assert_eq!(
+                text.chars().nth(split.separator),
+                Some('│'),
+                "row {row}: {text:?}"
+            );
+            assert!(
+                !text
+                    .chars()
+                    .take(split.separator)
+                    .collect::<String>()
+                    .ends_with(|c: char| c != ' '),
+                "the conversation ran into the separator on row {row}: {text:?}"
+            );
+        }
+        // Wrapping follows the narrower width; nothing is clipped.
+        let left: String = (0..scene.bar_row)
+            .map(|row| {
+                scene
+                    .rest
+                    .row_text(row)
+                    .chars()
+                    .take(split.separator)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(left.matches("conversation").count(), 30, "{left}");
+        // The status bar and hints keep the whole width.
+        assert!(scene.rest.row_text(scene.bar_row).starts_with(" 🤖 first"));
+        assert!(
+            scene
+                .rest
+                .row_text(scene.hint_row)
+                .contains("Alt-PgUp/PgDn context | Ctrl-O hide")
+        );
+    }
+
+    #[test]
+    fn a_terminal_too_small_for_the_panel_keeps_the_layout_and_says_why() {
+        let mut view = view();
+        view.context_panel.toggle();
+        let session = session();
+        let scene = compose(&view, &session, 0, 70, 24);
+        assert!(scene.rest.find("│").is_none());
+        assert!(scene.rest.find("Context of the latest request").is_none());
+        assert_eq!(
+            scene.rest.row_text(scene.hint_row),
+            format!(" {}", context_panel::too_small_hint())
+        );
+        // Command hints still win while one is typed.
+        view.input = "/he".into();
+        let scene = compose(&view, &session, 0, 70, 24);
+        assert!(scene.rest.row_text(scene.hint_row).starts_with(" /help"));
+    }
+
+    #[test]
+    fn ctrl_o_toggles_the_panel_and_modified_page_keys_scroll_it_only_when_shown() {
+        let mut view = view();
+        let ctrl_o = event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let alt_page_up = event::KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT);
+        let shift_page_down = event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT);
+        let wide = (120, 40);
+        assert!(!handle_context_key(&mut view, alt_page_up, wide));
+        assert!(handle_context_key(&mut view, ctrl_o, wide));
+        assert!(view.context_panel.visible);
+        assert!(handle_context_key(&mut view, alt_page_up, wide));
+        assert!(handle_context_key(&mut view, shift_page_down, wide));
+        // Plain paging keeps scrolling the conversation.
+        assert!(!handle_context_key(&mut view, key(KeyCode::PageUp), wide));
+        // On a small terminal the panel is not shown, so the keys pass on.
+        assert!(!handle_context_key(&mut view, alt_page_up, (60, 40)));
+        assert!(handle_context_key(&mut view, ctrl_o, (60, 40)));
+        assert!(!view.context_panel.visible);
+    }
+
+    #[tokio::test]
+    async fn the_context_command_toggles_the_panel_even_during_a_reply() {
+        let mut view = view();
+        let mut session = session();
+        let mut active = Some(placeholder_run());
+        view.input = "/context".into();
+        submit(&mut view, &mut session, &mut active).unwrap();
+        assert!(view.context_panel.visible);
+        assert!(history_text(&view).contains("Context panel shown."));
+        view.input = "/context".into();
+        submit(&mut view, &mut session, &mut active).unwrap();
+        assert!(!view.context_panel.visible);
+        assert!(history_text(&view).ends_with("Context panel hidden.\n"));
     }
 
     #[tokio::test]

@@ -39,8 +39,11 @@ const RETAIN_RAW_TOOL_RESULT_RECENT_COUNT: usize = 4;
 const RETAIN_RAW_TOOL_RESULT_MAX_CHARS: usize = 6_000;
 const REPAIR_HANDOFF_RAW_TOOL_RESULT_RECENT_COUNT: usize = 2;
 const REPAIR_HANDOFF_RAW_TOOL_RESULT_MAX_CHARS: usize = 3_000;
-const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
-const FILE_OBSERVATION_PREFIX: &str = "[harness-consolidated-file-observation]";
+pub(crate) const TOOL_RESULT_SUMMARY_PREFIX: &str = "[harness-retained-tool-result-summary]";
+pub(crate) const FILE_OBSERVATION_PREFIX: &str = "[harness-consolidated-file-observation]";
+/// Call IDs the harness gives the read requests it writes when it
+/// consolidates earlier file reads.
+pub(crate) const FILE_OBSERVATION_CALL_ID_PREFIX: &str = "harness-file-observation-";
 const FILE_OBSERVATION_METADATA_PREFIX: &str = "Metadata: ";
 const FILE_OBSERVATION_CONTENT_START: &str = "--- BEGIN LINE-NUMBERED CONTENT ---";
 const FILE_OBSERVATION_CONTENT_END: &str = "--- END LINE-NUMBERED CONTENT ---";
@@ -56,7 +59,7 @@ const ACTION_BOUNDARY_INTENT_BUFFER_CHARS: usize = 4_096;
 const ACTION_BOUNDARY_INTENT_HIT_GAP_TOKENS: usize = 512;
 const RESPONSE_TOOL_CALL_ARGUMENT_MAX_CHARS: usize = 4_096;
 const ACCEPTANCE_LEDGER_ADVISORY_OUTPUT_TOKENS: usize = 4_096;
-const REASONING_CHECKPOINT_PREFIX: &str = "[harness-reasoning-checkpoint]";
+pub(crate) const REASONING_CHECKPOINT_PREFIX: &str = "[harness-reasoning-checkpoint]";
 
 /// Local provider selection; model capabilities remain explicit in Mojentic.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -4681,7 +4684,7 @@ fn consolidated_file_observation_messages(
             let mut arguments = std::collections::HashMap::new();
             arguments.insert("path".to_string(), serde_json::json!(observation.path));
             LlmToolCall {
-                id: Some(format!("harness-file-observation-{digest}")),
+                id: Some(format!("{FILE_OBSERVATION_CALL_ID_PREFIX}{digest}")),
                 name: "read_file".to_string(),
                 arguments,
             }
@@ -5848,7 +5851,7 @@ fn context_snapshot(
     })
 }
 
-fn estimate_tokens(chars: usize) -> usize {
+pub(crate) fn estimate_tokens(chars: usize) -> usize {
     chars.div_ceil(APPROX_CHARS_PER_TOKEN)
 }
 

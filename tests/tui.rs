@@ -1395,3 +1395,161 @@ fn tui_wraps_replies_at_words_and_keeps_indentation_omlx() {
 fn tui_wraps_replies_at_words_and_keeps_indentation_ollama() {
     word_wrap(Wire::Ollama);
 }
+
+// ---------------------------------------------------------------- context panel
+
+const PANEL_TITLE: &str = "Context of the latest request";
+
+/// The context panel's rows: everything from its title's column rightwards.
+fn panel_rows(screen: &Snapshot) -> Vec<String> {
+    match screen.locate(PANEL_TITLE) {
+        Some((_, col)) => screen.columns_from(col),
+        None => Vec::new(),
+    }
+}
+
+/// The panel row that contains `needle`.
+fn panel_row(rows: &[String], needle: &str) -> String {
+    rows.iter()
+        .find(|row| row.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} not in the panel:\n{}", rows.join("\n")))
+        .clone()
+}
+
+/// Ctrl-O and /context show what the latest request carried, live and
+/// after the reply, beside a conversation that wraps to the space left.
+fn context_panel(wire: Wire) {
+    let workspace = Workspace::new();
+    let release_tool_request = Gate::default();
+    let held = release_tool_request.clone();
+    let provider = MockProvider::start(wire, move |request| {
+        Reply::Stream(match request.number {
+            1 => vec![content("REPLY-ONE")],
+            2 => vec![content("REPLY-TWO")],
+            // Held, so the panel must show this request while it runs.
+            3 => vec![
+                Step::Hold(held.clone()),
+                content("Working it out."),
+                tool("calculate", serde_json::json!({"expression": "6 * 7"})),
+            ],
+            _ => vec![content("IT-IS-42")],
+        })
+    });
+    let mut session = open_session(microgentic(), workspace, provider, 40, 160);
+    session.tui.send(b"\x0f"); // Ctrl-O
+    let empty = session.tui.wait_text("No request yet.");
+    assert_eq!(panel_rows(&empty)[0], PANEL_TITLE);
+    assert!(
+        empty.rows().last().unwrap().contains("Ctrl-O hide"),
+        "{empty}"
+    );
+
+    let first = session.exchange("First message.", "REPLY-ONE");
+    let rows = panel_rows(&first);
+    panel_row(&rows, "Exchange 1 · request 1 · test-model");
+    assert!(
+        panel_row(&rows, "current user prompt").ends_with("new"),
+        "{}",
+        rows.join("\n")
+    );
+
+    session.tui.submit("/context");
+    let hidden = session.tui.wait_for("the panel to close", |screen| {
+        screen.contains("Context panel hidden.") && !screen.contains(PANEL_TITLE)
+    });
+    assert!(hidden.rows().last().unwrap().contains("Ctrl-O context"));
+    session.exchange("Second message.", "REPLY-TWO");
+    session.tui.send(b"\x0f");
+    let second = session
+        .tui
+        .wait_for("the second exchange's panel", |screen| {
+            panel_rows(screen)
+                .iter()
+                .any(|row| row.contains("Exchange 2 · request 1"))
+        });
+    let rows = panel_rows(&second);
+    let text = rows.join("\n");
+    assert!(text.contains("Earlier reasoning: not retained."), "{text}");
+    assert!(text.contains("Older exchanges omitted: none"), "{text}");
+    // The first exchange is in the request, in order, before the new prompt.
+    let position = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not in the panel:\n{text}"))
+    };
+    let order = [
+        position("1. system · system prompt"),
+        position("2. user · retained user prompt"),
+        position("First message."),
+        position("3. assistant · assistant reply"),
+        position("REPLY-ONE"),
+        position("4. user · current user prompt"),
+        position("Second message."),
+        position("Tools offered:"),
+    ];
+    assert!(order.is_sorted(), "{order:?}\n{text}");
+    assert!(panel_row(&rows, "2. user · retained user prompt").ends_with("kept"));
+    assert!(panel_row(&rows, "4. user · current user prompt").ends_with("new"));
+    // The conversation stays left of the separator; the status bar spans both.
+    let (_, panel_col) = second.locate(PANEL_TITLE).unwrap();
+    let separator = usize::from(panel_col) - 2;
+    for row in second.rows().iter().take(38) {
+        assert_eq!(
+            row.chars().nth(separator),
+            Some('│'),
+            "a row crossed the separator:\n{second}"
+        );
+    }
+    assert!(second.row(38).starts_with(" 🤖 test-model"), "{second}");
+    assert!(!second.row(38).contains('│'));
+
+    // A tool loop updates the panel for each request in the exchange, as
+    // soon as the request is assembled.
+    session.tui.submit("What is 6 * 7?");
+    let running = session.tui.wait_for("the held request's panel", |screen| {
+        panel_rows(screen)
+            .iter()
+            .any(|row| row.contains("Exchange 3 · request 1"))
+    });
+    assert!(running.contains("Ctrl-C to cancel"), "{running}");
+    release_tool_request.open();
+    let third = session.tui.wait_for("the tool loop to settle", |screen| {
+        screen.contains("IT-IS-42") && screen.contains(READY)
+    });
+    let rows = panel_rows(&third);
+    let text = rows.join("\n");
+    panel_row(&rows, "Exchange 3 · request 2");
+    assert!(
+        panel_row(&rows, "6. user · current user prompt").ends_with("kept"),
+        "{text}"
+    );
+    assert!(
+        panel_row(&rows, "7. assistant · tool request").ends_with("new"),
+        "{text}"
+    );
+    panel_row(&rows, "calls calculate 6 * 7");
+    assert!(
+        panel_row(&rows, "8. tool · tool result").ends_with("new"),
+        "{text}"
+    );
+    panel_row(&rows, "answers calculate 6 * 7");
+    assert_eq!(session.provider.request_count(), 4);
+
+    // Too small to split: the conversation keeps the whole width and the
+    // hint line says why the panel is missing.
+    session.tui.resize(30, 70);
+    let narrow = session.tui.wait_text("Context panel needs 80×12 or larger");
+    assert!(!narrow.contains(PANEL_TITLE), "{narrow}");
+    assert!(!narrow.contains("│"), "{narrow}");
+    session.tui.quit();
+}
+
+#[test]
+fn tui_context_panel_shows_the_latest_request_omlx() {
+    context_panel(Wire::Omlx);
+}
+
+#[test]
+fn tui_context_panel_shows_the_latest_request_ollama() {
+    context_panel(Wire::Ollama);
+}

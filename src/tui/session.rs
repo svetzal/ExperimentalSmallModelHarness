@@ -136,9 +136,17 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
             session.guidance = discover_guidance(&root, user_file.as_deref(), budget);
             guidance_report(&session.guidance, &view.guidance_shown)
         }
+        Command::Context => {
+            view.context_panel.toggle();
+            if view.context_panel.visible {
+                "Context panel shown. It lists what the model received in its latest request. Ctrl-O or /context hides it.\n".into()
+            } else {
+                "Context panel hidden.\n".into()
+            }
+        }
         Command::Clear => {
             session.state = None;
-            view.context = None;
+            view.forget_context();
             view.guidance_shown.clear();
             session.refresh_git();
             session.refresh_guidance();
@@ -166,7 +174,7 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
         }
         Command::SetModel(model) => {
             let note = session.change_settings(|settings| settings.model = model.clone());
-            view.context = None;
+            view.forget_context();
             format!("Model set to {model} for this session.{note}\n")
         }
         Command::ShowEffort => {
@@ -193,7 +201,7 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
         }
         Command::SetEffort(effort) => {
             let note = session.change_settings(|settings| settings.reasoning_effort = effort);
-            view.context = None;
+            view.forget_context();
             format!(
                 "Effort set to {} for this session.{note}\n",
                 effort_label(&session.settings)
@@ -347,6 +355,7 @@ mod tests {
             panel: None,
             context: None,
             guidance_shown: Default::default(),
+            context_panel: Default::default(),
         };
         view.history.reset();
         view

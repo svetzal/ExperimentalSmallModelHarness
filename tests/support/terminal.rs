@@ -184,6 +184,16 @@ impl Snapshot {
         self.rows().join("\n")
     }
 
+    /// Every row from column `col` to the right edge, with trailing blanks
+    /// removed, for a pane that sits beside other text.
+    pub fn columns_from(&self, col: u16) -> Vec<String> {
+        let (_, cols) = self.0.size();
+        self.0
+            .rows(col, cols.saturating_sub(col))
+            .map(|row| row.trim_end().to_owned())
+            .collect()
+    }
+
     pub fn contains(&self, needle: &str) -> bool {
         self.rows().iter().any(|row| row.contains(needle))
     }

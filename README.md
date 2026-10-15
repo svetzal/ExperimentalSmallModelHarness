@@ -267,8 +267,8 @@ not play when `MICROGENTIC_NO_ANIMATION` is set to a non-empty value, when
 `NO_COLOR`, it plays without colour.
 
 In the TUI, Enter sends a message, Alt-Enter inserts a newline, Page Up/Down
-scroll, Tab completes a command, Ctrl-C requests cancellation, and Esc exits when
-idle. The view shows defaults, elapsed time, streamed replies, thinking status,
+scroll, Tab completes a command, Ctrl-O shows or hides the context panel,
+Ctrl-C requests cancellation, and Esc exits when idle. The view shows defaults, elapsed time, streamed replies, thinking status,
 tool activity, and trace locations. Follow-up prompts retain actual user
 messages, completed assistant responses, and native tool request/result pairs.
 You can draft your next message while a reply streams; Enter submits it after the
@@ -340,7 +340,32 @@ are never sent to the model:
   returns to the model's own setting.
 - `/clear` starts a new conversation. The earlier session file and its traces
   stay on disk.
+- `/guidance` lists the project guidance files with their size and status.
+- `/context` shows or hides the context panel, like Ctrl-O. It works while a
+  reply runs.
 - `/help` lists the commands.
+
+The context panel sits to the right of the conversation and takes about 40% of
+the width. It lists everything in the latest model request, in request order:
+each message with its role, its kind (system prompt, project guidance, retained
+or current user prompt, assistant reply, tool request, tool result, summarized
+tool result, consolidated file observation, session notice, or harness
+instruction), an estimated token count, and the first few lines of its text.
+It also lists the tool descriptors sent with the request. A header names the
+exchange and the request within it, the model, the message count, and the
+estimated size against the context window. It also says whether the model's
+thinking from earlier requests was sent and how many older exchanges were left
+out. Each element is marked `new` when the previous request of the exchange did
+not have it, or `kept` when it did. On the first request of an exchange,
+everything except the retained history is `new`. Summarized and consolidated
+elements say `not verbatim`, because the harness rewrote them. The panel
+updates with each request, including requests inside a tool loop, and keeps
+showing the last one after the reply. Alt-Page Up/Down (or Shift-Page Up/Down)
+scroll it; a new request returns it to the newest rows. The panel needs a
+terminal of at least 80 columns by 12 rows. In a smaller terminal it stays
+hidden, and the key hint line says why. The panel is built from the exact
+provider request the runtime records in the trace, credential-redacted and
+shortened, and it changes nothing that is sent to the model.
 
 In a picker, Up and Down move (wrapping at the ends), Home and End jump to the
 first and last option, Enter chooses, and Esc or Ctrl-C closes it without a
@@ -348,7 +373,7 @@ change. The selected option has a `›` marker, so it shows without colour.
 While you type a command, the bottom line shows matching commands, and Tab
 completes a unique match. An unknown command shows an error and sends nothing.
 To send a message that starts with `/`, type `//`; Microgentic removes one `/`.
-While a reply runs, commands other than `/help` are refused; wait for the reply
+While a reply runs, commands other than `/help` and `/context` are refused; wait for the reply
 or cancel it, then try again. Changes apply only to this TUI session; `microgentic setup` changes the
 saved defaults. A conversation keeps the model and effort it started with, so
 after `/model` or `/effort` changes a setting, your next message starts a new

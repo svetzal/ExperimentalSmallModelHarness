@@ -5,6 +5,7 @@ pub mod agent;
 pub mod baseline;
 pub mod calculator;
 pub mod cli;
+mod context_snapshot;
 pub mod contract;
 mod conversation;
 pub mod guidance;

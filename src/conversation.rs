@@ -1,10 +1,13 @@
 //! TUI-only continuity and presentation. Ordinary runs never create this state.
 use crate::agent::{AgentRunConfig, AgentRunSummary, Provider};
+pub(crate) use crate::context_snapshot::ContextSnapshot;
+use crate::context_snapshot::RequestFacts;
 use anyhow::{Context, Result, bail};
 use mojentic::llm::gateway::ReasoningEffort;
 use mojentic::llm::models::{LlmMessage, MessageRole};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -50,6 +53,11 @@ pub(crate) enum ConversationEvent {
         used_tokens: usize,
         window_tokens: Option<usize>,
     },
+    /// What the model received in the request just assembled, bounded for
+    /// the view's context panel.
+    ContextSnapshot {
+        snapshot: ContextSnapshot,
+    },
     Activity {
         message: String,
     },
@@ -85,6 +93,32 @@ pub(crate) struct ConversationRun {
     events: UnboundedSender<ConversationEvent>,
     pub(crate) omitted_exchanges: usize,
     reply_completed: AtomicBool,
+    requests: Mutex<RequestTracking>,
+}
+
+/// What the context panel needs to remember between requests in one exchange.
+#[derive(Debug, Default)]
+struct RequestTracking {
+    count: usize,
+    /// Fingerprints of the messages in the previous request, or of the
+    /// retained history before the first one.
+    previous: HashSet<u64>,
+    /// From the latest context ledger, which precedes each request.
+    window_tokens: Option<usize>,
+}
+
+/// Fingerprints of retained history, redacted as the trace recorder redacts
+/// the request it is later compared with.
+fn history_fingerprints(messages: &[LlmMessage]) -> HashSet<u64> {
+    let secrets = crate::recovery::credentials();
+    messages
+        .iter()
+        .filter_map(|message| serde_json::to_value(message).ok())
+        .map(|mut message| {
+            crate::recovery::redact_value(&mut message, &secrets);
+            crate::context_snapshot::fingerprint(&message)
+        })
+        .collect()
 }
 
 pub(crate) fn system_guidance() -> String {
@@ -173,6 +207,10 @@ impl ConversationRun {
             .filter(|m| m.role == MessageRole::User)
             .count()
             + 1;
+        let requests = Mutex::new(RequestTracking {
+            previous: history_fingerprints(&state.messages),
+            ..RequestTracking::default()
+        });
         Ok(Self {
             state: Mutex::new(state),
             prompt,
@@ -180,6 +218,7 @@ impl ConversationRun {
             events,
             omitted_exchanges,
             reply_completed: AtomicBool::new(false),
+            requests,
         })
     }
 
@@ -288,11 +327,33 @@ impl ConversationRun {
         });
     }
 
+    /// Turn the exact assembled request into the context panel's bounded
+    /// snapshot. The payload is the trace record's, so already redacted.
+    fn snapshot_request(&self, payload: &Value) {
+        let mut requests = self.requests.lock().expect("request tracking poisoned");
+        requests.count += 1;
+        let facts = RequestFacts {
+            request: requests.count,
+            protected_users: self.protected_users,
+            current_prompt: &self.prompt,
+            omitted_exchanges: self.omitted_exchanges,
+            window_tokens: requests.window_tokens,
+        };
+        let (snapshot, seen) = crate::context_snapshot::build(payload, &facts, &requests.previous);
+        requests.previous = seen;
+        drop(requests);
+        self.emit(ConversationEvent::ContextSnapshot { snapshot });
+    }
+
     pub(crate) fn observe(&self, kind: &str, payload: &Value) {
         if kind == "context.guidance.nested_injected" {
             self.emit(ConversationEvent::GuidanceInjected {
                 path: payload["path"].as_str().unwrap_or_default().into(),
             });
+            return;
+        }
+        if kind == crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED {
+            self.snapshot_request(payload);
             return;
         }
         let message = match kind {
@@ -301,6 +362,12 @@ impl ConversationRun {
             }
             "llm.context_assembly.ledger" => {
                 if let Some(usage) = context_usage(payload) {
+                    if let ConversationEvent::ContextUsage { window_tokens, .. } = &usage {
+                        self.requests
+                            .lock()
+                            .expect("request tracking poisoned")
+                            .window_tokens = *window_tokens;
+                    }
                     self.emit(usage);
                 }
                 format!(
@@ -585,6 +652,7 @@ mod tests {
             events,
             omitted_exchanges: 0,
             reply_completed: AtomicBool::new(false),
+            requests: Mutex::default(),
         }
     }
 
@@ -646,6 +714,76 @@ mod tests {
                 .contains("automatic repair directive")
         );
         validate_history(&state.messages).unwrap();
+    }
+
+    #[test]
+    fn each_assembled_request_reaches_the_view_as_a_bounded_snapshot() {
+        let history = vec![
+            LlmMessage::user("old actual prompt"),
+            LlmMessage::assistant("old answer"),
+        ];
+        let (events, mut receiver) = unbounded_channel();
+        let mut session = conversation(history.clone());
+        session.events = events;
+        session.requests = Mutex::new(RequestTracking {
+            previous: history_fingerprints(&history),
+            ..RequestTracking::default()
+        });
+        let mut messages =
+            session.initial_messages("fresh system".into(), "new actual prompt".into());
+        let request = |messages: &[LlmMessage]| {
+            json!({
+                "model": "test",
+                "messages": messages,
+                "tools": [],
+                "completion": {"preserve_reasoning": false},
+            })
+        };
+        session.observe(
+            "llm.context_assembly.ledger",
+            &json!({"estimated_tokens": 10, "context_window_tokens": 32_768}),
+        );
+        session.observe(
+            crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+            &request(&messages),
+        );
+        messages.extend(tool_exchange());
+        session.observe(
+            crate::runtime_events::LLM_PROVIDER_REQUEST_ASSEMBLED,
+            &request(&messages),
+        );
+        let snapshots: Vec<ContextSnapshot> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|event| match event {
+                ConversationEvent::ContextSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(snapshots.len(), 2);
+        let (first, second) = (&snapshots[0], &snapshots[1]);
+        assert_eq!((first.request, second.request), (1, 2));
+        assert_eq!(first.window_tokens, Some(32_768));
+        let new = |snapshot: &ContextSnapshot| -> Vec<bool> {
+            snapshot.elements.iter().map(|e| e.new).collect()
+        };
+        // History is kept; the system prompt and current prompt are new.
+        assert_eq!(new(first), [true, false, false, true]);
+        assert_eq!(new(second), [false, false, false, false, true, true, true]);
+        use crate::context_snapshot::ElementKind;
+        assert_eq!(first.elements[1].kind, ElementKind::RetainedUserPrompt);
+        assert_eq!(first.elements[3].kind, ElementKind::CurrentUserPrompt);
+        // The worker protocol carries the snapshot as one JSON line.
+        let line = serde_json::to_string(&ConversationEvent::ContextSnapshot {
+            snapshot: second.clone(),
+        })
+        .unwrap();
+        assert!(
+            line.starts_with("{\"event\":\"context-snapshot\""),
+            "{line}"
+        );
+        assert!(matches!(
+            serde_json::from_str::<ConversationEvent>(&line).unwrap(),
+            ConversationEvent::ContextSnapshot { snapshot } if &snapshot == second
+        ));
     }
 
     #[test]

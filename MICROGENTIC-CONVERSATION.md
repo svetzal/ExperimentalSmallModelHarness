@@ -70,6 +70,22 @@ and strings longer than 2,000 characters are shortened, because the view only
 summarizes them. `tool-finished` carries the call ID, name, and success flag
 from the existing `tool_result` context event. Trace records are unchanged.
 
+Each `llm.provider_request.assembled` trace record also reaches the view, as
+`context-snapshot`, for the context panel (added 2026-10-15). The worker builds
+it in the same conversation hook, from the trace record's payload after
+credential redaction. It carries the request number within the exchange, the
+model, the message count, the token estimate (the context ledger's
+four-bytes-per-token rule), the window from the preceding ledger, the
+`preserve_reasoning` setting, and the omitted-exchange count. Each message
+becomes one element, or two when the system message holds project guidance or
+the current prompt carries a session notice. An element has its role, kind,
+call names with arguments shortened to 120 characters, token estimate, at most
+three preview lines of 120 characters, the count of characters left out, and a
+`new` flag. `new` compares the message with the previous request of the
+exchange; the first request compares with the retained history. Tool
+descriptors are reduced to names and token estimates. The provider request,
+the trace, and the session file are unchanged.
+
 Enter submits when idle; Alt-Enter adds a newline. Drafting, paste, and scrolling
 remain available during generation. Ctrl-C forwards cancellation to the owned
 worker. The worker retains completed responses/tool batches and records why the

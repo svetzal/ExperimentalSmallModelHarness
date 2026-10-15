@@ -28,6 +28,11 @@ pub(super) enum Role {
     Error,
     Prompt,
     System,
+    /// Context panel: an element the previous request did not have.
+    Fresh,
+    /// Context panel: text the harness summarized, merged, or left out,
+    /// rather than what the model or user wrote.
+    Rewritten,
     Ready,
     Working,
     Stopped,
@@ -66,7 +71,8 @@ impl Palette {
             // The model's thinking: dim and italic, so it reads apart from replies
             // with or without colour.
             Role::Thinking => (None, &[Attribute::Dim, Attribute::Italic]),
-            Role::Success => (Some(Color::DarkGreen), &[Attribute::Bold]),
+            Role::Success | Role::Fresh => (Some(Color::DarkGreen), &[Attribute::Bold]),
+            Role::Rewritten => (Some(Color::DarkYellow), &[Attribute::Italic]),
             Role::Model => (Some(Color::DarkGreen), &[]),
             Role::Effort => (Some(Color::DarkYellow), &[]),
             Role::Folder => (None, &[Attribute::Bold]),
