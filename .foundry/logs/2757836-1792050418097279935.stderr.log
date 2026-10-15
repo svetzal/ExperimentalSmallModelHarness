@@ -1,0 +1,38 @@
+   Compiling rustls v0.23.46
+    Checking tokio-rustls v0.26.4
+    Checking rustls-platform-verifier v0.7.0
+    Checking hyper-rustls v0.27.9
+    Checking reqwest v0.13.4
+    Checking mojentic v2.1.0 (https://github.com/svetzal/mojentic-ru.git?rev=4ca1ed279c02eab37827a1ed07c30e961155ecf3#4ca1ed27)
+    Checking microgentic v0.1.0 (/home/svetzal/Work/Sandbox2/Harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.30s
+   Compiling rustls v0.23.46
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling mojentic v2.1.0 (https://github.com/svetzal/mojentic-ru.git?rev=4ca1ed279c02eab37827a1ed07c30e961155ecf3#4ca1ed27)
+   Compiling microgentic v0.1.0 (/home/svetzal/Work/Sandbox2/Harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 49.46s
+     Running unittests src/lib.rs (target/debug/deps/adaptive_agent_harness-7e22900cb2853aef)
+     Running unittests src/bin/legacy.rs (target/debug/deps/adaptive_agent_harness-0d26643fb0b2598f)
+     Running unittests src/main.rs (target/debug/deps/microgentic-70c593453cd17a69)
+     Running tests/microgentic_cli.rs (target/debug/deps/microgentic_cli-3bf19edbbe497b02)
+     Running tests/omlx_gateway.rs (target/debug/deps/omlx_gateway-33eff5b1a7204a40)
+     Running tests/recovery_prerequisites.rs (target/debug/deps/recovery_prerequisites-425a3c67a60866df)
+     Running tests/recovery_worker.rs (target/debug/deps/recovery_worker-a4c6229210c5bfc6)
+     Running tests/structural_coupling.rs (target/debug/deps/structural_coupling-729be38e577a9780)
+     Running unittests examples/provider_benchmark.rs (target/debug/examples/provider_benchmark-4fec499dac07239f)
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.507s
+
+OK
+   Compiling rustls v0.23.46
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling mojentic v2.1.0 (https://github.com/svetzal/mojentic-ru.git?rev=4ca1ed279c02eab37827a1ed07c30e961155ecf3#4ca1ed27)
+   Compiling microgentic v0.1.0 (/home/svetzal/Work/Sandbox2/Harness)
+    Finished `release` profile [optimized] target(s) in 2m 11s
