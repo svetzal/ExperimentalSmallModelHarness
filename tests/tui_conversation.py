@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -14,6 +15,8 @@ import threading
 import time
 
 base_directory = Path(sys.argv[2])
+# Colour stays on; matching ignores SGR styling so text within a row stays contiguous.
+SGR = re.compile(rb"\x1b\[[0-9;]*m")
 
 
 def exercise(provider):
@@ -106,6 +109,7 @@ def exercise(provider):
     host = f"http://127.0.0.1:{server.server_port}"
     env = dict(os.environ, TERM="xterm-256color", XDG_STATE_HOME=str(state),
                OMLX_HOST=host, OLLAMA_HOST=host, OMLX_API_KEY="test-key")
+    env.pop("NO_COLOR", None)
     pending = {}
 
     def launch():
@@ -122,7 +126,7 @@ def exercise(provider):
         deadline = time.monotonic() + 15
         while needle not in data and time.monotonic() < deadline:
             if select.select([master], [], [], .05)[0]:
-                data += os.read(master, 65536)
+                data = SGR.sub(b"", data + os.read(master, 65536))
         assert needle in data, (needle, data[-8000:])
         end = data.index(needle) + len(needle)
         pending[master] = data[end:]

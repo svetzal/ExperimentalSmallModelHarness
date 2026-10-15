@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -14,6 +15,8 @@ import threading
 import time
 
 binary, base = str(Path(sys.argv[1]).resolve()), Path(sys.argv[2])
+# Colour stays on; matching ignores SGR styling so text within a row stays contiguous.
+SGR = re.compile(rb"\x1b\[[0-9;]*m")
 
 
 def exercise(provider):
@@ -72,6 +75,7 @@ def exercise(provider):
     # The generated fixture must build inside its own project, independently
     # of the harness's optional shared Cargo cache directory.
     env.pop("CARGO_TARGET_DIR", None)
+    env.pop("NO_COLOR", None)
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 200, 0, 0))
@@ -85,7 +89,7 @@ def exercise(provider):
         deadline = time.monotonic() + 20
         while needle not in data and time.monotonic() < deadline:
             if select.select([master], [], [], .05)[0]:
-                data += os.read(master, 65536)
+                data = SGR.sub(b"", data + os.read(master, 65536))
         assert needle in data, (needle, data[-7000:], errors)
         end = data.index(needle) + len(needle)
         pending = data[end:]

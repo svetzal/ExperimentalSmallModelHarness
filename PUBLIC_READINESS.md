@@ -475,6 +475,9 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
   readable light/dark themes, monochrome status labels, `NO_COLOR`, Unicode-safe
   wrapping, and narrow layouts. Offer screen-reader-friendly plain mode; verify
   paste, copy/selection, SSH, and common terminal emulators.
+  Progress: the view uses named ANSI colours that follow the terminal theme,
+  honours `NO_COLOR`, keeps text labels on status, and wraps by Unicode cell
+  width. Narrow layouts, plain mode, and emulator checks remain.
 - [ ] **Choose the TUI library after the event seam.** Evaluate Rust terminal
   libraries against these needs. Keep rendering responsive while providers and
   tools are slow. Display backpressure must not alter stop or validation policy.

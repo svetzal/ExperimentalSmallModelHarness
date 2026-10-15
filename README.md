@@ -238,6 +238,12 @@ Quoted commands remain discussion text, and replies do not require DONE/FAIL.
 In the TUI, Enter sends a message, Alt-Enter inserts a newline, Page Up/Down scroll,
 Ctrl-C requests cancellation, and Esc exits when idle. The view shows defaults,
 elapsed time, streamed replies, thinking status, tool activity, and trace locations.
+
+The view uses the terminal's named ANSI colours, so it follows your light or dark
+theme. Your messages, Microgentic's replies, tool activity, errors, and the
+status line each have their own style. The status line keeps a text label, such
+as `Ready` or `Stopped`, so it does not depend on colour. Set `NO_COLOR` to any
+non-empty value to turn colour off; bold and dim text remain.
 Follow-up prompts retain actual user messages, completed assistant responses, and
 native tool request/result pairs. You can draft your next message while a reply
 streams; Enter submits it after the current request settles.
