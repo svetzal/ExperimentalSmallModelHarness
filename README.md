@@ -235,18 +235,42 @@ questions, and discussion receive natural replies. The conversation supplies
 requests for work; tools are available when those requests or answers need them.
 Quoted commands remain discussion text, and replies do not require DONE/FAIL.
 
-In the TUI, Enter sends a message, Alt-Enter inserts a newline, Page Up/Down scroll,
-Ctrl-C requests cancellation, and Esc exits when idle. The view shows defaults,
-elapsed time, streamed replies, thinking status, tool activity, and trace locations.
+In the TUI, Enter sends a message, Alt-Enter inserts a newline, Page Up/Down
+scroll, Tab completes a command, Ctrl-C requests cancellation, and Esc exits when
+idle. The view shows defaults, elapsed time, streamed replies, thinking status,
+tool activity, and trace locations. Follow-up prompts retain actual user
+messages, completed assistant responses, and native tool request/result pairs.
+You can draft your next message while a reply streams; Enter submits it after the
+current request settles.
 
 The view uses the terminal's named ANSI colours, so it follows your light or dark
 theme. Your messages, Microgentic's replies, tool activity, errors, and the
 status line each have their own style. The status line keeps a text label, such
 as `Ready` or `Stopped`, so it does not depend on colour. Set `NO_COLOR` to any
 non-empty value to turn colour off; bold and dim text remain.
-Follow-up prompts retain actual user messages, completed assistant responses, and
-native tool request/result pairs. You can draft your next message while a reply
-streams; Enter submits it after the current request settles.
+
+Type a command that starts with `/` in the input. Commands run in the TUI and
+are never sent to the model:
+
+- `/model` shows the current provider and model and asks the provider for its
+  available models. `/model <id>` switches to that model for this session.
+  It switches models within the current provider only.
+- `/effort` shows the current reasoning effort and the accepted values.
+  `/effort <level>` sets it for this session. The levels are `disabled`,
+  `enabled`, `low`, `medium`, `high`, and `xhigh`. `default` returns to the
+  model's own setting.
+- `/clear` starts a new conversation. The earlier session file and its traces
+  stay on disk.
+- `/help` lists the commands.
+
+While you type a command, the bottom line shows matching commands, and Tab
+completes a unique match. An unknown command shows an error and sends nothing.
+To send a message that starts with `/`, type `//`; Microgentic removes one `/`.
+While a reply runs, commands other than `/help` are refused; wait for the reply
+or cancel it, then try again. Changes apply only to this TUI session; `microgentic setup` changes the
+saved defaults. A conversation keeps the model and effort it started with, so
+after `/model` or `/effort` changes a setting, your next message starts a new
+conversation.
 
 The TUI shows an `Evidence:` trace location only for exchanges that use project
 tools, including inspection, edits, and checks. Ordinary replies omit the footer,
@@ -255,8 +279,9 @@ The footer points to recorded activity; validation results remain in the reply
 and trace.
 
 Each TUI invocation starts a new conversation, scoped to its project and resolved
-provider/model/effort. State is saved outside the project in a unique
-`session-*/conversation.json` under the run-state directory. Previous task-scoped
+provider/model/effort. `/clear`, `/model`, and `/effort` also start one. State
+is saved outside the project in a unique `session-*/conversation.json` under the
+run-state directory. Previous task-scoped
 system/probe/repair instructions and incomplete streamed replies are not replayed.
 Each prompt gets fresh task validation state and the existing runtime budgets.
 Conversational shell checks are observations; they do not become executor-owned

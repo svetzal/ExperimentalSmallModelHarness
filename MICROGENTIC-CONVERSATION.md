@@ -40,6 +40,9 @@ The file `session-*/conversation.json` lives under
 written atomically with private temporary-file permissions after the worker
 settles. Reuse with a different canonical project root, provider, model, effort,
 or reasoning-retention setting is refused before contacting a provider.
+The TUI `/model` and `/effort` commands therefore start a new session file when
+they change a setting after a conversation has begun; `/clear` does the same.
+Earlier session files and traces stay on disk.
 
 History admission uses the existing four-bytes-per-token approximation. Half of
 the input allowance after the requested output reservation is available for

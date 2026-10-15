@@ -468,6 +468,9 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
 - [ ] **Expose meaningful decisions.** Offer provider/model selection, proposed
   change review, check output, and final diff. Count changed files and passing
   checks; label unchecked outcomes clearly.
+  Progress: TUI `/model` lists the provider's models and switches the model for
+  the session; `/effort` sets reasoning effort. Provider switching, change
+  review, check output, and the final diff remain.
 - [ ] **Specify keyboard behavior.** Define send versus newline, history, scroll,
   help, and cancellation. Preserve input during resize. Define Ctrl-C and a
   second interrupt; restore the terminal after exit, errors, or panic.

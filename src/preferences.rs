@@ -34,7 +34,7 @@ impl Preferences {
                 self.schema_version
             );
         }
-        if self.model.trim().is_empty() || self.model.chars().any(char::is_control) {
+        if !valid_model_id(&self.model) {
             bail!("default model must be a nonempty model ID without control characters");
         }
         if let Some(value) = &self.reasoning_effort {
@@ -42,6 +42,11 @@ impl Preferences {
         }
         Ok(())
     }
+}
+
+/// A model ID is non-empty and has no control characters, including newlines.
+pub fn valid_model_id(model: &str) -> bool {
+    !model.trim().is_empty() && !model.chars().any(char::is_control)
 }
 
 pub fn config_path(explicit: Option<&Path>) -> Result<PathBuf> {
