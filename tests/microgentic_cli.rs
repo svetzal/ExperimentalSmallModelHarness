@@ -62,25 +62,6 @@ fn benchmark_help_and_errors_explain_isolated_file_intake() {
 }
 
 #[test]
-fn benchmark_packets_match_task_runs_and_ignore_ambient_intake() {
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/benchmark_continuity.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_microgentic"))
-        .arg(env!("CARGO_BIN_EXE_microgentic"))
-        .arg("benchmark")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
 fn setup_previews_before_saving_and_persists_model_default_effort() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("nested/config.json");

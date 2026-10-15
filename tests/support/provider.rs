@@ -59,8 +59,8 @@ impl Gate {
 pub enum Step {
     Thinking(String),
     Content(String),
-    /// Tool calls by name and arguments, in one frame.
-    Tools(Vec<(String, Value)>),
+    /// Tool calls in one frame.
+    Tools(Vec<ToolCall>),
     /// Hold the stream until the gate opens.
     Hold(Gate),
     Pause(Duration),
@@ -76,15 +76,38 @@ pub fn content(text: &str) -> Step {
     Step::Content(text.into())
 }
 
+/// One tool call. oMLX calls without an `id` get `call-{request}-{index}`;
+/// Ollama has no call ids.
+#[derive(Clone)]
+pub struct ToolCall {
+    pub id: Option<String>,
+    pub name: String,
+    pub arguments: Value,
+}
+
 pub fn tool(name: &str, arguments: Value) -> Step {
-    Step::Tools(vec![(name.into(), arguments)])
+    tools(&[(name, arguments)])
+}
+
+/// A tool call with a fixed oMLX id, for replies that must be identical
+/// whichever request they answer.
+pub fn tool_with_id(id: &str, name: &str, arguments: Value) -> Step {
+    Step::Tools(vec![ToolCall {
+        id: Some(id.into()),
+        name: name.into(),
+        arguments,
+    }])
 }
 
 pub fn tools(calls: &[(&str, Value)]) -> Step {
     Step::Tools(
         calls
             .iter()
-            .map(|(name, args)| ((*name).into(), args.clone()))
+            .map(|(name, arguments)| ToolCall {
+                id: None,
+                name: (*name).into(),
+                arguments: arguments.clone(),
+            })
             .collect(),
     )
 }
@@ -311,14 +334,14 @@ fn stream_reply(
                 let calls = calls
                     .iter()
                     .enumerate()
-                    .map(|(index, (name, arguments))| match wire {
+                    .map(|(index, call)| match wire {
                         Wire::Omlx => json!({
                             "index": index,
-                            "id": format!("call-{number}-{index}"),
+                            "id": call.id.clone().unwrap_or_else(|| format!("call-{number}-{index}")),
                             "type": "function",
-                            "function": {"name": name, "arguments": arguments.to_string()},
+                            "function": {"name": call.name, "arguments": call.arguments.to_string()},
                         }),
-                        Wire::Ollama => json!({"function": {"name": name, "arguments": arguments}}),
+                        Wire::Ollama => json!({"function": {"name": call.name, "arguments": call.arguments}}),
                     })
                     .collect::<Vec<_>>();
                 frame(wire, json!({"tool_calls": calls}), None)
