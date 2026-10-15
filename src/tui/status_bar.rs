@@ -149,10 +149,10 @@ pub(super) struct BarState<'a> {
     pub(super) context: Option<ContextUsage>,
 }
 
-/// The bar for `width` cells. Segments keep their order; when they do not
+/// The segments that fit in `width` cells, in order. When they do not all
 /// fit, git goes first, then the folder, then effort. Model and context stay
 /// longest.
-pub(super) fn status_bar(state: &BarState, width: usize) -> Styled {
+pub(super) fn status_segments(state: &BarState, width: usize) -> Vec<Styled> {
     // (keep priority, segment): higher priority survives longer.
     let mut segments: Vec<(u8, Styled)> = vec![
         (
@@ -193,8 +193,13 @@ pub(super) fn status_bar(state: &BarState, width: usize) -> Styled {
             .expect("segments are not empty");
         segments.remove(lowest);
     }
+    segments.into_iter().map(|(_, segment)| segment).collect()
+}
+
+/// Segments side by side, separated as the bar separates them.
+pub(super) fn join_segments(segments: &[Styled]) -> Styled {
     let mut bar = Styled::default();
-    for (index, (_, segment)) in segments.iter().enumerate() {
+    for (index, segment) in segments.iter().enumerate() {
         if index > 0 {
             bar.push(Role::Plain, SEPARATOR);
         }
@@ -216,6 +221,10 @@ pub(super) fn cells(text: &Styled) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status_bar(state: &BarState, width: usize) -> Styled {
+        join_segments(&status_segments(state, width))
+    }
 
     fn text(styled: &Styled) -> String {
         styled.runs.iter().map(|(_, text)| text.as_str()).collect()

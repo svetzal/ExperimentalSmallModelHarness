@@ -235,6 +235,14 @@ questions, and discussion receive natural replies. The conversation supplies
 requests for work; tools are available when those requests or answers need them.
 Quoted commands remain discussion text, and replies do not require DONE/FAIL.
 
+When the TUI opens, a short launch animation plays for about three quarters of
+a second: the name bursts out from the centre, glides into the welcome line,
+and the status bar appears below. It never delays input. Any key, paste, or terminal resize
+skips to the resting screen, and the key still takes effect. The animation does
+not play when `MICROGENTIC_NO_ANIMATION` is set to a non-empty value, when
+`TERM` is `dumb`, or in a terminal smaller than 40 columns by 12 rows. With
+`NO_COLOR`, it plays without colour.
+
 In the TUI, Enter sends a message, Alt-Enter inserts a newline, Page Up/Down
 scroll, Tab completes a command, Ctrl-C requests cancellation, and Esc exits when
 idle. The view shows defaults, elapsed time, streamed replies, thinking status,

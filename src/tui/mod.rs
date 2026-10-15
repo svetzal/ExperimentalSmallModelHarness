@@ -1,6 +1,8 @@
 //! Terminal conversation with native history and a live worker event stream.
+mod canvas;
 mod commands;
 mod history;
+mod launch;
 mod picker;
 mod session;
 mod status_bar;
@@ -9,21 +11,22 @@ mod tool_lines;
 
 use crate::conversation::ConversationEvent;
 use anyhow::{Context, Result};
+use canvas::Canvas;
 use commands::{Command, Submission, complete, footer, parse_submission};
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
         KeyModifiers,
     },
-    execute, queue,
-    style::PrintStyledContent,
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    execute,
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use history::History;
+use launch::Scene;
 use picker::{Outcome, Panel, PickerKey, Purpose};
 use session::{Session, finish_model_listing, run_command};
-use status_bar::{BarState, ContextUsage, status_bar};
+use status_bar::{BarState, ContextUsage, join_segments, status_segments};
 use std::io::{Write, stdout};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
@@ -37,6 +40,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
 use tool_lines::{SPINNER_FRAME, ToolLine, spinner};
+
+/// About 30 frames a second while the launch animation plays.
+const LAUNCH_FRAME: Duration = Duration::from_millis(33);
 
 struct Screen;
 impl Screen {
@@ -298,25 +304,12 @@ fn start_reply(view: &mut View, session: &mut Session, prompt: &str) -> Result<O
     }))
 }
 
-/// Layout, top to bottom: history, a rule, the working/ready status line,
-/// any open panel, the input, the status bar, and the key hints.
-fn draw(view: &View, session: &Session, frame: usize, palette: Palette) -> Result<()> {
-    let (columns, lines) = terminal::size()?;
+/// Compose the screen, top to bottom: history, a rule, the working/ready
+/// status line, any open panel, the input, the status bar, and the key hints.
+fn compose(view: &View, session: &Session, frame: usize, columns: u16, lines: u16) -> Scene {
     let width = usize::from(columns.saturating_sub(2)).max(1);
-    let mut out = stdout();
-    queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-    let mut put = |row: u16, cells: &[(Role, String)]| -> Result<()> {
-        if row < lines {
-            queue!(out, MoveTo(1.min(columns.saturating_sub(1)), row))?;
-            for (role, text) in cells {
-                queue!(
-                    out,
-                    PrintStyledContent(palette.style(*role).apply(text.as_str()))
-                )?;
-            }
-        }
-        Ok(())
-    };
+    let mut canvas = Canvas::new(usize::from(lines), usize::from(columns));
+    let margin = usize::from(columns > 1);
     let input = Styled::default()
         .with(Role::Prompt, "> ")
         .with(Role::Plain, &view.input);
@@ -333,35 +326,68 @@ fn draw(view: &View, session: &Session, frame: usize, palette: Palette) -> Resul
     let rule_row = status_row.saturating_sub(1);
     // Very short terminals drop the rule and the history first.
     if rule_row > 0 {
-        put(
-            rule_row,
-            &first_row(
-                &Styled::default().with(Role::Muted, &"─".repeat(width)),
-                width,
-            ),
-        )?;
+        let rule = Styled::default().with(Role::Muted, &"─".repeat(width));
+        canvas.put(usize::from(rule_row), margin, &first_row(&rule, width));
     }
     let history = wrap(&view.history.render(frame), width);
     let end = history.len().saturating_sub(view.scroll.min(history.len()));
     let start = end.saturating_sub(usize::from(rule_row));
     for (index, row) in history[start..end].iter().enumerate() {
-        put(index as u16, row)?;
+        canvas.put(index, margin, row);
     }
-    put(status_row, &first_row(&view.status.line(), width))?;
+    canvas.put(
+        usize::from(status_row),
+        margin,
+        &first_row(&view.status.line(), width),
+    );
     for (index, row) in panel.iter().enumerate() {
-        put(panel_top + index as u16, &first_row(row, width))?;
+        canvas.put(
+            usize::from(panel_top) + index,
+            margin,
+            &first_row(row, width),
+        );
     }
     for (index, row) in input_rows[input_rows.len() - usize::from(input_height)..]
         .iter()
         .enumerate()
     {
-        put(input_top + index as u16, row)?;
+        canvas.put(usize::from(input_top) + index, margin, row);
     }
-    put(
-        lines.saturating_sub(2),
-        &first_row(&status_bar(&bar_state(view, session), width), width),
-    )?;
-    put(lines.saturating_sub(1), &first_row(&hints(view), width))?;
+    let segments = status_segments(&bar_state(view, session), width);
+    let bar_row = usize::from(lines.saturating_sub(2));
+    canvas.put(
+        bar_row,
+        margin,
+        &first_row(&join_segments(&segments), width),
+    );
+    let hint_row = usize::from(lines.saturating_sub(1));
+    canvas.put(hint_row, margin, &first_row(&hints(view), width));
+    Scene {
+        rest: canvas,
+        history_rows: usize::from(rule_row),
+        chrome_rows: usize::from(rule_row)..usize::from(input_top + input_height),
+        bar_row,
+        hint_row,
+        segments,
+    }
+}
+
+/// Paint the resting screen, or the launch frame while it plays.
+fn draw(
+    view: &View,
+    session: &Session,
+    frame: usize,
+    launch: Option<Duration>,
+    palette: Palette,
+) -> Result<()> {
+    let (columns, lines) = terminal::size()?;
+    let scene = compose(view, session, frame, columns, lines);
+    let canvas = match launch {
+        Some(elapsed) => launch::frame(&scene, elapsed),
+        None => scene.rest,
+    };
+    let mut out = stdout();
+    out.write_all(&canvas.paint(palette)?)?;
     out.flush()?;
     Ok(())
 }
@@ -398,6 +424,14 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
     let mut active: Option<ActiveRun> = None;
     let mut last_draw = None;
     let spinner_epoch = Instant::now();
+    let (columns, lines) = terminal::size()?;
+    let mut launch_started = launch::should_play(
+        std::env::var_os("MICROGENTIC_NO_ANIMATION").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+        columns,
+        lines,
+    )
+    .then(Instant::now);
     let outcome: Result<()> = async {
         loop {
             if leaving.load(Ordering::Relaxed) {
@@ -464,7 +498,16 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
             let frame = animating.then(|| {
                 (spinner_epoch.elapsed().as_millis() / SPINNER_FRAME.as_millis()) as usize
             });
+            // The launch animation redraws at about 30 fps while it plays, then
+            // the idle signature takes over again.
+            let launch = launch_started
+                .map(|started| started.elapsed())
+                .filter(|elapsed| *elapsed < launch::duration());
+            if launch.is_none() {
+                launch_started = None;
+            }
             let signature = (
+                launch.map(|elapsed| elapsed.as_millis() / LAUNCH_FRAME.as_millis()),
                 frame,
                 (
                     session.settings.model.clone(),
@@ -480,14 +523,19 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 terminal::size()?,
             );
             if last_draw.as_ref() != Some(&signature) {
-                draw(&view, &session, frame.unwrap_or(0), palette)?;
+                draw(&view, &session, frame.unwrap_or(0), launch, palette)?;
                 last_draw = Some(signature);
             }
-            if !event::poll(Duration::from_millis(50))? {
+            let wait = if launch.is_some() { LAUNCH_FRAME } else { Duration::from_millis(50) };
+            if !event::poll(wait)? {
                 tokio::task::yield_now().await;
                 continue;
             }
-            match event::read()? {
+            let event = event::read()?;
+            // Any key, paste or resize skips to the resting screen, and the
+            // event still has its usual effect below.
+            launch_started = None;
+            match event {
                 Event::Paste(text) => view
                     .input
                     .extend(text.chars().filter(|ch| !ch.is_control() || *ch == '\n')),
@@ -946,7 +994,7 @@ mod tests {
     }
 
     fn bar_text(view: &View, session: &Session) -> String {
-        status_bar(&bar_state(view, session), 200)
+        join_segments(&status_segments(&bar_state(view, session), 200))
             .runs
             .iter()
             .map(|(_, text)| text.as_str())
@@ -990,6 +1038,20 @@ mod tests {
         );
         assert!(bar_text(&view, &session).ends_with("ctx: 12.4k"));
         assert!(bar_text(&view, &session).starts_with("🤖 test-model  🧠 low  📁 p"));
+    }
+
+    #[test]
+    fn the_launch_animation_lands_on_the_real_resting_screen() {
+        let view = view();
+        let session = session();
+        let scene = compose(&view, &session, 0, 90, 24);
+        assert_eq!(scene.rest.find("Microgentic"), Some((0, 9)));
+        assert_eq!(launch::frame(&scene, launch::duration()), scene.rest);
+        // Mid-way the real status bar is sprouting below the landed word.
+        let sprouting = launch::frame(&scene, launch::start_of(9));
+        assert!(sprouting.row_text(scene.bar_row).starts_with(" 🤖 first"));
+        assert_eq!(sprouting.role_at(0, 9), Some(Role::Wordmark));
+        assert_eq!(scene.rest.role_at(0, 9), Some(Role::Muted));
     }
 
     #[tokio::test]

@@ -77,6 +77,8 @@ def exercise(provider, model, in_git):
     env = dict(os.environ, TERM="xterm-256color", XDG_STATE_HOME=str(state),
                OMLX_HOST=host, OLLAMA_HOST=host, OMLX_API_KEY="test-key")
     env.pop("NO_COLOR", None)
+    # The launch animation has its own test; the rest stay deterministic.
+    env["MICROGENTIC_NO_ANIMATION"] = "1"
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 160, 0, 0))

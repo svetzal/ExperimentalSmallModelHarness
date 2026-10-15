@@ -76,6 +76,8 @@ def exercise(provider):
     # of the harness's optional shared Cargo cache directory.
     env.pop("CARGO_TARGET_DIR", None)
     env.pop("NO_COLOR", None)
+    # The launch animation has its own test; the rest stay deterministic.
+    env["MICROGENTIC_NO_ANIMATION"] = "1"
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 200, 0, 0))

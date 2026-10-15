@@ -246,3 +246,20 @@ fn tui_status_bar_shows_settings_git_state_and_context_fill() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn tui_launch_animation_settles_quickly_and_never_blocks_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tui_launch.py"))
+        .arg(env!("CARGO_BIN_EXE_microgentic"))
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

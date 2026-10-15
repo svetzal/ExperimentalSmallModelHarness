@@ -21,6 +21,8 @@ def open_view(no_color):
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 90, 0, 0))
     env = dict(os.environ, TERM="xterm-256color", OMLX_HOST="http://127.0.0.1:1")
     env.pop("NO_COLOR", None)
+    # The launch animation has its own test; the rest stay deterministic.
+    env["MICROGENTIC_NO_ANIMATION"] = "1"
     if no_color is not None:
         env["NO_COLOR"] = no_color
     process = subprocess.Popen([sys.argv[1], "--config", os.path.join(sys.argv[2], "config.json")],

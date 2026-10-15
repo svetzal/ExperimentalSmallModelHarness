@@ -16,6 +16,12 @@ pub(super) enum Role {
     Folder,
     Branch,
     Dirty,
+    /// The launch wordmark and its brightest sparks.
+    Wordmark,
+    Spark,
+    SparkDim,
+    /// A letter about to land, before it takes the wordmark colour.
+    Flash,
     Error,
     Prompt,
     System,
@@ -46,7 +52,11 @@ impl Palette {
     pub(super) fn style(self, role: Role) -> ContentStyle {
         let (colour, attribute) = match role {
             Role::Plain => (None, None),
-            Role::AgentLabel => (Some(Color::DarkMagenta), Some(Attribute::Bold)),
+            Role::AgentLabel | Role::Wordmark => (Some(Color::DarkMagenta), Some(Attribute::Bold)),
+            Role::Spark => (Some(Color::DarkMagenta), None),
+            Role::SparkDim => (Some(Color::DarkMagenta), Some(Attribute::Dim)),
+            // Bold default foreground: bright on dark themes, dark on light ones.
+            Role::Flash => (None, Some(Attribute::Bold)),
             Role::UserLabel | Role::Prompt => (Some(Color::DarkCyan), Some(Attribute::Bold)),
             Role::Muted => (None, Some(Attribute::Dim)),
             Role::System => (None, Some(Attribute::Italic)),
