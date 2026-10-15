@@ -1,6 +1,7 @@
 # Context residency
 
-Date: 2026-10-15. Status: draft for discussion. Nothing here is built yet.
+Date: 2026-10-15. Status: framing agreed on 2026-10-15; see Decisions.
+Nothing here is built yet.
 Source baseline: `38f7431`.
 
 ## Why this note exists
@@ -203,7 +204,9 @@ Hypothesis: root guidance of up to 8k tokens improves convention-following
   without lowering success.
 Nearest alternative explanation: the guidance tokens cost more attention than
   the guidance is worth.
-Changed variable: guidance on or off.
+Changed variable: guidance on or off. A follow-up cell varies the guidance
+  share of the window (for example 4%, 8%, and 12.5%) once the limit is a
+  run setting.
 Minimum replicate count: 5 per arm.
 ```
 
@@ -223,12 +226,50 @@ Fixed variables for every cell follow Gate 4 of `EXPERIMENTAL_METHOD.md`.
 Benchmark mode stays unchanged throughout, unless a cell deliberately varies it
 and records that.
 
-## Open questions
+## Decisions
 
-- Where do skills live? Options: a project directory, a user directory under
-  `~/.config/microgentic/`, or existing skill directories that other agents
-  already read.
-- Should residency be visible to the user, for example a `/context` command
-  listing resident items, or status bar counts?
-- Are tool descriptors in scope for residency, or held fixed for now?
-- What budget defaults apply per window size, and per kind of item?
+Stacey reviewed this draft on 2026-10-15 and agreed the framing and the
+sequencing above. The open questions are answered as follows.
+
+**Where skills live.** User skills live in `~/.config/microgentic/skills/`,
+beside the personal `AGENTS.md`. Project skills live in `.agents/skills/` in
+the repository. Microgentic does not read `~/.claude/skills/` or other agents'
+skill directories by default: a catalog of dozens of skills would use a small
+model's whole catalog budget.
+
+**Visibility.** Grow the existing `/guidance` command into `/context`, which
+lists every resident item with its kind, tokens, and inclusion reason. The
+status bar keeps one compact resident count beside the context gauge. The trace
+records the residency events listed under Measurement.
+
+**Tool descriptors.** Record them in the trace as pinned residents, so their
+cost is measured, but do not activate or eject them yet. On-demand tools change
+the provider request shape and need their own hypothesis before any work.
+
+**Budget defaults.** All standing context (guidance, skill catalog, and active
+skill bodies) stays below the 15% yellow pressure band. Each kind has its own
+cap, a fraction of the discovered context window with a floor and a ceiling.
+The caps add up to about 20%, so they cannot all be full at once: the combined
+15% limit is the binding one. When standing context would pass it, ejection
+removes active skill bodies first, then nested guidance. Root guidance and the
+catalog are pinned.
+
+| Kind | Fraction of window | Floor | Ceiling |
+| --- | --- | --- | --- |
+| Guidance (unchanged) | 1/8 | 500 | 8,000 |
+| Skill catalog | 1/64 | 250 | 1,000 |
+| Active skill bodies, combined | 1/16 | 500 | 4,000 |
+
+When the window is unknown, the skill budgets apply to an assumed 32,000-token
+window: 500 for the catalog and 2,000 for active bodies. Guidance keeps its
+existing unknown-window budget of 8,000, which is 25% of that assumed window and
+breaks the yellow-band rule. Context window discovery in the measurement step
+should make an unknown window rare; revisit the guidance fallback then.
+
+**The percentages are variables.** The combined standing-context limit (15%)
+and each per-kind fraction are run settings, not constants, so cells can
+measure performance at different levels. Expose them as documented advanced
+configuration with a matching run flag, never in the everyday interface.
+Record the effective values in the trace beside each context ledger. The values
+above are only the defaults. Benchmark mode keeps its current fixed behaviour
+unless a cell sets these values explicitly and records them.

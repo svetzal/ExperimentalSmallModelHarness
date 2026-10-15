@@ -1,8 +1,8 @@
 # Microgentic public CLI readiness checklist
 
-Started: 2026-10-13. Reviewed: 2026-10-14. Status: v0.1.0 published with
-Homebrew installation and an ongoing streaming conversation. Remaining proposals
-are identified below. See [migration evidence](MICROGENTIC-CLI-MIGRATION.md).
+Started: 2026-10-13. Reviewed: 2026-10-14. Status: v0.3.0 published through
+Homebrew, with an ongoing streaming conversation and project guidance. Open
+questions answered on 2026-10-15. Remaining proposals are identified below. See [migration evidence](MICROGENTIC-CLI-MIGRATION.md).
 
 Build Microgentic as an adaptive coding agent optimized for small models that
 need extra help staying on task. Give it a small, simple, fast interface with
@@ -173,12 +173,16 @@ Source seams: [prompt intake](src/cli.rs), [conversation](src/conversation.rs),
 Guidance discovery and skills add standing context, and small models lose
 quality well below their window size. Activation and ejection are one policy.
 See the [context residency draft](CONTEXT-RESIDENCY.md) for the framing, the
-measurements, and the draft hypotheses. The framing awaits review before any
-build work starts.
+measurements, the draft hypotheses, and the decisions from the 2026-10-15
+review: skill locations, the `/context` view, tool descriptors held fixed, and
+budget defaults.
 
-- [ ] Agree the residency framing and answer its open questions.
+- [x] Agree the residency framing and answer its open questions.
 - [ ] Measurement first: trace residency events and time to first token, and
   discover context windows from providers so pressure stops reading "unknown".
+  Make the standing-context limit and per-kind window fractions run settings
+  (advanced configuration and a flag), recorded in the trace, so cells can
+  vary them.
 - [ ] Run the guidance on/off baseline cell (HYP-R-4).
 - [ ] Add an ejection policy for guidance, and move tool-result compaction under
   it (HYP-R-1, HYP-R-3).
@@ -501,6 +505,12 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
   switches the model for the session; `/effort` does the same for reasoning
   effort. Provider switching, change
   review, check output, and the final diff remain.
+- [ ] **Keep the conversation across a model or effort switch.** Decided on
+  2026-10-15. Today a switch after the first message starts a new session file,
+  because `ConversationRun::open` refuses a different model or effort (see
+  `MICROGENTIC-CONVERSATION.md`). Relax that guard for model and effort only;
+  keep the project root and provider checks. Drop the previous model's retained
+  reasoning, trim history to the new model's window, and report what was left out.
 - [ ] **Specify keyboard behavior.** Define send versus newline, history, scroll,
   help, and cancellation. Preserve input during resize. Define Ctrl-C and a
   second interrupt; restore the terminal after exit, errors, or panic.
