@@ -49,7 +49,8 @@ mode; the task path keeps its original exact DONE/FAIL instruction.
 
 ## Deterministic evidence
 
-The native integration suite runs `tests/tui_dialogue.py` through the real PTY
+The native integration suite runs `tests/tui_dialogue.py` (now the
+`tui_chats_naturally_*` tests in `tests/tui.rs`) through the real PTY
 and mock HTTP gateways for oMLX and Ollama. It checks:
 
 - Idle launch contacts no provider and creates no engineering task.
@@ -66,7 +67,7 @@ and mock HTTP gateways for oMLX and Ollama. It checks:
 The existing history, full-content streaming, cancellation, session isolation,
 scope, validation, context, and recovery tests remain in the full suite.
 The pre-change executable was copied before rebuilding. The reusable
-`tests/benchmark_continuity.py` checker compares benchmark HTTP request JSON,
+`tests/benchmark_continuity.py` checker (now `tests/benchmark_continuity.rs`) compares benchmark HTTP request JSON,
 exact provider snapshots, and context ledgers before and after a scripted tool
 result for both gateways; public summary fields also remain equal. See
 [comparison evidence](benchmarks/cli-migration/dialogue-isolation-check.json).

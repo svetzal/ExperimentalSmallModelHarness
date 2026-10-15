@@ -200,6 +200,26 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
+The end-to-end tests are Rust and run under `cargo test`. `tests/tui.rs`
+drives the real TUI in a pseudo-terminal and reads the rendered screen.
+`tests/everyday_runs.rs` covers the calculator tool and project guidance.
+`tests/benchmark_continuity.rs` checks that benchmark runs send the same
+provider requests as the legacy task commands. All of them use a mock oMLX and
+Ollama server from `tests/support/`, never a model. The TUI tests need a Unix
+pseudo-terminal.
+
+To check that a change keeps benchmark requests identical to an older build,
+keep that build's binary and compare it with the current one:
+
+```sh
+MICROGENTIC_CONTINUITY_BASELINE=/path/to/old/microgentic \
+  cargo test --test benchmark_continuity -- --ignored --nocapture
+```
+
+The test prints a report with both binaries' SHA-256 hashes. Set
+`MICROGENTIC_CONTINUITY_MODE=conversation` to compare contract runs through
+`run --prompt` only.
+
 ## Command-Line Interface
 
 Install the canonical command from this checkout:

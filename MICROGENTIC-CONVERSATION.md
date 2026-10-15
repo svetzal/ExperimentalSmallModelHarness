@@ -84,7 +84,8 @@ change sampling, invent completion status, or replace deterministic checks.
 
 ## Deterministic checks
 
-`tests/tui_conversation.py`, invoked by the native integration suite, exercises
+`tests/tui_conversation.py` (now the `tui_streams_and_keeps_native_history_*`
+tests in `tests/tui.rs`), invoked by the native integration suite, exercises
 the actual PTY, CLI worker, and mock HTTP gateway for both oMLX and Ollama,
 through the canonical and compatibility executables:
 
@@ -105,7 +106,8 @@ in the full suite. These are delivery/conformance checks, not model efficacy
 measurements; no live local-model trial is part of this slice.
 
 The baseline binary was copied before rebuilding this slice. The reusable
-`tests/benchmark_continuity.py` checker compares it against the new executable
+`tests/benchmark_continuity.py` checker (now `tests/benchmark_continuity.rs`)
+compares it against the new executable
 using an authoritative contract, a scripted inspection tool, and a terminal
 reply. Both gateways produce equal HTTP request JSON, exact assembled provider
 snapshots, and adjacent context ledgers before and after the tool result. Public

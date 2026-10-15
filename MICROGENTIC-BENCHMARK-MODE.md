@@ -68,7 +68,7 @@ The earlier migration patch and evidence remain separate historical records.
 ## Deterministic evidence
 
 The comparison rebuilt `bfe3529` with its locked dependencies and preserved that
-binary before rebuilding Microgentic. `tests/benchmark_continuity.py` compares the
+binary before rebuilding Microgentic. `tests/benchmark_continuity.py` (now `tests/benchmark_continuity.rs`) compares the
 original task commands with the new benchmark commands through mock HTTP gateways.
 The record is `benchmarks/cli-migration/benchmark-mode-check.json`.
 

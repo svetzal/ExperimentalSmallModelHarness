@@ -38,6 +38,14 @@ python3 -m unittest discover -s benchmarks -p 'test_collection_validation.py'
 cargo build --locked --release --bins
 ```
 
+End-to-end tests are Rust integration tests. Build new ones on `tests/support/`:
+a pseudo-terminal driver with a rendered screen, one mock server for oMLX and
+Ollama, and workspace fixtures. Do not add Python test scripts under `tests/`.
+To compare benchmark requests with an older binary, run
+`MICROGENTIC_CONTINUITY_BASELINE=<old binary> cargo test --test benchmark_continuity -- --ignored --nocapture`.
+The recovery tests still call the Python harness in `fixtures/recovery/`,
+because experiment runs outside this repository use it.
+
 Provider fixtures use mock HTTP servers. Do not start local models for routine
 checks. Preserve model patience and let the runtime own stop policy during live
 runs. Local-model comparisons stay within Qwen unless the user requests otherwise.
