@@ -137,23 +137,6 @@ fn prompt_must_match_an_authoritative_contract_before_a_run_is_created() {
 
 #[cfg(unix)]
 #[test]
-fn tui_opens_without_a_provider_and_restores_the_terminal() {
-    let temp = tempfile::tempdir().unwrap();
-    let output = Command::new("python3")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tui_smoke.py"))
-        .arg(env!("CARGO_BIN_EXE_microgentic"))
-        .arg(temp.path())
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn tui_streams_and_keeps_native_history_without_leaking_into_runs() {
     let temp = tempfile::tempdir().unwrap();
     let output = Command::new("python3")

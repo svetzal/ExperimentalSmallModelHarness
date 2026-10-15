@@ -37,3 +37,7 @@ tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.0"
 unicode-width = "0.2"
+
+[dev-dependencies]
+portable-pty = "0.9"
+vt100 = "0.16"
