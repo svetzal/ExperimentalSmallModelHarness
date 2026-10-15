@@ -4,6 +4,8 @@ An adaptive coding agent optimized for small models that need extra help staying
 on task. Microgentic provides a small terminal interface over an experimental
 runtime for inspecting, editing, validating, and repairing scoped artifacts.
 
+User documentation: <https://vetzal.ca/microgentic/>
+
 ## Install and start
 
 ```sh

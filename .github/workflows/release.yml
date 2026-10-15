@@ -10,6 +10,12 @@ permissions:
 jobs:
   build:
     uses: ./.github/workflows/ci.yml
+    # The reused CI declares a Pages deploy job. It only runs for pushes to
+    # main, but a caller must still allow the permissions it requests.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     with:
       package: true
   publish:
@@ -22,6 +28,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
+          pattern: microgentic-*
           merge-multiple: true
       - name: Publish versioned archives and checksums
         env:

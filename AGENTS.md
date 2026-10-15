@@ -36,6 +36,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 python3 -m unittest discover -s benchmarks -p 'test_collection_validation.py'
 cargo build --locked --release --bins
+mdbook build book
 ```
 
 End-to-end tests are Rust integration tests. Build new ones on `tests/support/`:
@@ -71,6 +72,15 @@ Every push and tag starts GitHub Actions. Let those runs finish, including for
 intermediate versions; never cancel them. Do not wait on them either: push, then
 continue local work and local installs. Check a run's result later, when its
 outcome decides the next step (for example, before updating the Homebrew tap).
+
+## Documentation site
+
+User documentation is an mdBook in `book/`. The `deploy-docs` job in
+`.github/workflows/ci.yml` publishes it to <https://vetzal.ca/microgentic/>
+after every push to `main` that passes CI. When a change alters what users see
+or do, update the matching page in `book/src/` in the same commit.
+`book/src/changelog.md` includes `CHANGELOG.md`; do not copy entries into it.
+Use the mdBook version that CI pins (`MDBOOK_VERSION`, 0.5.4 today).
 
 ## Release process
 

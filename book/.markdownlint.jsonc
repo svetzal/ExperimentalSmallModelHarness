@@ -1,0 +1,7 @@
+// mdBook part titles in SUMMARY.md are top-level headings, changelog.md is
+// only an include of CHANGELOG.md, and reference tables read better unwrapped.
+{
+  "MD013": { "tables": false },
+  "MD025": false,
+  "MD041": false
+}

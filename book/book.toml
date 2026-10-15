@@ -1,0 +1,16 @@
+[book]
+title = "Microgentic"
+authors = ["Stacey Vetzal"]
+description = "An adaptive coding agent optimized for small models that need extra help staying on task"
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+site-url = "/microgentic/"
+git-repository-url = "https://github.com/svetzal/microgentic"
+edit-url-template = "https://github.com/svetzal/microgentic/edit/main/book/{path}"
+
+[build]
+build-dir = "book"

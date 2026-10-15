@@ -24,6 +24,11 @@
       "name": "collection-tests",
       "command": "python3 -m unittest discover -s benchmarks -p 'test_collection_validation.py'",
       "required": true
+    },
+    {
+      "name": "docs",
+      "command": "mdbook build book",
+      "required": true
     }
   ]
 }
