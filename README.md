@@ -260,7 +260,7 @@ non-empty value to turn colour off; bold and dim text remain.
 A status bar sits below the input, above the key hints:
 
 ```text
-🤖 qwen3.8:27b-mxfp8  🧠 low  📁 microgentic  🌿 main ●3 …2 ↑1  ctx:[███░░░░░░░]31%
+🤖 qwen3.8:27b-mxfp8  🧠 low  📁 microgentic  🌿 main ●3 …2 ↑1  ctx:[███·······]31%
 ```
 
 It shows the model, the reasoning effort (`default` when unset), the project

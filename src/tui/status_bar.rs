@@ -85,7 +85,7 @@ pub(super) struct ContextUsage {
     pub(super) window_tokens: Option<usize>,
 }
 
-/// `ctx:[███▌░░░░░░]35%`, coloured by fill. Without a known window, only the
+/// `ctx:[███▌······]35%`, coloured by fill. Without a known window, only the
 /// token count: `ctx: 12.4k`. The bar shape and number carry the meaning
 /// without colour.
 pub(super) fn context_gauge(usage: ContextUsage) -> Styled {
@@ -102,8 +102,9 @@ pub(super) fn context_gauge(usage: ContextUsage) -> Styled {
     if part > 0 {
         bar.push_str(EIGHTHS[part - 1]);
     }
-    let empty = GAUGE_CELLS - full - usize::from(part > 0);
-    bar.push_str(&"░".repeat(empty));
+    // The empty track is dim dots, never a block, so a low fill cannot read
+    // as nearly full in fonts that draw shade characters solid.
+    let track = "·".repeat(GAUGE_CELLS - full - usize::from(part > 0));
     let role = match percent {
         0..60 => Role::Success,
         60..=85 => Role::Working,
@@ -112,6 +113,7 @@ pub(super) fn context_gauge(usage: ContextUsage) -> Styled {
     Styled::default()
         .with(Role::Muted, "ctx:[")
         .with(role, &bar)
+        .with(Role::Muted, &track)
         .with(Role::Muted, "]")
         .with(role, &format!("{percent}%"))
 }
@@ -289,19 +291,24 @@ mod tests {
     #[test]
     fn the_gauge_fills_in_eighths_and_changes_colour_by_fill() {
         let expected = [
-            (0, "ctx:[░░░░░░░░░░]0%", Role::Success),
-            (31, "ctx:[███░░░░░░░]31%", Role::Success),
-            (59, "ctx:[█████▉░░░░]59%", Role::Success),
-            (60, "ctx:[██████░░░░]60%", Role::Working),
-            (85, "ctx:[████████▌░]85%", Role::Working),
+            (0, "ctx:[··········]0%", Role::Success),
+            (31, "ctx:[███·······]31%", Role::Success),
+            (59, "ctx:[█████▉····]59%", Role::Success),
+            (60, "ctx:[██████····]60%", Role::Working),
+            (85, "ctx:[████████▌·]85%", Role::Working),
             (100, "ctx:[██████████]100%", Role::Failure),
         ];
         for (percent, shown, role) in expected {
             let gauge = gauge(percent);
             assert_eq!(text(&gauge), shown);
-            assert_eq!(gauge.runs[1].0, role, "{percent}%");
+            assert_eq!(gauge.runs.last().unwrap().0, role, "{percent}%");
             assert_eq!(cells(&gauge), cells_of(shown));
         }
+        // The empty track is dim dots in every state, so 5% reads as nearly empty.
+        let low = gauge(5);
+        assert_eq!(text(&low), "ctx:[▌·········]5%");
+        assert!(low.runs.contains(&(Role::Muted, "·········]".to_owned())));
+        assert!(!text(&low).contains('█') && !text(&low).contains('░'));
         // An estimate past the window fills the bar and reports the real number.
         assert_eq!(text(&gauge(130)), "ctx:[██████████]130%");
     }
@@ -350,7 +357,7 @@ mod tests {
         let bar = status_bar(&state(Some(&git)), 200);
         assert_eq!(
             text(&bar),
-            "🤖 qwen3.8:27b  🧠 high  📁 Operations  🌿 main ●3 …2  ctx:[▉░░░░░░░░░]9%"
+            "🤖 qwen3.8:27b  🧠 high  📁 Operations  🌿 main ●3 …2  ctx:[▉·········]9%"
         );
         // Emoji count as two cells each.
         assert_eq!(cells(&bar), text(&bar).chars().count() + 4);
@@ -367,14 +374,14 @@ mod tests {
         let widths_and_shown = [
             (
                 full,
-                "🤖 qwen3.8:27b  🧠 high  📁 Operations  🌿 main ●3  ctx:[▉░░░░░░░░░]9%",
+                "🤖 qwen3.8:27b  🧠 high  📁 Operations  🌿 main ●3  ctx:[▉·········]9%",
             ),
             (
                 full - 1,
-                "🤖 qwen3.8:27b  🧠 high  📁 Operations  ctx:[▉░░░░░░░░░]9%",
+                "🤖 qwen3.8:27b  🧠 high  📁 Operations  ctx:[▉·········]9%",
             ),
-            (50, "🤖 qwen3.8:27b  🧠 high  ctx:[▉░░░░░░░░░]9%"),
-            (34, "🤖 qwen3.8:27b  ctx:[▉░░░░░░░░░]9%"),
+            (50, "🤖 qwen3.8:27b  🧠 high  ctx:[▉·········]9%"),
+            (34, "🤖 qwen3.8:27b  ctx:[▉·········]9%"),
             (10, "🤖 qwen3.8:27b"),
         ];
         for (width, shown) in widths_and_shown {

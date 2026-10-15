@@ -3,6 +3,8 @@
 //! History is a list of entries: styled text, and tool-call lines that change
 //! state in place. Vertical rhythm is one blank line between exchanges and
 //! commands, with replies, tool lines, and footers tight inside an exchange.
+//! Whitespace-only reply content never opens blank rows: it is held until
+//! visible text follows it in the same reply segment, and dropped otherwise.
 use super::styled::{Role, Styled};
 use super::tool_lines::{CallState, ToolLine};
 
@@ -18,6 +20,10 @@ enum Entry {
 pub(super) struct History {
     entries: Vec<Entry>,
     pub(super) revision: usize,
+    /// Reply whitespace waiting for visible text to follow it.
+    held: String,
+    /// Whether the current reply segment has shown any visible text.
+    reply_visible: bool,
 }
 
 impl History {
@@ -54,16 +60,68 @@ impl History {
         }
     }
 
+    fn ends_with_blank_row(&self) -> bool {
+        match self.entries.last() {
+            Some(Entry::Text(styled)) => {
+                let tail: String = styled
+                    .runs
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                tail.ends_with("\n\n")
+            }
+            _ => false,
+        }
+    }
+
     /// Start an exchange or command output, one blank line below the last.
+    /// There is never more than one blank row in a row.
     pub(super) fn start_block(&mut self) {
         self.start_line();
-        if !self.entries.is_empty() {
+        if !self.entries.is_empty() && !self.ends_with_blank_row() {
             self.push(Role::Plain, "\n");
         }
     }
 
+    /// Begin a reply segment: a model turn's text, or text after a tool block.
+    pub(super) fn begin_reply(&mut self) {
+        self.held.clear();
+        self.reply_visible = false;
+    }
+
+    /// Add streamed reply text. Leading whitespace in a segment is dropped,
+    /// whitespace is held until visible text follows it, and runs of blank
+    /// lines shrink to one. Whitespace inside visible text, such as code
+    /// indentation, is kept.
+    pub(super) fn push_reply(&mut self, text: &str) {
+        self.held.push_str(text);
+        let Some((last, ch)) = self
+            .held
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| !ch.is_whitespace())
+        else {
+            return;
+        };
+        let visible: String = self.held.drain(..last + ch.len_utf8()).collect();
+        let visible = if self.reply_visible {
+            visible.as_str()
+        } else {
+            self.reply_visible = true;
+            visible.trim_start()
+        };
+        self.push(Role::Plain, &clamp_blank_lines(visible));
+    }
+
     /// Add a running call, or refresh one already shown with the same ID.
     pub(super) fn start_tool(&mut self, line: ToolLine) {
+        // A tool block ends the reply segment; its held whitespace is dropped.
+        self.begin_reply();
         let existing = self.entries.iter_mut().rev().find_map(|entry| match entry {
             Entry::Tool(shown) if !line.call_id.is_empty() && shown.call_id == line.call_id => {
                 Some(shown)
@@ -140,6 +198,32 @@ impl History {
     }
 }
 
+/// Shrink every run of blank lines to a single blank line, keeping the
+/// indentation that follows the last newline in the run.
+fn clamp_blank_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            run.push(ch);
+            continue;
+        }
+        out.push_str(&shrink_run(&run));
+        run.clear();
+        out.push(ch);
+    }
+    out.push_str(&shrink_run(&run));
+    out
+}
+
+fn shrink_run(run: &str) -> String {
+    if run.matches('\n').count() <= 2 {
+        return run.to_owned();
+    }
+    let indent = &run[run.rfind('\n').map_or(0, |at| at + 1)..];
+    format!("\n\n{indent}")
+}
+
 pub(super) const WELCOME: &str = "Talk to Microgentic. Ask for work when you're ready.\nWhen requested, Microgentic can edit files and run project commands.\nConfigure defaults with microgentic setup outside this view.\nType /help for commands.\n";
 
 #[cfg(test)]
@@ -176,6 +260,64 @@ mod tests {
         );
         // Every edit changes the redraw signature, even one that adds nothing visible.
         assert_eq!(history.revision, 4);
+    }
+
+    #[test]
+    fn whitespace_only_content_never_opens_blank_rows() {
+        let mut history = History::default();
+        history.begin_reply();
+        for chunk in ["\n\n", "\n", "\n", "   ", "\t"] {
+            history.push_reply(chunk);
+        }
+        assert_eq!(text(&history), "");
+        history.start_tool(call("c1", "read_file", "a.rs"));
+        assert_eq!(text(&history), "  ⠋ read_file a.rs\n");
+    }
+
+    #[test]
+    fn held_whitespace_appears_only_before_following_text() {
+        let mut history = History::default();
+        history.begin_reply();
+        for chunk in [
+            "\n\nFirst",
+            " ",
+            "line.\n",
+            "\n\n\n",
+            "Second\n",
+            "  indented",
+        ] {
+            history.push_reply(chunk);
+        }
+        assert_eq!(text(&history), "First line.\n\nSecond\n  indented");
+        // Trailing whitespace before a tool block is dropped.
+        history.push_reply("\n\n");
+        history.start_tool(call("c1", "read_file", "a.rs"));
+        assert_eq!(
+            text(&history),
+            "First line.\n\nSecond\n  indented\n  ⠋ read_file a.rs\n"
+        );
+    }
+
+    #[test]
+    fn code_blocks_keep_their_inner_whitespace() {
+        let mut history = History::default();
+        history.begin_reply();
+        let code = "```rust\nfn main() {\n    let x = 1;\n\n    println!(\"{x}\");\n}\n```";
+        for chunk in code.split_inclusive(' ') {
+            history.push_reply(chunk);
+        }
+        assert_eq!(text(&history), code);
+        assert_eq!(clamp_blank_lines("a\n\n\n\n    b"), "a\n\n    b");
+        assert_eq!(clamp_blank_lines("a\n \n\t\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn blocks_never_stack_two_blank_rows() {
+        let mut history = History::default();
+        history.push(Role::Plain, "text\n\n");
+        history.start_block();
+        history.push(Role::Plain, "next\n");
+        assert_eq!(text(&history), "text\n\nnext\n");
     }
 
     #[test]

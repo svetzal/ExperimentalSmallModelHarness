@@ -635,6 +635,7 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
     match event {
         ConversationEvent::ReplyStarted => {
             view.history.start_line();
+            view.history.begin_reply();
             if !run.replied {
                 view.history.push(Role::AgentLabel, "Microgentic:");
                 view.history.push(Role::Plain, " ");
@@ -646,7 +647,7 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             run.activity = "Waiting for response".into();
         }
         ConversationEvent::Content { text } => {
-            view.history.push(Role::Plain, &text);
+            view.history.push_reply(&text);
             run.streamed_text.push_str(&text);
             run.activity = "Replying".into();
         }
@@ -861,6 +862,96 @@ mod tests {
         assert!(!text.contains("Using") && !text.contains("finished"));
     }
 
+    fn tool(id: &str, name: &str, arguments: serde_json::Value) -> ConversationEvent {
+        ConversationEvent::ToolStarted {
+            call_id: id.into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    fn done(id: &str, name: &str) -> ConversationEvent {
+        ConversationEvent::ToolFinished {
+            call_id: id.into(),
+            name: name.into(),
+            ok: true,
+        }
+    }
+
+    fn content(text: &str) -> ConversationEvent {
+        ConversationEvent::Content { text: text.into() }
+    }
+
+    /// The content chunks and tool calls of a real oMLX run (Qwen3.8-27B,
+    /// 2026-10-15), where whitespace-only chunks before each tool group
+    /// opened blank rows.
+    #[tokio::test]
+    async fn the_real_run_shows_no_blank_rows_between_tool_groups() {
+        use serde_json::json;
+        let mut view = view();
+        let mut run = placeholder_run();
+        let turns: Vec<Vec<ConversationEvent>> = vec![
+            vec![
+                content("\n\n"),
+                content("\n"),
+                content("\n"),
+                tool(
+                    "t1",
+                    "shell_command",
+                    json!({"command": "grep -rniE \"pacing\" src | head"}),
+                ),
+                tool("t2", "shell_command", json!({"command": "ls src/tui"})),
+                tool("t3", "list_tree", json!({"path": ".", "max_depth": 3})),
+                done("t1", "shell_command"),
+                done("t2", "shell_command"),
+                done("t3", "list_tree"),
+            ],
+            vec![
+                content("\n\n"),
+                tool("t4", "read_file", json!({"path": "src/tui/launch.rs"})),
+                done("t4", "read_file"),
+            ],
+            vec![
+                content("\n\n"),
+                tool(
+                    "t5",
+                    "shell_command",
+                    json!({"command": "grep -rn \"PACE\" src/tui"}),
+                ),
+                done("t5", "shell_command"),
+            ],
+            vec![
+                content("\n\n"),
+                tool(
+                    "t6",
+                    "read_file",
+                    json!({"path": "src/tui/mod.rs", "line_start": 460, "line_end": 540}),
+                ),
+                done("t6", "read_file"),
+            ],
+            vec![
+                content("\n\n"),
+                content("Found"),
+                content(" it."),
+                content(" The pace is set by `PACE`.\n\n"),
+                content("```rust\nconst PACE: f64 = 2.0;\n```"),
+            ],
+        ];
+        for events in turns {
+            apply_event(&mut view, &mut run, ConversationEvent::ReplyStarted);
+            for event in events {
+                apply_event(&mut view, &mut run, event);
+            }
+        }
+        let text = history_text(&view);
+        let exchange = &text[text.find("Microgentic:").unwrap()..];
+        assert_eq!(
+            exchange,
+            "Microgentic: \n  ✓ shell_command grep -rniE \"pacing\" src | head\n  ✓ shell_command ls src/tui\n  ✓ list_tree . depth 3\n  ✓ read_file src/tui/launch.rs\n  ✓ shell_command grep -rn \"PACE\" src/tui\n  ✓ read_file src/tui/mod.rs:460-540\nFound it. The pace is set by `PACE`.\n\n```rust\nconst PACE: f64 = 2.0;\n```"
+        );
+        assert!(!text.contains("\n\n\n"));
+    }
+
     #[tokio::test]
     async fn a_failed_run_stops_calls_that_were_still_running() {
         let mut view = view();
@@ -1007,7 +1098,7 @@ mod tests {
         let mut session = session();
         session.settings.model = "qwen3.8:27b-mxfp8".into();
         // A known window shows an empty gauge before the first request.
-        assert!(bar_text(&view, &session).ends_with("📁 p  ctx:[░░░░░░░░░░]0%"));
+        assert!(bar_text(&view, &session).ends_with("📁 p  ctx:[··········]0%"));
         let mut run = placeholder_run();
         apply_event(
             &mut view,
@@ -1017,9 +1108,9 @@ mod tests {
                 window_tokens: Some(262_144),
             },
         );
-        assert!(bar_text(&view, &session).ends_with("ctx:[███░░░░░░░]31%"));
+        assert!(bar_text(&view, &session).ends_with("ctx:[███·······]31%"));
         run_command(&mut view, &mut session, Command::Clear);
-        assert!(bar_text(&view, &session).ends_with("ctx:[░░░░░░░░░░]0%"));
+        assert!(bar_text(&view, &session).ends_with("ctx:[··········]0%"));
 
         // An unknown window shows the estimate alone, and nothing before it.
         run_command(

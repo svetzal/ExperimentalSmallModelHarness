@@ -269,10 +269,9 @@ impl ConversationRun {
             {
                 "Preparing tool request".into()
             }
-            "llm.progress.status" => format!(
-                "Model progress: {}",
-                payload["progress_state"].as_str().unwrap_or("unknown")
-            ),
+            "llm.progress.status" => {
+                progress_label(payload["progress_state"].as_str().unwrap_or_default()).into()
+            }
             _ => return,
         };
         self.emit(ConversationEvent::Activity { message });
@@ -317,6 +316,19 @@ fn context_usage(ledger: &Value) -> Option<ConversationEvent> {
             .as_u64()
             .and_then(|window| usize::try_from(window).ok()),
     })
+}
+
+/// Plain words for the runtime's model progress states.
+fn progress_label(state: &str) -> &'static str {
+    match state {
+        "WaitingForFirstToken" => "Waiting for the model",
+        "Generating" => "Generating",
+        "GeneratingToolCall" => "Preparing a tool call",
+        "PossiblyStalled" => "No output for a while",
+        "Stalled" => "Stalled",
+        "DoneFrame" => "Finishing",
+        _ => "Working",
+    }
 }
 
 /// Longest string, in characters, sent to the view in tool arguments.
@@ -466,6 +478,24 @@ mod tests {
             })
         ));
         assert!(context_usage(&json!({"pressure_band": "green"})).is_none());
+    }
+
+    #[test]
+    fn progress_states_read_as_plain_words() {
+        assert_eq!(
+            progress_label("WaitingForFirstToken"),
+            "Waiting for the model"
+        );
+        assert_eq!(progress_label("Generating"), "Generating");
+        assert_eq!(
+            progress_label("GeneratingToolCall"),
+            "Preparing a tool call"
+        );
+        assert_eq!(progress_label("ProgressUnknown"), "Working");
+        assert_eq!(progress_label("PossiblyStalled"), "No output for a while");
+        assert_eq!(progress_label("Stalled"), "Stalled");
+        assert_eq!(progress_label("DoneFrame"), "Finishing");
+        assert_eq!(progress_label(""), "Working");
     }
 
     #[test]

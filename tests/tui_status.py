@@ -113,7 +113,7 @@ def exercise(provider, model, in_git):
         identity = f"🤖 {model}  🧠 low  📁 project"
         if model == "qwen3.8:27b-mxfp8":
             # A known window shows an empty gauge before the first request.
-            wait_for((identity + "  🌿 main ●1 …1  ctx:[░░░░░░░░░░]0%").encode())
+            wait_for((identity + "  🌿 main ●1 …1  ctx:[··········]0%").encode())
         else:
             wait_for(b"Enter send")
             assert identity.encode() + b"\x1b" in seen, "the bar showed more than it knows"
