@@ -237,10 +237,13 @@ the repository. Microgentic does not read `~/.claude/skills/` or other agents'
 skill directories by default: a catalog of dozens of skills would use a small
 model's whole catalog budget.
 
-**Visibility.** Grow the existing `/guidance` command into `/context`, which
-lists every resident item with its kind, tokens, and inclusion reason. The
-status bar keeps one compact resident count beside the context gauge. The trace
-records the residency events listed under Measurement.
+**Visibility.** `/context` (or Ctrl-O) shows the context panel beside the
+conversation. It lists every element of the latest model request with its kind,
+estimated tokens, a short preview, and whether it is new this round. `/guidance`
+stays as the guidance-specific listing. When residency lands, the panel gains
+each item's inclusion reason and residency state. The status bar keeps one
+compact resident count beside the context gauge. The trace records the
+residency events listed under Measurement.
 
 **Tool descriptors.** Record them in the trace as pinned residents, so their
 cost is measured, but do not activate or eject them yet. On-demand tools change
