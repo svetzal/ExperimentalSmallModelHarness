@@ -109,7 +109,7 @@ try:
     assert any("✦".encode() in frame for frame in shown), "the seed never appeared"
     assert any(b"microgentic" in frame for frame in shown), "the letters never assembled"
     assert len(shown) >= 6, f"only {len(shown)} frames: the animation did not play"
-    assert settled < 1.2, f"the resting screen took {settled:.2f}s"
+    assert settled < 2.4, f"the resting screen took {settled:.2f}s"
     assert resting(shown[-1]), shown[-1][-2000:]
 
     # A key during the animation skips it, and the key lands in the input.
