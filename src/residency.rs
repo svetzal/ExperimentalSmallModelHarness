@@ -51,11 +51,37 @@ pub(crate) struct Settings {
     pub(crate) guidance_fraction: f64,
 }
 
+/// A fraction setting must be above 0 and at most 1.
+pub(crate) fn validate_fraction(name: &str, value: f64) -> Result<f64, String> {
+    if value.is_finite() && value > 0.0 && value <= 1.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "{name} must be a fraction of the context window above 0 and at most 1, such as 0.15; got {value}"
+        ))
+    }
+}
+
+impl Settings {
+    /// The defaults with any explicit values in place.
+    pub(crate) fn with(
+        standing_context_limit: Option<f64>,
+        guidance_fraction: Option<f64>,
+    ) -> Self {
+        let defaults = Self::default();
+        Self {
+            standing_context_limit: standing_context_limit
+                .unwrap_or(defaults.standing_context_limit),
+            guidance_fraction: guidance_fraction.unwrap_or(defaults.guidance_fraction),
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             standing_context_limit: 0.15,
-            guidance_fraction: 0.125,
+            guidance_fraction: crate::guidance::DEFAULT_WINDOW_FRACTION,
         }
     }
 }

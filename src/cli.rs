@@ -29,6 +29,21 @@ pub(crate) fn model_context_window_tokens(model: &str) -> Option<usize> {
     }
 }
 
+fn parse_fraction(name: &str, value: &str) -> Result<f64, String> {
+    let number = value
+        .parse::<f64>()
+        .map_err(|_| format!("{name} must be a number such as 0.15, not {value:?}"))?;
+    crate::residency::validate_fraction(name, number)
+}
+
+fn parse_standing_context_limit(value: &str) -> Result<f64, String> {
+    parse_fraction("--standing-context-limit", value)
+}
+
+fn parse_guidance_fraction(value: &str) -> Result<f64, String> {
+    parse_fraction("--guidance-fraction", value)
+}
+
 pub(crate) fn parse_reasoning_effort(
     value: &str,
 ) -> Result<mojentic::llm::gateway::ReasoningEffort, String> {
@@ -130,6 +145,17 @@ struct RunArgs {
     /// Defaults to 262144 for Qwen3.8-27B-MLX-8bit and Mojentic accounting otherwise.
     #[arg(long, help_heading = "Advanced / research")]
     context_window_tokens: Option<usize>,
+
+    /// All standing context (project guidance now) as a fraction of the context window,
+    /// recorded in traces against each request. Not enforced. Default 0.15, or
+    /// standing_context_limit in config.json for everyday runs.
+    #[arg(long, value_parser = parse_standing_context_limit, help_heading = "Advanced / research")]
+    standing_context_limit: Option<f64>,
+
+    /// The project guidance budget as a fraction of the context window, between 500 and
+    /// 8,000 tokens. Default 0.125, or guidance_fraction in config.json for everyday runs.
+    #[arg(long, value_parser = parse_guidance_fraction, help_heading = "Advanced / research")]
+    guidance_fraction: Option<f64>,
 
     /// Packet type used for default output-token budgeting.
     #[arg(
@@ -287,6 +313,8 @@ impl RunArgs {
             acceptance_ledger: self.acceptance_ledger,
             conversational: false,
             context_window: None,
+            standing_context_limit: self.standing_context_limit,
+            guidance_fraction: self.guidance_fraction,
             calculator: false,
             project_guidance: false,
             user_guidance_file: None,
@@ -382,6 +410,60 @@ mod tests {
                 ])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn residency_settings_accept_only_fractions_of_the_window() {
+        let parse = |args: &[&str]| {
+            let mut full = vec!["microgentic", "run", "--prompt", "Hi"];
+            full.extend_from_slice(args);
+            Cli::try_parse_from(full).map(|cli| match cli.command {
+                Some(Command::Run(run)) => (run.standing_context_limit, run.guidance_fraction),
+                _ => panic!("run"),
+            })
+        };
+        assert_eq!(parse(&[]).unwrap(), (None, None));
+        assert_eq!(
+            parse(&[
+                "--standing-context-limit",
+                "0.2",
+                "--guidance-fraction",
+                "0.04"
+            ])
+            .unwrap(),
+            (Some(0.2), Some(0.04))
+        );
+        assert_eq!(
+            parse(&["--standing-context-limit", "1"]).unwrap().0,
+            Some(1.0)
+        );
+        for (flag, value, message) in [
+            ("--standing-context-limit", "0", "above 0 and at most 1"),
+            ("--standing-context-limit", "15", "above 0 and at most 1"),
+            ("--guidance-fraction", "-0.1", "above 0 and at most 1"),
+            ("--guidance-fraction", "NaN", "above 0 and at most 1"),
+            (
+                "--guidance-fraction",
+                "eighth",
+                "must be a number such as 0.15",
+            ),
+        ] {
+            let argument = format!("{flag}={value}");
+            let error = parse(&[&argument]).unwrap_err().to_string();
+            assert!(error.contains(message), "{flag} {value}: {error}");
+        }
+        let mut prefs = crate::preferences::Preferences {
+            guidance_fraction: Some(1.5),
+            ..Default::default()
+        };
+        let error = prefs.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("guidance_fraction must be a fraction"),
+            "{error}"
+        );
+        prefs.guidance_fraction = Some(0.25);
+        prefs.standing_context_limit = Some(0.1);
+        prefs.validate().unwrap();
     }
 
     #[test]
@@ -1166,6 +1248,10 @@ fn prepare_run_with_mode(
     if !legacy && !advanced {
         let path = crate::preferences::config_path(config_path)?;
         if let Some(prefs) = crate::preferences::load(&path)? {
+            // A run flag beats the configuration, which beats the default.
+            run.standing_context_limit =
+                run.standing_context_limit.or(prefs.standing_context_limit);
+            run.guidance_fraction = run.guidance_fraction.or(prefs.guidance_fraction);
             let provider = run.provider.unwrap_or(prefs.provider);
             if run.model.is_none() && provider == prefs.provider {
                 run.model = Some(prefs.model);

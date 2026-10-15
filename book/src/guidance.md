@@ -33,7 +33,9 @@ changed, appeared, or disappeared, the model is told.
 ## Size limit
 
 All guidance together is limited to 8,000 estimated tokens, or to one eighth of
-a smaller known context window. Each file is limited to half of that. When the
+a smaller known context window, and never less than 500. Each file is limited
+to half of that. The advanced `guidance_fraction` setting changes the share of
+the window; see [Providers and models](providers.md#advanced-context-settings). When the
 limit is reached, the most general files are cut first, and a note names the
 file and how much was left out.
 

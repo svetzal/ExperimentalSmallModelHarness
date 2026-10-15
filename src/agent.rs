@@ -134,6 +134,12 @@ pub struct AgentRunConfig {
     /// `None` keeps accounting on `context_window_tokens`. It never sets
     /// Ollama's `num_ctx`, which stays `context_window_tokens`.
     pub context_window: Option<crate::context_window::ContextWindow>,
+    /// Advanced: the standing-context limit as a fraction of the window,
+    /// recorded against, not enforced. `None` is the default, 0.15.
+    pub standing_context_limit: Option<f64>,
+    /// Advanced: the guidance budget as a fraction of the window. `None` is
+    /// the default, 0.125.
+    pub guidance_fraction: Option<f64>,
     /// Offer the `calculate` tool. Everyday `run` and the TUI conversation set
     /// it; benchmark and historical runs leave it off so their provider
     /// requests stay identical.
@@ -476,12 +482,14 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         .unwrap_or_else(|| experiment_dir.join("traces"));
     // Everyday runs reply like the conversation without keeping its session.
     let conversational = config.conversational || conversation.is_some();
+    let residency_settings =
+        crate::residency::Settings::with(config.standing_context_limit, config.guidance_fraction);
     let trace =
         TraceRecorder::create_for_conversation(&trace_dir, conversation.clone(), conversational)?;
     let trace = Arc::new(match &config.context_window {
         Some(window) => trace.with_residency(crate::residency::Residency::new(
             window.clone(),
-            crate::residency::Settings::default(),
+            residency_settings,
         )),
         None => trace,
     });
@@ -555,6 +563,11 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
 
     if let Some(window) = &config.context_window {
         trace.event("context.window.resolved", window)?;
+    }
+    // Explicit settings are recorded in every mode; benchmark runs have no
+    // ledger residency to carry them.
+    if config.standing_context_limit.is_some() || config.guidance_fraction.is_some() {
+        trace.event("context.residency.settings", residency_settings)?;
     }
     trace.event("agent.git_stash.entry", &stash_baseline)?;
     trace.event(
@@ -735,7 +748,10 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             project: &tool_root,
             home: home.as_deref(),
             user_file: config.user_guidance_file.as_deref(),
-            budget_tokens: crate::guidance::budget_for(accounting_window_tokens),
+            budget_tokens: crate::guidance::budget_for(
+                accounting_window_tokens,
+                residency_settings.guidance_fraction,
+            ),
         });
         trace.event(
             "context.guidance.discovered",
@@ -9177,6 +9193,8 @@ mod tests {
             acceptance_ledger: false,
             conversational: false,
             context_window: None,
+            standing_context_limit: None,
+            guidance_fraction: None,
             calculator: false,
             project_guidance: false,
             user_guidance_file: None,
@@ -10874,6 +10892,8 @@ mod tests {
                     acceptance_ledger: true,
                     conversational: false,
                     context_window: None,
+                    standing_context_limit: None,
+                    guidance_fraction: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10920,6 +10940,8 @@ mod tests {
                     acceptance_ledger: false,
                     conversational: false,
                     context_window: None,
+                    standing_context_limit: None,
+                    guidance_fraction: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10972,6 +10994,8 @@ mod tests {
                 acceptance_ledger: false,
                 conversational: false,
                 context_window: None,
+                standing_context_limit: None,
+                guidance_fraction: None,
                 calculator: false,
                 project_guidance: false,
                 user_guidance_file: None,
@@ -11048,6 +11072,8 @@ mod tests {
                     acceptance_ledger: false,
                     conversational: false,
                     context_window: None,
+                    standing_context_limit: None,
+                    guidance_fraction: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -11093,6 +11119,8 @@ mod tests {
                     acceptance_ledger: false,
                     conversational: false,
                     context_window: None,
+                    standing_context_limit: None,
+                    guidance_fraction: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -11138,6 +11166,8 @@ mod tests {
                     acceptance_ledger: false,
                     conversational: false,
                     context_window: None,
+                    standing_context_limit: None,
+                    guidance_fraction: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -11179,6 +11209,8 @@ mod tests {
                     acceptance_ledger: false,
                     conversational: false,
                     context_window: None,
+                    standing_context_limit: None,
+                    guidance_fraction: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,

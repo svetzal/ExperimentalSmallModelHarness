@@ -109,11 +109,14 @@ pub struct Sources<'a> {
     pub budget_tokens: usize,
 }
 
-/// A budget scaled to the context window: an eighth of it, at most the
-/// default, and never less than 500 tokens.
-pub fn budget_for(window_tokens: Option<usize>) -> usize {
+/// The default share of the context window for guidance.
+pub const DEFAULT_WINDOW_FRACTION: f64 = 0.125;
+
+/// A budget scaled to the context window: `fraction` of it (an eighth by
+/// default), at most the default, and never less than 500 tokens.
+pub fn budget_for(window_tokens: Option<usize>, fraction: f64) -> usize {
     window_tokens.map_or(DEFAULT_TOTAL_TOKENS, |window| {
-        (window / 8).clamp(500, DEFAULT_TOTAL_TOKENS)
+        ((window as f64 * fraction).floor() as usize).clamp(500, DEFAULT_TOTAL_TOKENS)
     })
 }
 
@@ -823,10 +826,22 @@ mod tests {
 
     #[test]
     fn the_budget_scales_down_for_small_windows() {
-        assert_eq!(budget_for(None), 8_000);
-        assert_eq!(budget_for(Some(262_144)), 8_000);
-        assert_eq!(budget_for(Some(16_384)), 2_048);
-        assert_eq!(budget_for(Some(2_048)), 500);
+        let eighth = DEFAULT_WINDOW_FRACTION;
+        assert_eq!(budget_for(None, eighth), 8_000);
+        assert_eq!(budget_for(Some(262_144), eighth), 8_000);
+        assert_eq!(budget_for(Some(16_384), eighth), 2_048);
+        assert_eq!(budget_for(Some(2_048), eighth), 500);
+        assert_eq!(budget_for(Some(16_384), 0.25), 4_096);
+        assert_eq!(
+            budget_for(Some(262_144), 0.04),
+            8_000,
+            "the ceiling still applies"
+        );
+        assert_eq!(
+            budget_for(None, 0.04),
+            8_000,
+            "an unknown window keeps the default"
+        );
     }
 
     #[test]

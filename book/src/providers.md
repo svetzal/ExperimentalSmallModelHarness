@@ -62,3 +62,19 @@ saved values.
 
 Benchmark mode and the `adaptive-agent-harness` compatibility executable do not
 read this file.
+
+## Advanced context settings
+
+Two settings exist for experiments that measure how much standing context a
+model handles well. They are not in setup or the conversation view. Set them in
+`config.json`, or with the matching flag for one run. A flag overrides the file,
+and the file overrides the default.
+
+| Key in `config.json` | Flag | Default | Effect |
+| --- | --- | --- | --- |
+| `standing_context_limit` | `--standing-context-limit` | 0.15 | All standing context (project guidance now) as a fraction of the context window. Traces record each request against it. It is not enforced yet. |
+| `guidance_fraction` | `--guidance-fraction` | 0.125 | The project guidance budget as a fraction of the window, between 500 and 8,000 tokens |
+
+Each value must be above 0 and at most 1. Traces record the effective values
+beside each context ledger. Benchmark mode ignores the file and records a flag
+only when you give it.

@@ -13,6 +13,14 @@ pub struct Preferences {
     pub model: String,
     /// None preserves the provider's model default, rather than inventing effort.
     pub reasoning_effort: Option<String>,
+    /// Advanced: all standing context as a fraction of the window, recorded
+    /// against in traces. Default 0.15.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_context_limit: Option<f64>,
+    /// Advanced: the guidance budget as a fraction of the window, between
+    /// 500 and 8,000 tokens. Default 0.125.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance_fraction: Option<f64>,
 }
 
 impl Default for Preferences {
@@ -22,6 +30,8 @@ impl Default for Preferences {
             provider: Provider::default(),
             model: Provider::default().default_model().into(),
             reasoning_effort: None,
+            standing_context_limit: None,
+            guidance_fraction: None,
         }
     }
 }
@@ -39,6 +49,14 @@ impl Preferences {
         }
         if let Some(value) = &self.reasoning_effort {
             crate::cli::parse_reasoning_effort(value).map_err(anyhow::Error::msg)?;
+        }
+        for (key, value) in [
+            ("standing_context_limit", self.standing_context_limit),
+            ("guidance_fraction", self.guidance_fraction),
+        ] {
+            if let Some(value) = value {
+                crate::residency::validate_fraction(key, value).map_err(anyhow::Error::msg)?;
+            }
         }
         Ok(())
     }

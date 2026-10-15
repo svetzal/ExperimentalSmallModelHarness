@@ -32,6 +32,10 @@ The release workflow publishes each version's section as its GitHub release note
   existing compaction as a demotion. This is measurement only: nothing sent
   to the model changes, no limit is enforced, and benchmark traces are
   unchanged.
+- Advanced settings `standing_context_limit` and `guidance_fraction` in
+  `config.json`, with the run flags `--standing-context-limit` and
+  `--guidance-fraction`. A flag overrides the file, and the file overrides
+  the defaults of 0.15 and 0.125. Traces record the effective values.
 - Each `llm.context_assembly.response` trace event records the request's time
   to first token, the kind of that token (content, thinking, or tool call),
   and its total duration, in every mode.

@@ -786,3 +786,149 @@ fn an_everyday_run_discovers_the_context_window_omlx() {
 fn an_everyday_run_discovers_the_context_window_ollama() {
     discovered_window(Wire::Ollama);
 }
+
+// ---------------------------------------------------------------- residency settings
+
+/// A run flag beats config.json, which beats the default, and explicit
+/// settings are recorded.
+#[test]
+fn residency_settings_come_from_flags_then_config_then_defaults() {
+    let workspace = Workspace::new();
+    let provider = MockProvider::replying(Wire::Omlx, vec![content("Hello.")]);
+    let config = workspace.base.join("settings.json");
+    std::fs::write(
+        &config,
+        json!({
+            "schema_version": "microgentic_config.v1",
+            "provider": "omlx",
+            "model": "test-model",
+            "reasoning_effort": null,
+            "standing_context_limit": 0.1,
+            "guidance_fraction": 0.25,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut env = provider.env();
+    env.push(("XDG_STATE_HOME", workspace.state.display().to_string()));
+    let run = |config: &std::path::Path, flags: &[&str]| -> Value {
+        let config = config.display().to_string();
+        let mut args = vec![
+            "--config",
+            config.as_str(),
+            "run",
+            "--prompt",
+            "Hi",
+            "--json",
+        ];
+        args.extend_from_slice(flags);
+        let output = run_binary(microgentic(), &args, &workspace.project, &env, b"");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let trace = trace_of(&summary);
+        let ledger = trace_payloads(&trace, "llm.context_assembly.ledger").remove(0);
+        let recorded = trace_payloads(&trace, "context.residency.settings");
+        // Explicit settings, from a flag or the configuration, are also
+        // recorded once before the first ledger.
+        let explicit =
+            flags.iter().any(|flag| flag.starts_with("--")) || config.ends_with("settings.json");
+        assert_eq!(recorded.len(), usize::from(explicit), "{recorded:?}");
+        if explicit {
+            assert_eq!(recorded[0], ledger["residency_settings"]);
+        }
+        ledger["residency_settings"].clone()
+    };
+    let settings = |limit: f64, fraction: f64| json!({"standing_context_limit": limit, "guidance_fraction": fraction});
+    assert_eq!(run(&config, &[]), settings(0.1, 0.25));
+    assert_eq!(
+        run(&config, &["--standing-context-limit", "0.2"]),
+        settings(0.2, 0.25)
+    );
+    let missing = workspace.base.join("missing.json");
+    assert_eq!(run(&missing, &[]), settings(0.15, 0.125));
+    assert_eq!(
+        run(&missing, &["--guidance-fraction", "0.04"]),
+        settings(0.15, 0.04)
+    );
+}
+
+/// Benchmark runs keep no residency, but record explicit settings.
+#[test]
+fn benchmark_runs_record_explicit_residency_settings_only() {
+    let workspace = Workspace::new();
+    let contract = workspace.base.join("contract.json");
+    std::fs::write(
+        &contract,
+        json!({
+            "profile": {"id": "terminal_work", "version": "terminal_work_profile.v1"},
+            "guidance": "Finish.",
+            "read_scope": ["./**"],
+            "write_scope": ["./**"],
+            "probes": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for (flags, recorded) in [
+        (&[][..], None),
+        (
+            &["--standing-context-limit", "0.2"][..],
+            Some(json!({"standing_context_limit": 0.2, "guidance_fraction": 0.125})),
+        ),
+    ] {
+        let provider = MockProvider::replying(Wire::Omlx, vec![content("DONE")]);
+        let traces = tempfile::tempdir().unwrap();
+        let experiment = workspace.base.display().to_string();
+        let contract = contract.display().to_string();
+        let trace_dir = traces.path().display().to_string();
+        let dir = workspace.project.display().to_string();
+        let mut args = vec![
+            "benchmark",
+            "run",
+            "--experiment",
+            &experiment,
+            "--contract",
+            &contract,
+            "--trace-dir",
+            &trace_dir,
+            "--provider",
+            "omlx",
+            "--dir",
+            &dir,
+            "--max-model-interactions",
+            "2",
+            "--max-iterations",
+            "1",
+        ];
+        args.extend_from_slice(flags);
+        let output = run_binary(
+            microgentic(),
+            &args,
+            &workspace.project,
+            &provider.env(),
+            b"",
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let trace = trace_of(&summary);
+        assert_eq!(
+            trace_payloads(&trace, "context.residency.settings").pop(),
+            recorded
+        );
+        let ledger = trace_payloads(&trace, "llm.context_assembly.ledger").remove(0);
+        assert!(ledger.get("residency_settings").is_none());
+        assert!(ledger.get("residency").is_none());
+        assert!(
+            provider.gets().is_empty(),
+            "benchmark mode asked for the window"
+        );
+    }
+}

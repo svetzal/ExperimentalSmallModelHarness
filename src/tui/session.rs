@@ -63,9 +63,12 @@ impl Session {
             .as_ref()
             .and_then(|path| path.parent())
             .map(|directory| directory.join("AGENTS.md"));
-        let budget = crate::guidance::budget_for(crate::cli::model_context_window_tokens(
-            &self.settings.model,
-        ));
+        let budget = crate::guidance::budget_for(
+            crate::cli::model_context_window_tokens(&self.settings.model),
+            self.settings
+                .guidance_fraction
+                .unwrap_or(crate::guidance::DEFAULT_WINDOW_FRACTION),
+        );
         (self.root.clone(), user_file, budget)
     }
 
