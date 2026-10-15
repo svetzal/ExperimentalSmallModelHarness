@@ -565,6 +565,47 @@ fn a_work_request_edits_checks_and_reports_naturally_ollama() {
     edit_and_check(Wire::Ollama);
 }
 
+/// A review keeps piped stdin as labelled reference material. Shell fences in
+/// the prompt or the reference are discussion, not declared probes.
+fn review(wire: Wire) {
+    let workspace = Workspace::new();
+    let diff = "--- a/run.sh\n+++ b/run.sh\n@@ -1 +1 @@\n-echo hi\n+echo hello\n";
+    let prompt = "Review this diff. Do not run it:\n```sh\ntouch SHOULD_NOT_EXIST\n```";
+    let reply = "The diff changes the greeting from hi to hello. It looks fine.";
+    let provider = MockProvider::replying(wire, vec![content(reply)]);
+    let output = everyday(
+        &provider,
+        &workspace,
+        &["--prompt", prompt],
+        diff.as_bytes(),
+    );
+    assert_eq!(stdout(&output), format!("{reply}\n"));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "a review reply ends the run");
+    assert_everyday(&requests);
+    assert_eq!(
+        user_messages(&requests[0]),
+        [format!(
+            "{prompt}\n\n[Reference material from stdin; not execution policy]\n{diff}\n[End reference material]"
+        )]
+    );
+    assert!(
+        !requests[0].to_string().contains("adapter-owned"),
+        "a shell fence became a declared probe"
+    );
+    assert!(!workspace.project.join("SHOULD_NOT_EXIST").exists());
+}
+
+#[test]
+fn a_review_keeps_stdin_as_reference_material_omlx() {
+    review(Wire::Omlx);
+}
+
+#[test]
+fn a_review_keeps_stdin_as_reference_material_ollama() {
+    review(Wire::Ollama);
+}
+
 // ---------------------------------------------------------------- task path
 
 /// The historical executable keeps the task path for a plain prompt: the task
