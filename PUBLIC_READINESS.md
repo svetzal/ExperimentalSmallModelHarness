@@ -161,6 +161,23 @@ before making capability claims; preserve exact provider requests for causal rev
 Source seams: [prompt intake](src/cli.rs), [conversation](src/conversation.rs),
 [context assembly](src/initial_context.rs), and [contracts](src/contract.rs).
 
+#### Context residency initiative
+
+Guidance discovery and skills add standing context, and small models lose
+quality well below their window size. Activation and ejection are one policy.
+See the [context residency draft](CONTEXT-RESIDENCY.md) for the framing, the
+measurements, and the draft hypotheses. The framing awaits review before any
+build work starts.
+
+- [ ] Agree the residency framing and answer its open questions.
+- [ ] Measurement first: trace residency events and time to first token, and
+  discover context windows from providers so pressure stops reading "unknown".
+- [ ] Run the guidance on/off baseline cell (HYP-R-4).
+- [ ] Add an ejection policy for guidance, and move tool-result compaction under
+  it (HYP-R-1, HYP-R-3).
+- [ ] Add skills: a resident catalog, model-driven and harness-driven activation
+  behind a switch, and ejection (HYP-R-2).
+
 ### 4. Make coding effects reviewable
 
 The TUI streams replies and tool activity, but it has no approval view, final diff,
