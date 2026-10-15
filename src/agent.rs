@@ -2482,6 +2482,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             validation_repair_active,
         })?;
         trace.reply_started();
+        let mut first_token = crate::first_token::FirstTokenClock::start();
         let mut stream = gateway.complete_stream(
             model,
             &current_messages,
@@ -2564,6 +2565,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             };
             match chunk_result {
                 Ok(StreamChunk::Content(chunk)) => {
+                    if !chunk.is_empty() {
+                        first_token.observe(crate::first_token::TokenKind::Content);
+                    }
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
                     latest_progress_state = ModelProgressState::Generating;
@@ -2590,6 +2594,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     trace.stream_content(&chunk);
                 }
                 Ok(StreamChunk::ToolCalls(tool_calls)) => {
+                    first_token.observe(crate::first_token::TokenKind::ToolCall);
                     last_observable_progress = Instant::now();
                     stalled_candidate_checks = 0;
                     latest_progress_state = ModelProgressState::GeneratingToolCall;
@@ -2607,6 +2612,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                     accumulated_tool_calls = tool_calls;
                 }
                 Ok(StreamChunk::Thinking(thinking)) => {
+                    first_token.observe(crate::first_token::TokenKind::Thinking);
                     if completion_config.preserve_reasoning {
                         call_reasoning.push_str(&thinking);
                     }
@@ -2739,6 +2745,15 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         progress.tool_call_count > 0 || progress.accumulated_tool_call_count > 0;
                     let progress_has_content = progress.content_chars > 0;
                     let progress_has_thinking = progress.thinking_chars > 0;
+                    // A progress frame can report the first token before the
+                    // chunk that carries it.
+                    if progress_has_tool_call {
+                        first_token.observe(crate::first_token::TokenKind::ToolCall);
+                    } else if progress_has_content {
+                        first_token.observe(crate::first_token::TokenKind::Content);
+                    } else if progress_has_thinking {
+                        first_token.observe(crate::first_token::TokenKind::Thinking);
+                    }
                     if progress.tool_call_count > 0 || progress.accumulated_tool_call_count > 0 {
                         tool_call_progress_frame_count += 1;
                         call_tool_call_progress_frame_count += 1;
@@ -2884,6 +2899,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             }
         }
         drop(stream);
+        let timing = first_token.finish();
 
         trace.event(
             "llm.context_assembly.response",
@@ -2891,6 +2907,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 "turn": turn,
                 "llm_call_depth": depth,
                 "duration_ms": started.elapsed().as_millis(),
+                "time_to_first_token_ms": timing.time_to_first_token_ms,
+                "first_token_kind": timing.first_token_kind,
+                "request_duration_ms": timing.request_duration_ms,
                 "content_chars": call_content.len(),
                 "content_estimated_tokens": estimate_tokens(call_content.len()),
                 "thinking_chars": call_thinking_chars,
@@ -9261,6 +9280,28 @@ mod tests {
         assert_eq!(requests[2].1, requests[3].1);
         assert_eq!(requests[2].1, 8_192);
         assert_ne!(requests[1].1, 262_144);
+    }
+
+    #[tokio::test]
+    async fn each_response_records_its_first_token_kind_and_time() {
+        for (first, kind) in [
+            (StreamChunk::Content("DONE".to_string()), "content"),
+            (StreamChunk::Thinking("Planning.".to_string()), "thinking"),
+            (
+                StreamChunk::ToolCalls(vec![tool_call("list_tree", HashMap::new())]),
+                "tool_call",
+            ),
+        ] {
+            let fixture = AgentFixture::new("Finish.");
+            let gateway =
+                ScriptedGateway::new(vec![vec![first, StreamChunk::Content("DONE".to_string())]]);
+            let summary = fixture.run(&gateway, 1).await;
+            let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+            let response = trace_payloads(&trace, "llm.context_assembly.response").remove(0);
+            assert_eq!(response["first_token_kind"], kind);
+            let first_ms = response["time_to_first_token_ms"].as_u64().unwrap();
+            assert!(first_ms <= response["request_duration_ms"].as_u64().unwrap());
+        }
     }
 
     #[tokio::test]

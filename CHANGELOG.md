@@ -22,6 +22,9 @@ The release workflow publishes each version's section as its GitHub release note
   keeps the answer for later exchanges. A discovered window is used for
   accounting only: Ollama's `num_ctx` and the run policies that read the
   window are unchanged. Benchmark mode makes no discovery request.
+- Each `llm.context_assembly.response` trace event records the request's time
+  to first token, the kind of that token (content, thinking, or tool call),
+  and its total duration, in every mode.
 
 ### Changed
 

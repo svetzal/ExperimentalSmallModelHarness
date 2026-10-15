@@ -719,6 +719,10 @@ fn discovered_window(wire: Wire) {
         Wire::Omlx => assert_eq!(known.gets(), ["/v1/models"]),
         Wire::Ollama => assert_eq!(known.shows(), [json!({"model": "test-model"})]),
     }
+    let response = trace_payloads(&trace_of(&after), "llm.context_assembly.response").remove(0);
+    assert_eq!(response["first_token_kind"], "content");
+    assert!(response["time_to_first_token_ms"].is_u64(), "{response}");
+    assert!(response["request_duration_ms"].is_u64(), "{response}");
     // The discovered window changes nothing the provider receives, num_ctx
     // included.
     assert_eq!(unknown.requests(), known.requests());

@@ -108,6 +108,19 @@ The normal causal order is:
 8. deterministic tool, validation, and harness-policy events
 9. the next context ledger and provider-request snapshot
 
+`llm.context_assembly.response` times each provider request from the moment
+it is sent:
+
+- `time_to_first_token_ms`: milliseconds to the first streamed token of any
+  kind, or `null` when the stream produced none. A provider progress frame
+  that reports content, thinking, or a tool call counts as that token.
+- `first_token_kind`: `content`, `thinking`, or `tool_call`, or `null`.
+- `request_duration_ms`: milliseconds from sending the request to the end of
+  its stream.
+
+Its older `duration_ms` starts slightly earlier, before the progress status
+and request snapshot are written.
+
 Turn is the outer harness iteration. LLM call depth is the zero-based provider
 call within that turn. Tool results normally increase depth without advancing
 the turn; a harness follow-up normally advances the turn and resets depth to
