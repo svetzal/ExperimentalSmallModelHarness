@@ -129,6 +129,11 @@ pub struct AgentRunConfig {
     /// Task, benchmark and historical runs leave it off and keep the task
     /// template, terminal tokens and continuation prompts.
     pub conversational: bool,
+    /// The window to account context against, with its source. Everyday `run`
+    /// and the conversation set it, and it turns on residency recording.
+    /// `None` keeps accounting on `context_window_tokens`. It never sets
+    /// Ollama's `num_ctx`, which stays `context_window_tokens`.
+    pub context_window: Option<crate::context_window::ContextWindow>,
     /// Offer the `calculate` tool. Everyday `run` and the TUI conversation set
     /// it; benchmark and historical runs leave it off so their provider
     /// requests stay identical.
@@ -471,11 +476,18 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         .unwrap_or_else(|| experiment_dir.join("traces"));
     // Everyday runs reply like the conversation without keeping its session.
     let conversational = config.conversational || conversation.is_some();
-    let trace = Arc::new(TraceRecorder::create_for_conversation(
-        &trace_dir,
-        conversation.clone(),
-        conversational,
-    )?);
+    let trace =
+        TraceRecorder::create_for_conversation(&trace_dir, conversation.clone(), conversational)?;
+    let trace = Arc::new(match &config.context_window {
+        Some(window) => trace.with_residency(crate::residency::Residency::new(window.clone())),
+        None => trace,
+    });
+    // Accounting uses the known window; `num_ctx` and run policies keep
+    // `context_window_tokens`.
+    let accounting_window_tokens = config
+        .context_window
+        .as_ref()
+        .map_or(config.context_window_tokens, |window| window.tokens);
     if let Some(session) = &conversation {
         trace.event(
             "session.context.retained",
@@ -538,6 +550,9 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         }),
     )?;
 
+    if let Some(window) = &config.context_window {
+        trace.event("context.window.resolved", window)?;
+    }
     trace.event("agent.git_stash.entry", &stash_baseline)?;
     trace.event(
         "packet.scope",
@@ -717,7 +732,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             project: &tool_root,
             home: home.as_deref(),
             user_file: config.user_guidance_file.as_deref(),
-            budget_tokens: crate::guidance::budget_for(config.context_window_tokens),
+            budget_tokens: crate::guidance::budget_for(accounting_window_tokens),
         });
         trace.event(
             "context.guidance.discovered",
@@ -2362,7 +2377,11 @@ async fn stream_response<G: LlmGateway + ?Sized>(
             transcript_policy,
         });
         previous_call_total_chars = ledger.total_chars();
-        trace.event("llm.context_assembly.ledger", &ledger)?;
+        let mut ledger_record = serde_json::to_value(&ledger)?;
+        if let Some(residency) = trace.residency() {
+            residency.annotate_ledger(&mut ledger_record);
+        }
+        trace.value_event("llm.context_assembly.ledger", ledger_record)?;
         if let Some(decision) = repair_depth_decision(validation_repair_active, &ledger) {
             trace.event("agent.validation.repair_depth_hard_failed", &decision)?;
             trace.event(
@@ -5347,7 +5366,7 @@ fn role_label(role: MessageRole) -> &'static str {
     }
 }
 
-fn pressure_band(utilization: Option<f64>) -> &'static str {
+pub(crate) fn pressure_band(utilization: Option<f64>) -> &'static str {
     match utilization {
         None => "unknown",
         Some(value) if value < 0.15 => "green",
@@ -9120,6 +9139,7 @@ mod tests {
             semantic_advisor_model: None,
             acceptance_ledger: false,
             conversational: false,
+            context_window: None,
             calculator: false,
             project_guidance: false,
             user_guidance_file: None,
@@ -9183,6 +9203,64 @@ mod tests {
         assert!(summary.trace_file.starts_with(&external_traces));
         assert!(!fixture.experiment.join("traces").exists());
         assert!(summary.trace_file.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_known_window_feeds_accounting_but_never_num_ctx() {
+        use crate::context_window::{ContextWindow, WindowSource};
+        let provider_window = ContextWindow {
+            tokens: Some(262_144),
+            source: WindowSource::Provider,
+            field: Some("model_info.test.context_length".into()),
+            discovery_error: None,
+            discovery_ms: Some(1),
+            cached: false,
+        };
+        let mut requests = Vec::new();
+        for (configured, known) in [
+            (None, None),
+            (None, Some(provider_window.clone())),
+            (Some(8_192), None),
+            (Some(8_192), Some(provider_window.clone())),
+        ] {
+            let fixture = AgentFixture::new("Finish without tools.");
+            let gateway =
+                ScriptedGateway::new(vec![vec![StreamChunk::Content("DONE".to_string())]]);
+            let mut config = fixture.config(1);
+            config.provider = Provider::Ollama;
+            config.context_window_tokens = configured;
+            config.context_window = known.clone();
+            let summary = fixture.run_with_config(&gateway, config).await;
+            let trace = std::fs::read_to_string(summary.trace_file).unwrap();
+            let request = trace_payloads(&trace, "llm.provider_request.assembled").remove(0);
+            let ledger = trace_payloads(&trace, "llm.context_assembly.ledger").remove(0);
+            // The policy window and band stay on the configured value.
+            assert_eq!(
+                ledger["context_window_tokens"],
+                serde_json::json!(configured)
+            );
+            match &known {
+                Some(window) => {
+                    assert_eq!(ledger["known_window"]["tokens"], 262_144);
+                    assert_eq!(ledger["known_window"]["source"], "provider");
+                    assert_eq!(ledger["known_window"]["pressure_band"], "green");
+                    assert_eq!(
+                        trace_payloads(&trace, "context.window.resolved"),
+                        vec![serde_json::to_value(window).unwrap()]
+                    );
+                }
+                None => {
+                    assert!(ledger.get("known_window").is_none());
+                    assert!(trace_payloads(&trace, "context.window.resolved").is_empty());
+                }
+            }
+            requests.push((configured, request["completion"]["num_ctx"].clone()));
+        }
+        // A discovered window never sets num_ctx where it was not set before.
+        assert_eq!(requests[0].1, requests[1].1);
+        assert_eq!(requests[2].1, requests[3].1);
+        assert_eq!(requests[2].1, 8_192);
+        assert_ne!(requests[1].1, 262_144);
     }
 
     #[tokio::test]
@@ -10736,6 +10814,7 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: true,
                     conversational: false,
+                    context_window: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10781,6 +10860,7 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
                     conversational: false,
+                    context_window: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10798,43 +10878,55 @@ mod tests {
             max_iterations: usize,
             trace_dir: Option<PathBuf>,
         ) -> AgentRunSummary {
-            run_agent_with_gateway(
-                AgentRunConfig {
-                    recovery: Default::default(),
-                    provider: Provider::Omlx,
-                    experiment_dir: self.experiment.clone(),
-                    trace_dir,
-                    goal_file: PathBuf::from("task.md"),
-                    contract_file: None,
-                    model: "fake-model".to_string(),
-                    max_iterations,
-                    max_model_interactions: 10,
-                    context_window_tokens: Some(131_072),
-                    packet_type: "narrow-patch".to_string(),
-                    expected_output_tokens: 2_048,
-                    max_tokens: None,
-                    reasoning_effort: None,
-                    reasoning_profile: None,
-                    preserve_reasoning: false,
-                    max_thinking_only_tokens: 2_048,
-                    repair_exit_thinking_tokens: 16_384,
-                    repair_handoff_policy: RepairHandoffPolicy::TextOnly,
-                    action_boundary_interrupt_tokens: 0,
-                    reasoning_checkpoint_tokens: 0,
-                    transcript_policy: TranscriptPolicy::SummarizedTranscript,
-                    initial_context_catalog_file: None,
-                    semantic_advisor_model: None,
-                    acceptance_ledger: false,
-                    conversational: false,
-                    calculator: false,
-                    project_guidance: false,
-                    user_guidance_file: None,
-                },
-                gateway,
-                self.workspace.clone(),
-            )
-            .await
-            .unwrap()
+            let mut config = self.config(max_iterations);
+            config.trace_dir = trace_dir;
+            self.run_with_config(gateway, config).await
+        }
+
+        /// The default fixture configuration, for tests that change a field.
+        fn config(&self, max_iterations: usize) -> AgentRunConfig {
+            AgentRunConfig {
+                recovery: Default::default(),
+                provider: Provider::Omlx,
+                experiment_dir: self.experiment.clone(),
+                trace_dir: None,
+                goal_file: PathBuf::from("task.md"),
+                contract_file: None,
+                model: "fake-model".to_string(),
+                max_iterations,
+                max_model_interactions: 10,
+                context_window_tokens: Some(131_072),
+                packet_type: "narrow-patch".to_string(),
+                expected_output_tokens: 2_048,
+                max_tokens: None,
+                reasoning_effort: None,
+                reasoning_profile: None,
+                preserve_reasoning: false,
+                max_thinking_only_tokens: 2_048,
+                repair_exit_thinking_tokens: 16_384,
+                repair_handoff_policy: RepairHandoffPolicy::TextOnly,
+                action_boundary_interrupt_tokens: 0,
+                reasoning_checkpoint_tokens: 0,
+                transcript_policy: TranscriptPolicy::SummarizedTranscript,
+                initial_context_catalog_file: None,
+                semantic_advisor_model: None,
+                acceptance_ledger: false,
+                conversational: false,
+                context_window: None,
+                calculator: false,
+                project_guidance: false,
+                user_guidance_file: None,
+            }
+        }
+
+        async fn run_with_config(
+            &self,
+            gateway: &ScriptedGateway,
+            config: AgentRunConfig,
+        ) -> AgentRunSummary {
+            run_agent_with_gateway(config, gateway, self.workspace.clone())
+                .await
+                .unwrap()
         }
 
         async fn run_contract(
@@ -10896,6 +10988,7 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
                     conversational: false,
+                    context_window: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10940,6 +11033,7 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
                     conversational: false,
+                    context_window: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10984,6 +11078,7 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
                     conversational: false,
+                    context_window: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -11024,6 +11119,7 @@ mod tests {
                     semantic_advisor_model: Some("context-curator-model".to_string()),
                     acceptance_ledger: false,
                     conversational: false,
+                    context_window: None,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,

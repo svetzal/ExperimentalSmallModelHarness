@@ -15,6 +15,8 @@ pub struct TraceRecorder {
     /// Ask for natural replies instead of DONE/FAIL tokens. True for the TUI
     /// conversation and everyday `run`.
     natural_replies: bool,
+    /// Context residency recording; everyday runs and the conversation only.
+    residency: Option<crate::residency::Residency>,
 }
 
 impl TraceRecorder {
@@ -41,6 +43,7 @@ impl TraceRecorder {
             file: Mutex::new(file),
             conversation,
             natural_replies,
+            residency: None,
         })
     }
 
@@ -111,6 +114,16 @@ impl TraceRecorder {
         if let Some(conversation) = &self.conversation {
             conversation.tool_finished(call, ok, content);
         }
+    }
+
+    /// Record context residency in this trace.
+    pub(crate) fn with_residency(mut self, residency: crate::residency::Residency) -> Self {
+        self.residency = Some(residency);
+        self
+    }
+
+    pub(crate) fn residency(&self) -> Option<&crate::residency::Residency> {
+        self.residency.as_ref()
     }
 
     pub(crate) fn natural_replies(&self) -> bool {

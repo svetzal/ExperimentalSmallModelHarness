@@ -286,6 +286,7 @@ impl RunArgs {
             semantic_advisor_model: self.semantic_advisor_model,
             acceptance_ledger: self.acceptance_ledger,
             conversational: false,
+            context_window: None,
             calculator: false,
             project_guidance: false,
             user_guidance_file: None,
@@ -839,7 +840,12 @@ async fn dispatch(legacy: bool) -> Result<()> {
         Command::Setup(args) => setup(args, cli.config.as_deref())?,
         Command::Run(run) => {
             let json = run.json || legacy;
-            let config = prepare_run(run, cli.config.as_deref(), legacy)?;
+            let mut config = prepare_run(run, cli.config.as_deref(), legacy)?;
+            if let Some(window) = config.context_window.take() {
+                let metadata = crate::model_metadata::for_provider(config.provider);
+                config.context_window =
+                    Some(window.discover(metadata.as_ref(), &config.model).await);
+            }
             let summary = run_agent(config).await?;
             let output = if json {
                 serde_json::to_string_pretty(&summary)?
@@ -1250,8 +1256,18 @@ fn prepare_run_with_mode(
     }
     std::env::set_current_dir(root)?;
     let no_project_guidance = run.no_project_guidance;
+    let explicit_window = run.context_window_tokens;
     let mut config = run.into_config()?;
     config.conversational = everyday;
+    // Everyday runs account against a known window, asking the provider
+    // before the run; the explicit flag and the model table come first and
+    // last. Advanced and historical runs keep their window handling.
+    config.context_window = everyday.then(|| {
+        crate::context_window::ContextWindow::configured(
+            explicit_window,
+            model_context_window_tokens(&config.model),
+        )
+    });
     config.calculator = everyday;
     config.project_guidance = everyday && !no_project_guidance;
     if config.project_guidance {

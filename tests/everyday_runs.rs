@@ -664,3 +664,72 @@ fn the_legacy_binary_keeps_the_task_path_for_a_plain_prompt_omlx() {
 fn the_legacy_binary_keeps_the_task_path_for_a_plain_prompt_ollama() {
     legacy_prompt_keeps_the_task_path(Wire::Ollama);
 }
+
+// ---------------------------------------------------------------- context window
+
+/// The JSON summary of an everyday run of `prompt`.
+fn everyday_json(provider: &MockProvider, workspace: &Workspace, prompt: &str) -> Value {
+    let output = everyday(provider, workspace, &["--prompt", prompt, "--json"], b"");
+    serde_json::from_slice(&output.stdout).expect("the summary is JSON")
+}
+
+/// An everyday run asks the provider for the model's window, traces it with
+/// its source, and accounts against it, without changing the request.
+fn discovered_window(wire: Wire) {
+    let workspace = Workspace::new();
+    let unknown = MockProvider::replying(wire, vec![content("Hello.")]);
+    let before = everyday_json(&unknown, &workspace, "Hello!");
+    let known = MockProvider::replying(wire, vec![content("Hello.")]);
+    known.advertise_window(Some(262_144));
+    let after = everyday_json(&known, &workspace, "Hello!");
+
+    let resolved = |summary: &Value| {
+        trace_payloads(&trace_of(summary), "context.window.resolved")
+            .pop()
+            .expect("the window is traced")
+    };
+    let window = resolved(&after);
+    assert_eq!(window["tokens"], 262_144);
+    assert_eq!(window["source"], "provider");
+    assert_eq!(
+        window["field"],
+        match wire {
+            Wire::Omlx => "max_model_len",
+            Wire::Ollama => "model_info.test.context_length",
+        }
+    );
+    let fallback = resolved(&before);
+    assert_eq!(fallback["source"], "unknown");
+    assert!(fallback["tokens"].is_null());
+    assert!(
+        fallback["discovery_error"]
+            .as_str()
+            .unwrap()
+            .contains("does not advertise"),
+        "{fallback}"
+    );
+    let ledger = trace_payloads(&trace_of(&after), "llm.context_assembly.ledger").remove(0);
+    assert_eq!(ledger["known_window"]["tokens"], 262_144);
+    assert_eq!(ledger["known_window"]["pressure_band"], "green");
+    assert!(
+        ledger["context_window_tokens"].is_null(),
+        "the policy window is unchanged"
+    );
+    match wire {
+        Wire::Omlx => assert_eq!(known.gets(), ["/v1/models"]),
+        Wire::Ollama => assert_eq!(known.shows(), [json!({"model": "test-model"})]),
+    }
+    // The discovered window changes nothing the provider receives, num_ctx
+    // included.
+    assert_eq!(unknown.requests(), known.requests());
+}
+
+#[test]
+fn an_everyday_run_discovers_the_context_window_omlx() {
+    discovered_window(Wire::Omlx);
+}
+
+#[test]
+fn an_everyday_run_discovers_the_context_window_ollama() {
+    discovered_window(Wire::Ollama);
+}

@@ -145,6 +145,19 @@ pub struct MockProvider {
     port: u16,
     requests: Arc<Mutex<Vec<Value>>>,
     gets: Arc<Mutex<Vec<String>>>,
+    shows: Arc<Mutex<Vec<Value>>>,
+    window: Arc<Mutex<Option<usize>>>,
+}
+
+/// Server state shared with each connection.
+struct Served {
+    wire: Wire,
+    recorded: Arc<Mutex<Vec<Value>>>,
+    listed: Arc<Mutex<Vec<String>>>,
+    shows: Arc<Mutex<Vec<Value>>>,
+    window: Arc<Mutex<Option<usize>>>,
+    script: Arc<Script>,
+    models: Vec<String>,
 }
 
 impl MockProvider {
@@ -165,19 +178,22 @@ impl MockProvider {
         let port = listener.local_addr().expect("mock address").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let gets = Arc::new(Mutex::new(Vec::new()));
-        let script: Arc<Script> = Arc::new(script);
-        let models: Vec<String> = models.iter().map(|model| (*model).into()).collect();
-        let (recorded, listed) = (requests.clone(), gets.clone());
+        let shows = Arc::new(Mutex::new(Vec::new()));
+        let window = Arc::new(Mutex::new(None));
+        let served = Arc::new(Served {
+            wire,
+            recorded: requests.clone(),
+            listed: gets.clone(),
+            shows: shows.clone(),
+            window: window.clone(),
+            script: Arc::new(script),
+            models: models.iter().map(|model| (*model).into()).collect(),
+        });
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let (recorded, listed, script, models) = (
-                    recorded.clone(),
-                    listed.clone(),
-                    script.clone(),
-                    models.clone(),
-                );
+                let served = served.clone();
                 std::thread::spawn(move || {
-                    let _ = serve(stream, wire, &recorded, &listed, &*script, &models);
+                    let _ = serve(stream, &served);
                 });
             }
         });
@@ -186,6 +202,8 @@ impl MockProvider {
             port,
             requests,
             gets,
+            shows,
+            window,
         }
     }
 
@@ -218,6 +236,17 @@ impl MockProvider {
         self.requests.lock().expect("requests").len()
     }
 
+    /// Advertise a context window for every model: oMLX's `max_model_len` in
+    /// the model list, Ollama's `<arch>.context_length` from `/api/show`.
+    pub fn advertise_window(&self, tokens: Option<usize>) {
+        *self.window.lock().expect("window") = tokens;
+    }
+
+    /// Bodies of Ollama `/api/show` requests, which are not model requests.
+    pub fn shows(&self) -> Vec<Value> {
+        self.shows.lock().expect("shows").clone()
+    }
+
     /// Paths of GET requests, such as model listings.
     pub fn gets(&self) -> Vec<String> {
         self.gets.lock().expect("gets").clone()
@@ -233,14 +262,18 @@ impl MockProvider {
     }
 }
 
-fn serve(
-    stream: TcpStream,
-    wire: Wire,
-    recorded: &Mutex<Vec<Value>>,
-    listed: &Mutex<Vec<String>>,
-    script: &Script,
-    models: &[String],
-) -> std::io::Result<()> {
+fn serve(stream: TcpStream, served: &Served) -> std::io::Result<()> {
+    let Served {
+        wire,
+        recorded,
+        listed,
+        shows,
+        window,
+        script,
+        models,
+    } = served;
+    let wire = *wire;
+    let window = *window.lock().expect("window");
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -266,9 +299,13 @@ fn serve(
     if method == "GET" {
         listed.lock().expect("gets").push(path.into());
         let listing = match wire {
-            Wire::Omlx => {
-                json!({"data": models.iter().map(|id| json!({"id": id})).collect::<Vec<_>>()})
-            }
+            Wire::Omlx => json!({"data": models
+                .iter()
+                .map(|id| match window {
+                    Some(tokens) => json!({"id": id, "max_model_len": tokens}),
+                    None => json!({"id": id}),
+                })
+                .collect::<Vec<_>>()}),
             Wire::Ollama => {
                 json!({"models": models.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()})
             }
@@ -276,6 +313,14 @@ fn serve(
         return respond_json(&mut out, 200, &listing);
     }
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    if path == "/api/show" {
+        shows.lock().expect("shows").push(body);
+        let info = match window {
+            Some(tokens) => json!({"general.architecture": "test", "test.context_length": tokens}),
+            None => json!({"general.architecture": "test"}),
+        };
+        return respond_json(&mut out, 200, &json!({"model_info": info}));
+    }
     let number = {
         let mut recorded = recorded.lock().expect("requests");
         recorded.push(body.clone());

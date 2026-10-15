@@ -83,6 +83,10 @@ struct SessionState {
     /// Paths and hashes of the project guidance the last exchange used.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     guidance: Vec<(String, String)>,
+    /// The model's context window as the provider gave it, so later
+    /// exchanges do not ask again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window: Option<crate::context_window::ContextWindow>,
 }
 
 #[derive(Debug)]
@@ -177,6 +181,7 @@ impl ConversationRun {
                 messages: Vec::new(),
                 last_error: None,
                 guidance: Vec::new(),
+                context_window: None,
             },
             Err(error) => return Err(error.into()),
         };
@@ -234,6 +239,41 @@ impl ConversationRun {
         };
         state.guidance = current;
         notice
+    }
+
+    /// The accounting window: the one this conversation already learned from
+    /// the provider, or a fresh discovery, which is kept when it succeeds.
+    async fn context_window(
+        &self,
+        configured: crate::context_window::ContextWindow,
+        provider: Provider,
+        model: &str,
+    ) -> crate::context_window::ContextWindow {
+        use crate::context_window::WindowSource;
+        if configured.source != WindowSource::Explicit {
+            let cached = self
+                .state
+                .lock()
+                .expect("conversation mutex poisoned")
+                .context_window
+                .clone();
+            if let Some(window) = cached {
+                return crate::context_window::ContextWindow {
+                    cached: true,
+                    discovery_ms: None,
+                    ..window
+                };
+            }
+        }
+        let metadata = crate::model_metadata::for_provider(provider);
+        let window = configured.discover(metadata.as_ref(), model).await;
+        if window.source == WindowSource::Provider {
+            self.state
+                .lock()
+                .expect("conversation mutex poisoned")
+                .context_window = Some(window.clone());
+        }
+        window
     }
 
     pub(crate) fn protected_users(&self) -> usize {
@@ -372,7 +412,10 @@ impl ConversationRun {
                 }
                 format!(
                     "Requesting response · context {}",
-                    payload["pressure_band"].as_str().unwrap_or("unknown")
+                    payload["known_window"]["pressure_band"]
+                        .as_str()
+                        .or_else(|| payload["pressure_band"].as_str())
+                        .unwrap_or("unknown")
                 )
             }
             "llm.stream.progress"
@@ -423,8 +466,10 @@ impl ConversationRun {
 fn context_usage(ledger: &Value) -> Option<ConversationEvent> {
     Some(ConversationEvent::ContextUsage {
         used_tokens: usize::try_from(ledger["estimated_tokens"].as_u64()?).ok()?,
-        window_tokens: ledger["context_window_tokens"]
+        // The known window, when the run resolved one, else the configured one.
+        window_tokens: ledger["known_window"]["tokens"]
             .as_u64()
+            .or_else(|| ledger["context_window_tokens"].as_u64())
             .and_then(|window| usize::try_from(window).ok()),
     })
 }
@@ -515,12 +560,19 @@ fn trim_history(messages: &mut Vec<LlmMessage>, max_chars: usize) -> usize {
 }
 
 pub(crate) async fn run_worker(
-    config: AgentRunConfig,
+    mut config: AgentRunConfig,
     prompt: String,
     path: PathBuf,
 ) -> Result<()> {
     let (events, mut receiver) = unbounded_channel();
     let conversation = Arc::new(ConversationRun::open(&path, &config, prompt, events)?);
+    if let Some(configured) = config.context_window.take() {
+        config.context_window = Some(
+            conversation
+                .context_window(configured, config.provider, &config.model)
+                .await,
+        );
+    }
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(event) = receiver.recv().await {
@@ -646,6 +698,7 @@ mod tests {
                 messages: history,
                 last_error: None,
                 guidance: Vec::new(),
+                context_window: None,
             }),
             prompt: "new actual prompt".into(),
             protected_users,

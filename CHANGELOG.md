@@ -10,6 +10,19 @@ The release workflow publishes each version's section as its GitHub release note
 
 ## [Unreleased]
 
+### Added
+
+- Everyday `run` and the conversation ask the provider for the selected
+  model's context window: oMLX's `max_model_len` from `/v1/models`, and
+  Ollama's `num_ctx` parameter or `<arch>.context_length` from `/api/show`.
+  An explicit `--context-window-tokens` comes first and the built-in model
+  table last. The trace records the window and its source in
+  `context.window.resolved`, and each context ledger gains `known_window`
+  with utilization and pressure against it. The conversation asks once and
+  keeps the answer for later exchanges. A discovered window is used for
+  accounting only: Ollama's `num_ctx` and the run policies that read the
+  window are unchanged. Benchmark mode makes no discovery request.
+
 ### Changed
 
 - The conversation view draws each frame as one synchronized update (DEC mode

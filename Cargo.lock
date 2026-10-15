@@ -1230,6 +1230,7 @@ dependencies = [
  "libc",
  "mojentic",
  "portable-pty",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

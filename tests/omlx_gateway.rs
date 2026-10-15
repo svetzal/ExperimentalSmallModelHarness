@@ -33,16 +33,27 @@ fn read_request(stream: &mut TcpStream) -> (String, Value) {
             name.eq_ignore_ascii_case("content-length")
                 .then(|| value.trim().parse().unwrap())
         })
-        .unwrap();
+        .unwrap_or(0);
     while bytes.len() < header_end + length {
         let count = stream.read(&mut buffer).unwrap();
         assert!(count > 0, "connection ended before request body");
         bytes.extend_from_slice(&buffer[..count]);
     }
+    let body = &bytes[header_end..header_end + length];
     (
         headers,
-        serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap(),
+        if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(body).unwrap()
+        },
     )
+}
+
+/// Everyday runs ask for the model's context window before the model
+/// request. Answer without a window, so the run falls back as before.
+fn is_model_metadata(headers: &str) -> bool {
+    headers.starts_with("GET /v1/models ") || headers.starts_with("POST /api/show ")
 }
 
 fn mock_server(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<Value>>) {
@@ -61,17 +72,23 @@ fn mock_provider_server(
         let mut requests = Vec::new();
         for body in responses {
             let deadline = Instant::now() + Duration::from_secs(15);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
+            let (mut stream, headers, request) = loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(Instant::now() < deadline, "no provider request arrived");
                         std::thread::sleep(Duration::from_millis(5));
+                        continue;
                     }
                     Err(error) => panic!("accept failed: {error}"),
+                };
+                let (headers, request) = read_request(&mut stream);
+                if is_model_metadata(&headers) {
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+                    continue;
                 }
+                break (stream, headers, request);
             };
-            let (headers, request) = read_request(&mut stream);
             assert!(headers.starts_with(&format!("POST {route} HTTP/1.1")));
             if require_api_key {
                 assert!(
