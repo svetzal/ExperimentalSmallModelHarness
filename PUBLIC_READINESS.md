@@ -184,11 +184,15 @@ review: skill locations, the `/context` view, tool descriptors held fixed, and
 budget defaults.
 
 - [x] Agree the residency framing and answer its open questions.
-- [ ] Measurement first: trace residency events and time to first token, and
+- [x] Measurement first: trace residency events and time to first token, and
   discover context windows from providers so pressure stops reading "unknown".
   Make the standing-context limit and per-kind window fractions run settings
   (advanced configuration and a flag), recorded in the trace, so cells can
-  vary them.
+  vary them. Note: the standing-context limit and the guidance fraction are
+  settings now; the skill fractions arrive with skills. The ledger's own
+  pressure band stays on the configured window because run policies read it;
+  the known-window band is recorded beside it. See
+  [residency measurement](RESIDENCY-MEASUREMENT-2026-10.md).
 - [ ] Run the guidance on/off baseline cell (HYP-R-4).
 - [ ] Add an ejection policy for guidance, and move tool-result compaction under
   it (HYP-R-1, HYP-R-3).

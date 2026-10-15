@@ -14,6 +14,15 @@ did.
 - each tool call and its result
 - validation results, stop decisions, and the final outcome
 - the project guidance that was discovered and delivered
+- the model's context window and where it came from: your
+  `--context-window-tokens`, the provider, or Microgentic's model table
+- for each request, the time to the first token, what kind of token it was
+  (reply text, thinking, or a tool call), and how long the request took
+- for everyday runs and the conversation, the residency of each part of each
+  request: why it is there, its size, the turn that added it, whether it is
+  pinned, and whether Microgentic has shortened it. The standing context (the
+  project guidance) is measured against a limit you can set; see
+  [Providers and models](providers.md#advanced-context-settings).
 
 The full schema is in
 [`TRACE_SCHEMA.md`](https://github.com/svetzal/microgentic/blob/main/TRACE_SCHEMA.md).

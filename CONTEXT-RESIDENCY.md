@@ -1,12 +1,14 @@
 # Context residency
 
 Date: 2026-10-15. Status: framing agreed on 2026-10-15; see Decisions.
-Nothing here is built yet.
-Source baseline: `38f7431`.
+Steps 1 and 2 of the sequencing are built: guidance discovery, and the
+measurement-first step (window discovery, time to first token, residency
+recording, and the two settings). Nothing ejects yet. See Status below.
+Source baseline: `38f7431`; status updated at `6d028b3`.
 
 ## Why this note exists
 
-Project guidance (`AGENTS.md` discovery, in progress) and agent skills (next)
+Project guidance (`AGENTS.md` discovery) and agent skills (next)
 both add standing text to every model request. Small models lose quality long
 before their context window is full. The harness already encodes that belief:
 `pressure_band` in `src/agent.rs` reports yellow at 15% utilization, orange at
@@ -214,10 +216,10 @@ Fixed variables for every cell follow Gate 4 of `EXPERIMENTAL_METHOD.md`.
 
 ## Sequencing
 
-1. `AGENTS.md` discovery (in progress). It provides the first lazily activated
-   item and traces what it discovers.
+1. `AGENTS.md` discovery. Done. It provides the first lazily activated item and
+   traces what it discovers.
 2. Measurement-first: residency events, time to first token, context window
-   discovery.
+   discovery. Done; see Status.
 3. Baseline cell for HYP-R-4.
 4. Ejection policy for guidance, with tool-result compaction moved under the
    same policy. Cells for HYP-R-1 and HYP-R-3.
@@ -225,6 +227,58 @@ Fixed variables for every cell follow Gate 4 of `EXPERIMENTAL_METHOD.md`.
 
 Benchmark mode stays unchanged throughout, unless a cell deliberately varies it
 and records that.
+
+## Status
+
+Step 2 is built for everyday `run` and the conversation. Benchmark mode makes no
+discovery request and records no residency, and its provider requests match
+v0.4.0. The trace fields are in [`TRACE_SCHEMA.md`](TRACE_SCHEMA.md), and the
+live check is in [`RESIDENCY-MEASUREMENT-2026-10.md`](RESIDENCY-MEASUREMENT-2026-10.md).
+
+**Context windows.** The provider fields are oMLX `GET /v1/models`
+`data[].max_model_len`, and Ollama `POST /api/show`, which gives
+`model_info.<arch>.context_length` (the key has an architecture prefix, such as
+`qwen3_5` or `qwen4_exp`) and sometimes a `num_ctx` line in `parameters`.
+Microgentic prefers that `num_ctx` parameter when it is present, because Ollama
+runs the model with it. The order is the explicit `--context-window-tokens`,
+then the provider, then the model table. The conversation asks once and keeps
+the answer in its session file.
+
+The window is for accounting only. Ollama's `num_ctx` is unchanged, so a
+discovered window cannot make Ollama allocate a larger cache. Every request
+already sends Mojentic's default `num_ctx` of 32,768 when no explicit or table
+window applies, and Ollama runs the model with it, so on Ollama the accounting
+window is at most that value; the trace keeps the advertised size beside it.
+The run policies that read a window (the ledger's own pressure band, repair
+depth, stall projections, compaction, file observation budgets, and
+conversation trimming) keep the configured window too, so this step changes no
+behaviour. The guidance budget is the exception the brief named: it uses the
+known window. For any window of 64,000 tokens or more that is the same 8,000
+token ceiling as before.
+
+**Nested guidance is delivered once per exchange, not once per conversation.**
+Each exchange is one run, and each run delivers a nested file again the first
+time the model works in its directory. Ejection policy must account for this:
+in a conversation, an "ejected" nested file returns at the next exchange's
+first touch anyway.
+
+**Residency items.** The system message holds the base prompt, each guidance
+file, and the guidance framing as separate items. Item identities are stable
+within one run; a tool result without a provider call ID is identified by its
+position. Turns are the harness's outer iterations, so tool calls within one
+response share a turn.
+
+**Standing context.** Root guidance alone is about 130 tokens in the live check,
+far under the 15% limit. The unknown-window guidance fallback of 8,000 tokens
+is still over the 4,800-token limit of the assumed 32,000-token window, and the
+trace reports it as over limit. Window discovery makes that case rare.
+
+**Moving into Mojentic.** The provider window query (`src/model_metadata.rs`)
+and the first-token clock (`src/first_token.rs`) are expected to move into
+Mojentic's gateway and stream metrics, following Mojentic's rule that it
+provides the primitives and applications own the policy. When the pinned
+mojentic-ru revision provides them, switch to the Mojentic API and delete the
+local modules. Residency stays in Microgentic: it is policy.
 
 ## Decisions
 

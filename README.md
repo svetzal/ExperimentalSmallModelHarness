@@ -262,6 +262,17 @@ With `--experiment`, `--goal` or `--contract`, `run` keeps the task path: the
 task template, DONE/FAIL, continuation prompts and declared probes. The
 `adaptive-agent-harness` executable and `benchmark` commands always use it.
 See [everyday run trials](EVERYDAY-RUN-2026-10.md) for request counts.
+
+Everyday runs and the conversation also measure their context, without
+changing it. They ask the provider for the model's context window (oMLX's
+`max_model_len`, Ollama's `/api/show`), with `--context-window-tokens` first and
+the built-in table last, and account against it; Ollama's `num_ctx` is never
+changed by it. The trace records time to first token for every request, and a
+residency record for every item in each request with its reason, size, and
+state. `--standing-context-limit` and `--guidance-fraction`, or the matching
+`config.json` keys, set the limits those records are measured against. See
+[context residency](CONTEXT-RESIDENCY.md) and
+[residency measurement](RESIDENCY-MEASUREMENT-2026-10.md).
 Empty prompts, duplicate `--prompt` flags, positional prompts, and invalid UTF-8
 fail before a provider call. Stdin is limited to 1 MiB.
 
@@ -822,6 +833,9 @@ Live trials of project guidance discovery are recorded in
 [`GUIDANCE-TRIALS-2026-10.md`](GUIDANCE-TRIALS-2026-10.md).
 Everyday `run` replies, with request counts and live trials, are recorded in
 [`EVERYDAY-RUN-2026-10.md`](EVERYDAY-RUN-2026-10.md).
+The live check of window discovery, time to first token, and residency
+recording is in
+[`RESIDENCY-MEASUREMENT-2026-10.md`](RESIDENCY-MEASUREMENT-2026-10.md).
 
 Experiments are intentionally run from separate, scoped workspaces. Generated
 agents should see their work tree and task-relevant guidance, not experiment
