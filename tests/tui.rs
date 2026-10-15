@@ -1012,3 +1012,386 @@ fn tui_status_bar_shows_git_state_and_a_known_context_window() {
 fn tui_status_bar_shows_only_what_it_knows_outside_git() {
     status_bar(Wire::Omlx, "test-model", false);
 }
+
+// ---------------------------------------------------------------- launch animation
+
+fn resting(frame: &str) -> bool {
+    frame.contains("Type /help for commands.")
+        && frame.contains("Talk to Microgentic.")
+        && frame.contains("Enter send")
+        && !frame.contains('✦')
+        && !frame.contains('✧')
+}
+
+/// Every painted frame in the raw output, colour codes removed. Screen
+/// snapshots are taken per output chunk, so a frame that arrives inside one
+/// chunk with its successor only shows here.
+fn painted_frames(tui: &Tui) -> Vec<String> {
+    let raw = String::from_utf8_lossy(&tui.raw()).into_owned();
+    let mut plain = String::with_capacity(raw.len());
+    let mut rest = raw.as_str();
+    while let Some(start) = rest.find("\x1b[") {
+        plain.push_str(&rest[..start]);
+        let tail = &rest[start + 2..];
+        let params = tail
+            .find(|c: char| !(c.is_ascii_digit() || c == ';'))
+            .unwrap_or(tail.len());
+        if tail[params..].starts_with('m') {
+            rest = &tail[params + 1..];
+        } else {
+            plain.push_str("\x1b[");
+            rest = tail;
+        }
+    }
+    plain.push_str(rest);
+    plain.split("\x1b[2J").skip(1).map(str::to_owned).collect()
+}
+
+/// Launch with the animation on and return the session and the seconds from
+/// the first painted frame to the resting screen.
+fn animated_launch(
+    provider: &MockProvider,
+    workspace: &Workspace,
+    key: Option<&[u8]>,
+) -> (Tui, f64) {
+    workspace.configure("omlx", "test-model", Some("low"));
+    let mut launch = Launch::new(microgentic())
+        .arg("--config")
+        .arg(&workspace.config)
+        .cwd(&workspace.project)
+        .size(24, 90)
+        .env("XDG_STATE_HOME", &workspace.state)
+        .env_remove("MICROGENTIC_NO_ANIMATION");
+    for (name, value) in provider.env() {
+        launch = launch.env(name, value);
+    }
+    let mut tui = launch.spawn();
+    // Time from the first painted frame: a freshly built binary can take a
+    // moment to start on macOS, which is not the animation's doing.
+    let painted = |tui: &Tui| String::from_utf8_lossy(&tui.raw()).contains("\x1b[2J");
+    tui.wait_for("the first frame", |_| painted(&tui));
+    let first_frame = std::time::Instant::now();
+    if let Some(key) = key {
+        tui.send(key);
+    }
+    tui.wait_for("the resting screen", |screen| {
+        resting(&screen.text()) && (key.is_none() || screen.contains("> x"))
+    });
+    (tui, first_frame.elapsed().as_secs_f64())
+}
+
+#[test]
+fn tui_launch_animation_settles_on_the_resting_screen() {
+    let workspace = Workspace::new();
+    let provider = MockProvider::start(Wire::Omlx, |_| Reply::Status(500));
+    let (mut tui, settled) = animated_launch(&provider, &workspace, None);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let painted = painted_frames(&tui);
+    assert!(
+        painted.iter().any(|frame| frame.contains('✦')),
+        "the seed never appeared"
+    );
+    assert!(
+        painted.iter().any(|frame| frame.contains("microgentic")),
+        "the letters never assembled"
+    );
+    assert!(
+        painted.len() >= 6,
+        "only {} frames: the animation did not play",
+        painted.len()
+    );
+    assert!(
+        resting(painted.last().unwrap()),
+        "the last painted frame is not the resting screen"
+    );
+    assert!(settled < 2.4, "the resting screen took {settled:.2}s");
+    assert!(resting(&tui.snapshot().text()), "{}", tui.snapshot());
+    tui.quit();
+    assert_eq!(provider.request_count(), 0, "launch contacted the provider");
+    assert!(provider.gets().is_empty(), "launch listed models");
+}
+
+#[test]
+fn tui_launch_animation_is_skipped_by_a_key_that_still_lands() {
+    let workspace = Workspace::new();
+    let provider = MockProvider::start(Wire::Omlx, |_| Reply::Status(500));
+    let (mut tui, _) = animated_launch(&provider, &workspace, Some(b"x"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let frames = tui.frames_since_mark();
+    let first_with_key = frames
+        .iter()
+        .position(|frame| frame.contains("> x"))
+        .expect("the key reached the input");
+    assert!(
+        frames[first_with_key..]
+            .iter()
+            .filter(|frame| frame.contains("Enter send"))
+            .all(|frame| resting(frame)),
+        "the animation kept playing after a key"
+    );
+    let painted = painted_frames(&tui);
+    let first_with_key = painted
+        .iter()
+        .position(|frame| frame.contains("> x"))
+        .expect("a frame with the key");
+    assert!(
+        painted[first_with_key..]
+            .iter()
+            .filter(|frame| frame.contains("Enter send"))
+            .all(|frame| resting(frame)),
+        "a painted frame after the key still animated"
+    );
+    let screen = tui.snapshot();
+    let (row, _) = screen.locate("> x").unwrap();
+    assert_eq!(
+        screen.row(row).trim(),
+        "> x",
+        "the key is in the input line"
+    );
+    tui.quit();
+    assert_eq!(provider.request_count(), 0, "launch contacted the provider");
+    assert!(provider.gets().is_empty(), "launch listed models");
+}
+
+// ---------------------------------------------------------------- live thinking
+
+/// Rows without the one-column margin the view leaves on the left.
+fn content_rows(screen: &Snapshot) -> Vec<String> {
+    screen
+        .rows()
+        .into_iter()
+        .map(|row| row.strip_prefix(' ').map(str::to_owned).unwrap_or(row))
+        .collect()
+}
+
+/// Thinking streams live, then collapses above its tool calls.
+fn live_thinking(wire: Wire) {
+    let workspace = Workspace::new();
+    workspace.write("notes.txt", "PACE = 2.0\nsecond line\n");
+    let thought_seen = Gate::default();
+    let seen = thought_seen.clone();
+    let provider = MockProvider::start(wire, move |request| {
+        Reply::Stream(match request.number {
+            1 => vec![
+                thinking("\nThe user wants"),
+                thinking(" the pacing constant."),
+                thinking("\nLet me search"),
+                thinking(" for it first.\n"),
+                // Hold the stream until the test has seen the live thinking.
+                Step::Hold(seen.clone()),
+                content("\n\n"),
+                tools(&[
+                    (
+                        "read_file",
+                        serde_json::json!({"path": "notes.txt", "line_start": 1, "line_end": 2}),
+                    ),
+                    (
+                        "list_tree",
+                        serde_json::json!({"path": ".", "max_depth": 2}),
+                    ),
+                ]),
+            ],
+            2 => vec![
+                thinking("\nThe constant is likely"),
+                thinking(" in notes.txt.\n"),
+                content("\n\n"),
+                tool("read_file", serde_json::json!({"path": "notes.txt"})),
+            ],
+            _ => vec![
+                thinking("\nI have what I need.\n"),
+                content("\n\n"),
+                content("The pace is "),
+                content("set by PACE."),
+            ],
+        })
+    });
+    let mut session = open_session(microgentic(), workspace, provider, 36, 120);
+    session.tui.submit("Find the pacing constant.");
+    // The live thinking shows while the model is still thinking.
+    let live = session.tui.wait_text("Let me search for it first.");
+    let rows = content_rows(&live);
+    assert!(
+        rows.iter()
+            .any(|row| row.trim() == "The user wants the pacing constant."),
+        "{live}"
+    );
+    let (row, col) = live.locate("The user wants").unwrap();
+    let cell = live.cell(row, col);
+    assert!(cell.dim() && cell.italic(), "live thinking is dim italic");
+    thought_seen.open();
+    let done = session.tui.wait_for("the reply to settle", |screen| {
+        screen.contains("The pace is set by PACE.") && screen.contains(READY)
+    });
+    let rows = content_rows(&done);
+    let heading = rows
+        .iter()
+        .position(|row| row.starts_with("Microgentic:"))
+        .unwrap();
+    let reply = rows
+        .iter()
+        .position(|row| row.starts_with("The pace is set by PACE."))
+        .unwrap();
+    let exchange: Vec<&str> = rows[heading..=reply].iter().map(String::as_str).collect();
+    assert_eq!(
+        exchange,
+        [
+            "Microgentic:",
+            "  ∴ Let me search for it first.",
+            "  ✓ read_file notes.txt:1-2",
+            "  ✓ list_tree . depth 2",
+            "  ∴ The constant is likely in notes.txt.",
+            "  ✓ read_file notes.txt",
+            "",
+            "The pace is set by PACE.",
+        ],
+        "{done}"
+    );
+    let (row, col) = done.locate("∴ Let me search").unwrap();
+    assert!(
+        done.cell(row, col).italic(),
+        "a collapsed thought stays italic"
+    );
+    assert!(
+        !done.contains("The user wants"),
+        "the full thinking stayed on screen"
+    );
+    assert!(
+        !done.contains("I have what I need."),
+        "thinking before the reply was kept"
+    );
+    assert_eq!(session.provider.request_count(), 3);
+    session.tui.quit();
+}
+
+#[test]
+fn tui_streams_thinking_live_and_collapses_it_omlx() {
+    live_thinking(Wire::Omlx);
+}
+
+#[test]
+fn tui_streams_thinking_live_and_collapses_it_ollama() {
+    live_thinking(Wire::Ollama);
+}
+
+// ---------------------------------------------------------------- word wrap
+
+/// Longer than two rows at 60 columns, so it must be shortened rather than split.
+const LONG_URL: &str = concat!(
+    "https://github.com/svetzal/microgentic/releases/download/v0.2.0/",
+    "microgentic-0.2.0-aarch64-apple-darwin-with-a-deliberately-long-asset-name.tar.gz"
+);
+
+fn wrap_reply() -> String {
+    format!(
+        "Found it. The launch animation's pace is set by a single constant, and every stage of the \
+         timeline is divided by it, so the proportions never change when you adjust the speed.\n\n\
+         The release notes are at {LONG_URL} if you want the details.\n\n\
+         ```rust\n    const PACE: f64 = 1.1;\n    \
+         let hold = prototype_ms / PACE; // milliseconds for each stage of the burst\n```\n\n\
+         - Raise PACE to make the whole animation play faster than the prototype timeline\n\
+         - Lower it to slow everything down evenly"
+    )
+}
+
+/// At a narrow width, replies wrap at words and keep their indentation.
+fn word_wrap(wire: Wire) {
+    let workspace = Workspace::new();
+    workspace.write("notes.txt", "PACE = 1.1\n");
+    let reply = wrap_reply();
+    let chars: Vec<char> = reply.chars().collect();
+    let chunks: Vec<Step> = chars
+        .chunks(17)
+        .map(|chunk| content(&chunk.iter().collect::<String>()))
+        .collect();
+    let provider = MockProvider::turns(
+        wire,
+        vec![
+            vec![
+                content("\n\n"),
+                tool("read_file", serde_json::json!({"path": "notes.txt"})),
+            ],
+            chunks,
+        ],
+    );
+    let mut session = open_session(microgentic(), workspace, provider, 48, 60);
+    session.tui.submit("Where is the pace set?");
+    let screen = session.tui.wait_for("the wrapped reply", |screen| {
+        screen.contains("slow everything down evenly") && screen.contains(READY)
+    });
+    let rows = content_rows(&screen);
+    let tool_row = rows
+        .iter()
+        .position(|row| row.contains("✓ read_file notes.txt"))
+        .unwrap_or_else(|| panic!("no tool line\n{screen}"));
+    let first = rows
+        .iter()
+        .position(|row| row.starts_with("Found it."))
+        .unwrap_or_else(|| panic!("no reply\n{screen}"));
+    assert_eq!(
+        first,
+        tool_row + 2,
+        "no blank row above the reply\n{screen}"
+    );
+    assert_eq!(
+        rows[tool_row + 1],
+        "",
+        "no blank row above the reply\n{screen}"
+    );
+    let last = rows
+        .iter()
+        .position(|row| row.contains("slow everything down evenly"))
+        .unwrap();
+    let wrapped = &rows[first..=last];
+    for row in wrapped {
+        assert!(row.chars().count() <= 58, "row too wide: {row:?}\n{screen}");
+        let leading = row.len() - row.trim_start_matches(' ').len();
+        assert!(
+            [0, 2, 4].contains(&leading),
+            "stray leading space: {row:?}\n{screen}"
+        );
+    }
+    assert!(
+        wrapped
+            .iter()
+            .any(|row| row == "    const PACE: f64 = 1.1;"),
+        "code indentation lost\n{screen}"
+    );
+    let original: std::collections::HashSet<&str> = reply.split_whitespace().collect();
+    let joined = wrapped.join(" ");
+    for token in joined.split_whitespace() {
+        assert!(
+            original.contains(token) || token.contains('…'),
+            "split or altered word: {token:?}\n{screen}"
+        );
+    }
+    let urls: Vec<&str> = joined
+        .split_whitespace()
+        .filter(|token| token.starts_with("https://"))
+        .collect();
+    assert_eq!(urls.len(), 1, "{urls:?}");
+    assert!(
+        urls[0].contains('…') && urls[0].ends_with("asset-name.tar.gz"),
+        "{urls:?}"
+    );
+    assert!(urls[0].chars().count() <= 58, "{urls:?}");
+    assert!(wrapped.iter().any(|row| row.starts_with("- Raise PACE")));
+    assert!(wrapped.iter().any(|row| row.starts_with("- Lower it")));
+    assert!(
+        wrapped
+            .iter()
+            .any(|row| row.starts_with("  ") && !row.starts_with("    ")),
+        "no list hanging indent\n{screen}"
+    );
+    assert_eq!(session.provider.request_count(), 2);
+    session.tui.quit();
+}
+
+#[test]
+fn tui_wraps_replies_at_words_and_keeps_indentation_omlx() {
+    word_wrap(Wire::Omlx);
+}
+
+#[test]
+fn tui_wraps_replies_at_words_and_keeps_indentation_ollama() {
+    word_wrap(Wire::Ollama);
+}

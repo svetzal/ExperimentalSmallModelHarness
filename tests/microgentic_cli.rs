@@ -135,60 +135,6 @@ fn prompt_must_match_an_authoritative_contract_before_a_run_is_created() {
     assert!(!traces.exists());
 }
 
-#[cfg(unix)]
-#[test]
-fn tui_launch_animation_settles_quickly_and_never_blocks_input() {
-    let temp = tempfile::tempdir().unwrap();
-    let output = Command::new("python3")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tui_launch.py"))
-        .arg(env!("CARGO_BIN_EXE_microgentic"))
-        .arg(temp.path())
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn tui_streams_thinking_live_and_collapses_it_above_tool_calls() {
-    let temp = tempfile::tempdir().unwrap();
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/tui_thinking.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_microgentic"))
-        .arg(temp.path())
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn tui_wraps_replies_at_words_and_keeps_their_indentation() {
-    let temp = tempfile::tempdir().unwrap();
-    let output = Command::new("python3")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tui_wrap.py"))
-        .arg(env!("CARGO_BIN_EXE_microgentic"))
-        .arg(temp.path())
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 #[test]
 fn calculate_answers_batches_and_stays_out_of_benchmark_runs() {
     let temp = tempfile::tempdir().unwrap();
