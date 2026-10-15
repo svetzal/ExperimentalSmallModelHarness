@@ -1,0 +1,378 @@
+//! Everyday runs against a mock provider: the calculate tool and project
+//! guidance, on both providers. No terminal and no model.
+mod support;
+
+use serde_json::{Value, json};
+use std::path::Path;
+use support::*;
+
+/// Run `microgentic` against `provider` and return its parsed JSON summary.
+fn run_json(provider: &MockProvider, cwd: &Path, env: &[(&str, String)], args: &[&str]) -> Value {
+    let mut full_env = provider.env();
+    full_env.extend(env.iter().cloned());
+    let output = run_binary(microgentic(), args, cwd, &full_env, b"");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("the summary is JSON")
+}
+
+fn trace_of(summary: &Value) -> std::path::PathBuf {
+    summary["trace_file"]
+        .as_str()
+        .expect("the summary names its trace")
+        .into()
+}
+
+fn tool_json(request: &Value) -> Value {
+    serde_json::from_str(&last_tool_result(request)).expect("the tool result is JSON")
+}
+
+// ---------------------------------------------------------------- calculate
+
+#[test]
+fn calculate_answers_batches_and_stays_out_of_benchmark_runs_omlx() {
+    calculate(Wire::Omlx);
+}
+
+#[test]
+fn calculate_answers_batches_and_stays_out_of_benchmark_runs_ollama() {
+    calculate(Wire::Ollama);
+}
+
+fn calculate(wire: Wire) {
+    let workspace = Workspace::new();
+    let env = [
+        ("XDG_STATE_HOME", workspace.state.display().to_string()),
+        (
+            "XDG_CONFIG_HOME",
+            workspace.base.join("config").display().to_string(),
+        ),
+    ];
+
+    // An everyday run offers calculate; a batch comes back one line each.
+    let provider = MockProvider::turns(
+        wire,
+        vec![
+            vec![tool(
+                "calculate",
+                json!({"expression": "140+90+70+120+350+60+60+154+60+280+90\n1474/1.1"}),
+            )],
+            vec![tool("calculate", json!({"expression": "1354 / (1.1"}))],
+            vec![tool(
+                "calculate",
+                json!({"expression": "total = 140 + 90\ntotal / 1.1\n(total / 1000) as secs"}),
+            )],
+            vec![content(
+                "The total is 1474 ms and the new length is 1340 ms.",
+            )],
+        ],
+    );
+    let summary = run_json(
+        &provider,
+        &workspace.project,
+        &env,
+        &[
+            "run",
+            "--prompt",
+            "Add up the stage holds, then divide by 1.1.",
+            "--json",
+            "--provider",
+            wire.name(),
+            "--model",
+            "test-model",
+        ],
+    );
+    let requests = provider.requests();
+    // The run keeps asking after a plain reply, so only the first four matter.
+    assert!(requests.len() >= 4, "{} requests", requests.len());
+    assert!(
+        tool_names(&requests[0]).contains(&"calculate".to_owned()),
+        "{:?}",
+        tool_names(&requests[0])
+    );
+    assert_eq!(
+        tool_json(&requests[1]),
+        json!({"results": [
+            "140 + 90 + 70 + 120 + 350 + 60 + 60 + 154 + 60 + 280 + 90 = 1474",
+            "1474 / 1.1 = 1340",
+        ]})
+    );
+    // The error names the column and the unclosed bracket.
+    assert_eq!(
+        tool_json(&requests[2]),
+        json!({"error": "Tool error: 1354 / (1.1  ->  error at column 12: missing \")\"; \
+                         the \"(\" at column 8 is never closed"})
+    );
+    // A batch with some good lines still answers; the bad line says why.
+    let mixed = tool_json(&requests[3]);
+    let mixed = mixed["results"].as_array().expect("results");
+    assert_eq!(
+        mixed,
+        &[
+            json!("total = 140 + 90 = 230"),
+            json!("total / 1.1 = 209.090909091"),
+            json!(
+                "(total / 1000) as secs  ->  error at column 16: unexpected \"as\" after the \
+                 expression; write only arithmetic, or name the value first, such as \
+                 secs = 1474 / 1000"
+            ),
+        ]
+    );
+    let results: Vec<Value> = trace_payloads(&trace_of(&summary), "llm.context_assembly.appended")
+        .into_iter()
+        .filter(|payload| payload["component"] == "tool_result")
+        .map(|payload| payload["ok"].clone())
+        .collect();
+    assert_eq!(results, [json!(true), json!(false), json!(true)]);
+
+    // Benchmark runs keep their exact tool set.
+    let experiment = &workspace.base;
+    let contract = workspace.base.join("contract.json");
+    std::fs::write(
+        &contract,
+        json!({
+            "profile": {"id": "terminal_work", "version": "terminal_work_profile.v1"},
+            "guidance": "Finish.",
+            "read_scope": ["./**"],
+            "write_scope": ["./**"],
+            "probes": [],
+        })
+        .to_string(),
+    )
+    .expect("writing the contract");
+    let provider = MockProvider::replying(wire, vec![content("DONE")]);
+    let mut full_env = provider.env();
+    full_env.extend(env.iter().cloned());
+    let traces = workspace.base.join("bench-traces");
+    let output = run_binary(
+        microgentic(),
+        &[
+            "benchmark",
+            "run",
+            "--experiment",
+            &experiment.display().to_string(),
+            "--contract",
+            &contract.display().to_string(),
+            "--trace-dir",
+            &traces.display().to_string(),
+            "--provider",
+            wire.name(),
+            "--dir",
+            &workspace.project.display().to_string(),
+            "--max-model-interactions",
+            "2",
+            "--max-iterations",
+            "1",
+        ],
+        &workspace.project,
+        &full_env,
+        b"",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = provider.requests();
+    assert!(!requests.is_empty(), "the benchmark never asked the model");
+    assert!(
+        !tool_names(&requests[0]).contains(&"calculate".to_owned()),
+        "{:?}",
+        tool_names(&requests[0])
+    );
+}
+
+// ---------------------------------------------------------------- guidance
+
+#[test]
+fn project_guidance_reaches_everyday_runs_and_conversations_omlx() {
+    project_guidance(Wire::Omlx);
+}
+
+#[test]
+fn project_guidance_reaches_everyday_runs_and_conversations_ollama() {
+    project_guidance(Wire::Ollama);
+}
+
+fn project_guidance(wire: Wire) {
+    let workspace = Workspace::new();
+    let root = &workspace.project;
+    std::fs::create_dir_all(root.join(".git")).expect("a repository marker");
+    workspace.write("AGENTS.md", "ROOT-RULE: run tests with make check.\n");
+    workspace.write("sub/AGENTS.md", "SUB-RULE: in sub, answer in French.\n");
+    workspace.write("sub/notes.txt", "notes\n");
+    let config_home = workspace.base.join("config");
+    let user_guidance = config_home.join("microgentic").join("AGENTS.md");
+    std::fs::create_dir_all(user_guidance.parent().unwrap()).expect("user config directory");
+    std::fs::write(&user_guidance, "USER-RULE: be brief.\n").expect("user guidance");
+    let env = [
+        ("XDG_STATE_HOME", workspace.state.display().to_string()),
+        ("XDG_CONFIG_HOME", config_home.display().to_string()),
+    ];
+    let run_args = |extra: &[&'static str]| -> Vec<String> {
+        let mut args: Vec<String> = [
+            "run",
+            "--prompt",
+            "Check the notes.",
+            "--json",
+            "--provider",
+            wire.name(),
+            "--model",
+            "test-model",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        args
+    };
+    let read_notes = || tool("read_file", json!({"path": "sub/notes.txt"}));
+
+    let provider = MockProvider::turns(
+        wire,
+        vec![
+            vec![read_notes()],
+            vec![read_notes()],
+            vec![content("Done.")],
+        ],
+    );
+    let args = run_args(&[]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let summary = run_json(&provider, root, &env, &args);
+    let requests = provider.requests();
+    assert!(requests.len() >= 3, "{} requests", requests.len());
+    let prompt = system_message(&requests[0]);
+    assert!(prompt.contains("# Project guidance"), "{prompt}");
+    let user_header = format!("## {} (user guidance)", user_guidance.display());
+    assert!(prompt.contains(&user_header), "{prompt}");
+    assert!(
+        prompt.contains("## AGENTS.md (project directory and repository root)"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.find("USER-RULE").unwrap() < prompt.find("ROOT-RULE").unwrap(),
+        "user guidance must come first"
+    );
+    assert!(prompt.contains("- sub/ (sub/AGENTS.md)"), "{prompt}");
+    assert!(!prompt.contains("SUB-RULE"), "{prompt}");
+    // The nested file arrives after the first read under sub/, once.
+    assert!(
+        !user_messages(&requests[0])
+            .iter()
+            .any(|text| text.contains("SUB-RULE"))
+    );
+    let injected: Vec<String> = user_messages(&requests[1])
+        .into_iter()
+        .filter(|text| text.starts_with("[Project guidance for sub/ from sub/AGENTS.md."))
+        .collect();
+    assert_eq!(injected.len(), 1, "{:?}", user_messages(&requests[1]));
+    assert!(injected[0].contains("SUB-RULE"));
+    assert_eq!(
+        user_messages(&requests[2])
+            .iter()
+            .filter(|text| text.contains("SUB-RULE"))
+            .count(),
+        1,
+        "nested guidance was injected twice"
+    );
+    let trace = trace_of(&summary);
+    let discovered = trace_payloads(&trace, "context.guidance.discovered");
+    assert_eq!(discovered.len(), 1, "guidance is discovered once per run");
+    let candidates = discovered[0]["candidates"].as_array().expect("candidates");
+    let statuses: std::collections::BTreeMap<String, String> = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate["shown"].as_str().unwrap().to_owned(),
+                candidate["status"]["status"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let expected: std::collections::BTreeMap<String, String> = [
+        (user_guidance.display().to_string(), "included"),
+        ("AGENTS.md".into(), "included"),
+        ("sub/AGENTS.md".into(), "pending"),
+    ]
+    .into_iter()
+    .map(|(shown, status)| (shown, status.to_owned()))
+    .collect();
+    assert_eq!(statuses, expected);
+    assert_eq!(candidates.len(), 3, "a candidate appeared twice");
+    assert!(candidates.iter().all(|candidate| {
+        candidate["sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+    }));
+    assert_eq!(
+        trace_payloads(&trace, "context.guidance.nested_injected").len(),
+        1,
+        "the nested file was injected once"
+    );
+
+    // Guidance never changes the tools; the flag removes it entirely.
+    let plain = MockProvider::replying(wire, vec![content("Done.")]);
+    let args = run_args(&["--no-project-guidance"]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let summary = run_json(&plain, root, &env, &args);
+    let plain_requests = plain.requests();
+    assert!(!plain_requests[0].to_string().contains("Project guidance"));
+    assert_eq!(tool_names(&plain_requests[0]), tool_names(&requests[0]));
+    assert!(!trace_records(&trace_of(&summary)).iter().any(|record| {
+        record["kind"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("context.guidance"))
+    }));
+
+    // The conversation worker reads guidance too, and notices changes between exchanges.
+    let session = workspace.base.join("session").join("conversation.json");
+    std::fs::create_dir_all(session.parent().unwrap()).expect("session directory");
+    let worker = MockProvider::replying(wire, vec![content("Hello.")]);
+    let mut full_env = worker.env();
+    full_env.extend(env.iter().cloned());
+    for prompt in ["Hi.", "Again."] {
+        let output = run_binary(
+            microgentic(),
+            &[
+                "conversation-worker",
+                "--prompt",
+                prompt,
+                "--session-state",
+                &session.display().to_string(),
+                "--provider",
+                wire.name(),
+                "--model",
+                "test-model",
+            ],
+            root,
+            &full_env,
+            b"",
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.write("AGENTS.md", "ROOT-RULE: run tests with make verify.\n");
+    }
+    let requests = worker.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(system_message(&requests[0]).contains("ROOT-RULE: run tests with make check."));
+    assert!(system_message(&requests[1]).contains("ROOT-RULE: run tests with make verify."));
+    let first = user_messages(&requests[0]);
+    assert!(
+        !first
+            .last()
+            .unwrap()
+            .contains("project guidance was updated")
+    );
+    let second = user_messages(&requests[1]);
+    assert!(
+        second
+            .last()
+            .unwrap()
+            .contains("project guidance was updated since the last message (AGENTS.md changed)"),
+        "{second:?}"
+    );
+}
