@@ -46,9 +46,9 @@ enum Stage {
 }
 
 /// Playback speed against the prototype's timeline, whose holds sum to
-/// 1474 ms at 1.0; raise it to play faster, lower it to play slower. At 1.1
-/// it takes 1340 ms, 10% quicker than the prototype.
-const PACE: f64 = 1.1;
+/// 1474 ms at 1.0; raise it to play faster, lower it to play slower. At 0.88
+/// it takes 1675 ms, 25% slower than the previous 1.1 pace.
+const PACE: f64 = 0.88;
 
 /// Each stage and how long it holds in the prototype at speed 1, in
 /// milliseconds. `PACE` divides every hold, so proportions never change.
@@ -322,9 +322,9 @@ mod tests {
     }
 
     #[test]
-    fn the_whole_animation_takes_about_1340_ms() {
+    fn the_whole_animation_takes_about_1675_ms() {
         let total = duration().as_millis();
-        assert!((1290..=1390).contains(&total), "{total} ms");
+        assert!((1625..=1725).contains(&total), "{total} ms");
         assert_eq!(start_of(TIMELINE.len()), duration());
     }
 
