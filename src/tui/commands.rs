@@ -11,6 +11,7 @@ pub(super) enum Command {
     /// `None` returns to the model's own default.
     SetEffort(Option<String>),
     Clear,
+    Guidance,
 }
 
 /// What Enter does with the input.
@@ -37,7 +38,7 @@ impl CommandSpec {
 }
 
 /// One table drives help, footer hints, and Tab completion.
-const COMMANDS: [CommandSpec; 4] = [
+const COMMANDS: [CommandSpec; 5] = [
     CommandSpec {
         name: "/model",
         argument: Some("[id]"),
@@ -52,6 +53,11 @@ const COMMANDS: [CommandSpec; 4] = [
         name: "/clear",
         argument: None,
         summary: "Start a new conversation",
+    },
+    CommandSpec {
+        name: "/guidance",
+        argument: None,
+        summary: "List the project guidance files and their status",
     },
     CommandSpec {
         name: "/help",
@@ -82,7 +88,8 @@ pub(super) fn parse_submission(input: &str) -> Submission {
     let command = match (name, argument) {
         ("/help", "") => Command::Help,
         ("/clear", "") => Command::Clear,
-        ("/help" | "/clear", _) => {
+        ("/guidance", "") => Command::Guidance,
+        ("/help" | "/clear" | "/guidance", _) => {
             return Submission::Invalid(format!("{name} does not take an argument."));
         }
         ("/model", "") => Command::ShowModel,
@@ -197,6 +204,7 @@ mod tests {
     fn commands_parse_with_and_without_arguments() {
         assert_eq!(command("/help"), Command::Help);
         assert_eq!(command("/clear"), Command::Clear);
+        assert_eq!(command("/guidance"), Command::Guidance);
         assert_eq!(command("/model"), Command::ShowModel);
         assert_eq!(
             command("/model qwen3:8b"),
@@ -299,7 +307,8 @@ mod tests {
         let footer_text = |input: &str| rows_text(&wrap(&footer(input), 200)).remove(0);
         assert!(footer_text("").starts_with("Enter send"));
         assert!(footer_text("/e").starts_with("/effort [level] · Show or set"));
-        assert!(footer_text("/").contains("/model  /effort  /clear  /help"));
+        assert!(footer_text("/").contains("/model  /effort  /clear  /guidance  /help"));
+        assert!(footer_text("/g").starts_with("/guidance · List the project guidance"));
         assert!(footer_text("/z").starts_with("No matching command"));
     }
 

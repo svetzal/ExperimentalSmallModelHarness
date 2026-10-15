@@ -5,6 +5,7 @@ use super::picker::{Panel, Picker, Purpose};
 use super::status_bar::{GitStatus, git_status};
 use super::styled::Role;
 use crate::agent::Provider;
+use crate::guidance::{Discovery, Scope, Status};
 use crate::preferences::Preferences;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +32,12 @@ pub(super) struct Session {
     /// The project's git state for the status bar, `None` outside a repository.
     pub(super) git: Option<GitStatus>,
     git_refresh: Option<JoinHandle<Option<GitStatus>>>,
+    /// The configuration file the session was opened with; the user-level
+    /// guidance file sits beside it.
+    pub(super) config_path: Option<PathBuf>,
+    /// The project guidance the next message will carry, refreshed like git.
+    pub(super) guidance: Discovery,
+    guidance_refresh: Option<JoinHandle<Discovery>>,
 }
 
 impl Session {
@@ -42,7 +49,53 @@ impl Session {
             model_listing: None,
             git: None,
             git_refresh: None,
+            config_path: None,
+            guidance: Discovery::default(),
+            guidance_refresh: None,
         }
+    }
+
+    /// What discovery needs: the project, the user-level file beside the
+    /// config, and a budget for the current model.
+    fn guidance_inputs(&self) -> (PathBuf, Option<PathBuf>, usize) {
+        let user_file = self
+            .config_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|directory| directory.join("AGENTS.md"));
+        let budget = crate::guidance::budget_for(crate::cli::model_context_window_tokens(
+            &self.settings.model,
+        ));
+        (self.root.clone(), user_file, budget)
+    }
+
+    /// Discover project guidance off the render loop, as the worker will.
+    pub(super) fn refresh_guidance(&mut self) {
+        if self.guidance_refresh.is_none() {
+            let (root, user_file, budget) = self.guidance_inputs();
+            self.guidance_refresh = Some(tokio::task::spawn_blocking(move || {
+                discover_guidance(&root, user_file.as_deref(), budget)
+            }));
+        }
+    }
+
+    pub(super) async fn finish_guidance_refresh(&mut self) {
+        if let Some(refresh) = self
+            .guidance_refresh
+            .take_if(|refresh| refresh.is_finished())
+            && let Ok(discovery) = refresh.await
+        {
+            self.guidance = discovery;
+        }
+    }
+
+    /// Guidance files in context, for the status bar.
+    pub(super) fn guidance_count(&self) -> usize {
+        self.guidance
+            .files
+            .iter()
+            .filter(|file| matches!(file.status, Status::Included | Status::Truncated { .. }))
+            .count()
     }
 
     /// Ask git for the project state without blocking the view. Called at
@@ -76,10 +129,19 @@ impl Session {
 pub(super) fn run_command(view: &mut View, session: &mut Session, command: Command) {
     let output = match command {
         Command::Help => help_text(),
+        Command::Guidance => {
+            // Asked for directly, so read the files now rather than show a
+            // result that may be a moment old.
+            let (root, user_file, budget) = session.guidance_inputs();
+            session.guidance = discover_guidance(&root, user_file.as_deref(), budget);
+            guidance_report(&session.guidance, &view.guidance_shown)
+        }
         Command::Clear => {
             session.state = None;
             view.context = None;
+            view.guidance_shown.clear();
             session.refresh_git();
+            session.refresh_guidance();
             view.history.reset();
             view.history.start_block();
             view.history
@@ -139,6 +201,62 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
         }
     };
     view.history.push(Role::System, &output);
+}
+
+fn discover_guidance(
+    root: &std::path::Path,
+    user_file: Option<&std::path::Path>,
+    budget: usize,
+) -> Discovery {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    crate::guidance::discover(&crate::guidance::Sources {
+        project: root,
+        home: home.as_deref(),
+        user_file,
+        budget_tokens: budget,
+    })
+}
+
+/// Each guidance file with its size and status, most general first.
+fn guidance_report(discovery: &Discovery, shown: &std::collections::BTreeSet<String>) -> String {
+    if discovery.files.is_empty() && discovery.nested.is_empty() {
+        return "No project guidance found. Microgentic reads AGENTS.md (or CLAUDE.md) from this directory up to the repository root, and from beside config.json.\n".into();
+    }
+    let mut text = String::from("Project guidance, most general first:\n");
+    for file in discovery.files.iter().chain(&discovery.nested) {
+        let status = match (&file.status, &file.scope) {
+            (Status::Included, _) => "included".to_owned(),
+            (
+                Status::Truncated {
+                    shown_chars,
+                    total_chars,
+                },
+                _,
+            ) => format!("truncated to {shown_chars} of {total_chars} characters"),
+            (Status::Pending, Scope::Nested { directory }) if shown.contains(&file.shown) => {
+                format!("nested, shown for {directory}/")
+            }
+            (Status::Pending, Scope::Nested { directory }) => {
+                format!("nested, shown when work reaches {directory}/")
+            }
+            (Status::Pending, _) => "pending".to_owned(),
+            (Status::Excluded { reason }, _) => format!("left out: {reason}"),
+        };
+        text.push_str(&format!(
+            "  {}  {}  {status}\n",
+            file.shown,
+            size(file.bytes)
+        ));
+    }
+    text
+}
+
+fn size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
 }
 
 /// Open the model picker once the provider's list arrives. An empty list or
@@ -228,6 +346,7 @@ mod tests {
             status: Status::new(Phase::Ready, "Ready"),
             panel: None,
             context: None,
+            guidance_shown: Default::default(),
         };
         view.history.reset();
         view
@@ -240,6 +359,70 @@ mod tests {
             .iter()
             .map(|(_, text)| text.as_str())
             .collect()
+    }
+
+    #[test]
+    fn the_guidance_report_lists_files_sizes_and_status() {
+        use crate::guidance::{GuidanceFile, Status as Found};
+        let file = |shown: &str, scope: Scope, status: Found, bytes: u64| GuidanceFile {
+            shown: shown.into(),
+            scope,
+            sha256: String::new(),
+            bytes,
+            status,
+            text: String::new(),
+        };
+        let discovery = Discovery {
+            files: vec![
+                file(
+                    "~/.config/microgentic/AGENTS.md",
+                    Scope::User,
+                    Found::Included,
+                    300,
+                ),
+                file(
+                    "AGENTS.md",
+                    Scope::Directory {
+                        levels_up: 0,
+                        repository_root: true,
+                    },
+                    Found::Truncated {
+                        shown_chars: 100,
+                        total_chars: 400,
+                    },
+                    4_096,
+                ),
+            ],
+            nested: vec![
+                file(
+                    "docs/AGENTS.md",
+                    Scope::Nested {
+                        directory: "docs".into(),
+                    },
+                    Found::Pending,
+                    50,
+                ),
+                file(
+                    "web/AGENTS.md",
+                    Scope::Nested {
+                        directory: "web".into(),
+                    },
+                    Found::Pending,
+                    60,
+                ),
+            ],
+            budget_tokens: 8_000,
+        };
+        let shown = std::collections::BTreeSet::from(["web/AGENTS.md".to_owned()]);
+        let report = guidance_report(&discovery, &shown);
+        assert_eq!(
+            report,
+            "Project guidance, most general first:\n  ~/.config/microgentic/AGENTS.md  300 B  included\n  AGENTS.md  4.0 KB  truncated to 100 of 400 characters\n  docs/AGENTS.md  50 B  nested, shown when work reaches docs/\n  web/AGENTS.md  60 B  nested, shown for web/\n"
+        );
+        assert!(
+            guidance_report(&Discovery::default(), &shown)
+                .starts_with("No project guidance found.")
+        );
     }
 
     #[test]

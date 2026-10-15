@@ -124,6 +124,11 @@ pub struct AgentRunConfig {
     /// it; benchmark and historical runs leave it off so their provider
     /// requests stay identical.
     pub calculator: bool,
+    /// Discover `AGENTS.md` guidance in the project. Everyday `run` and the
+    /// TUI conversation set it; benchmark and historical runs never do.
+    pub project_guidance: bool,
+    /// The user-level guidance file beside `config.json`, when discovery is on.
+    pub user_guidance_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -691,6 +696,37 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         system_prompt.push_str(crate::calculator::GUIDANCE);
         tools.push(Box::new(crate::calculator::CalculateTool));
     }
+    // Project guidance is text in the system context. It is read after the
+    // tool set is fixed and never changes tools, permissions or stop policy.
+    let mut guidance_notice = None;
+    let nested_guidance = if config.project_guidance {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let discovery = crate::guidance::discover(&crate::guidance::Sources {
+            project: &tool_root,
+            home: home.as_deref(),
+            user_file: config.user_guidance_file.as_deref(),
+            budget_tokens: crate::guidance::budget_for(config.context_window_tokens),
+        });
+        trace.event(
+            "context.guidance.discovered",
+            crate::guidance::trace_payload(&discovery),
+        )?;
+        if let Some(section) = crate::guidance::system_section(&discovery) {
+            system_prompt.push_str(&section);
+        }
+        if let Some(session) = &conversation {
+            guidance_notice = session.note_guidance(crate::guidance::fingerprints(&discovery));
+            if let Some(notice) = &guidance_notice {
+                trace.event(
+                    "context.guidance.changed",
+                    serde_json::json!({ "notice": notice }),
+                )?;
+            }
+        }
+        Some(crate::guidance::NestedGuidance::new(&discovery))
+    } else {
+        None
+    };
     let repair_tools = tools
         .iter()
         .filter(|tool| {
@@ -779,6 +815,10 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     let protected_users = conversation
         .as_ref()
         .map_or(1, |session| session.protected_users());
+    let worker_message = match guidance_notice {
+        Some(notice) => format!("{worker_message}\n\n{notice}"),
+        None => worker_message,
+    };
     let mut messages = if let Some(session) = &conversation {
         session.initial_messages(system_prompt, worker_message)
     } else {
@@ -898,6 +938,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
                 && policy_before_turn.total_write_operations
                     > requested_validation_completed_write_operations,
             requested_validation_ledger: requested_validation_ledger.clone(),
+            nested_guidance: nested_guidance.as_ref(),
         })
         .await
         {
@@ -2123,6 +2164,9 @@ struct StreamResponseRequest<'a, G: LlmGateway + ?Sized> {
     requested_validation_commands: &'a [String],
     requested_validation_pending_after_write: bool,
     requested_validation_ledger: RequestedValidationLedger,
+    /// Nested project guidance to show when the model first works in its
+    /// directory. `None` outside everyday runs.
+    nested_guidance: Option<&'a crate::guidance::NestedGuidance>,
 }
 
 #[derive(Debug)]
@@ -2244,6 +2288,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         requested_validation_commands,
         requested_validation_pending_after_write,
         requested_validation_ledger,
+        nested_guidance,
     } = request;
     let mut validation_repair_active = validation_repair_active;
     trace.event(
@@ -3013,6 +3058,30 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 )));
                 final_response_only_after_validation = Some(validation);
                 requested_validation_pending_after_write = false;
+            }
+        }
+        if let Some(nested) = nested_guidance {
+            let arguments: Vec<_> = accumulated_tool_calls
+                .iter()
+                .map(|call| &call.arguments)
+                .collect();
+            for file in nested.take_for(&arguments) {
+                let message = crate::guidance::nested_message(&file);
+                trace.event(
+                    "context.guidance.nested_injected",
+                    serde_json::json!({
+                        "turn": turn,
+                        "llm_call_depth": depth,
+                        "path": &file.shown,
+                        "applies_to": match &file.scope {
+                            crate::guidance::Scope::Nested { directory } => directory.as_str(),
+                            _ => ".",
+                        },
+                        "sha256": &file.sha256,
+                        "chars": message.chars().count(),
+                    }),
+                )?;
+                current_messages.push(LlmMessage::user(message));
             }
         }
         trace.conversation_checkpoint(&current_messages);
@@ -7836,6 +7905,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap_err();
@@ -7898,6 +7968,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap_err();
@@ -7950,6 +8021,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap_err();
@@ -7997,6 +8069,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -8052,6 +8125,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -8110,6 +8184,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -8159,6 +8234,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -8226,6 +8302,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -8285,6 +8362,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -8343,6 +8421,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -8404,6 +8483,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap_err();
@@ -8503,6 +8583,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -8595,6 +8676,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -8650,6 +8732,7 @@ mod tests {
             requested_validation_commands: &[],
             requested_validation_pending_after_write: false,
             requested_validation_ledger: RequestedValidationLedger::new(Vec::new()),
+            nested_guidance: None,
         })
         .await
         .unwrap();
@@ -9026,6 +9109,8 @@ mod tests {
             semantic_advisor_model: None,
             acceptance_ledger: false,
             calculator: false,
+            project_guidance: false,
+            user_guidance_file: None,
         };
         let error = anyhow::anyhow!("HTTP error: unexpected EOF during chunk size line");
 
@@ -10639,6 +10724,8 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: true,
                     calculator: false,
+                    project_guidance: false,
+                    user_guidance_file: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10681,6 +10768,8 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
                     calculator: false,
+                    project_guidance: false,
+                    user_guidance_file: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10723,6 +10812,8 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
                     calculator: false,
+                    project_guidance: false,
+                    user_guidance_file: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10790,6 +10881,8 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
                     calculator: false,
+                    project_guidance: false,
+                    user_guidance_file: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10831,6 +10924,8 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
                     calculator: false,
+                    project_guidance: false,
+                    user_guidance_file: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10872,6 +10967,8 @@ mod tests {
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
                     calculator: false,
+                    project_guidance: false,
+                    user_guidance_file: None,
                 },
                 gateway,
                 self.workspace.clone(),
@@ -10909,6 +11006,8 @@ mod tests {
                     semantic_advisor_model: Some("context-curator-model".to_string()),
                     acceptance_ledger: false,
                     calculator: false,
+                    project_guidance: false,
+                    user_guidance_file: None,
                 },
                 gateway,
                 self.workspace.clone(),

@@ -17,6 +17,8 @@ with tempfile.TemporaryDirectory(prefix="microgentic-continuity-") as temporary:
     base = Path(temporary)
     root = base / "project"
     root.mkdir()
+    # Project guidance must never reach benchmark or contract runs.
+    (root / "AGENTS.md").write_text("PROJECT-GUIDANCE-SENTINEL: benchmark runs must never see this.\n")
     contract = base / "contract.json"
     prompt = "Inspect the project with list_tree, then finish. Unicode 世界."
     contract.write_text(json.dumps(dict(profile=dict(id="terminal_work", version="terminal_work_profile.v1"),
@@ -105,6 +107,7 @@ with tempfile.TemporaryDirectory(prefix="microgentic-continuity-") as temporary:
                         assert requests[:2] == requests[2:], "context leaked between task attempts"
                         assert summary["stop_reason"] == "consecutive_unchanged_attempts"
                         assert summary["confirmed_exact_success"] is False
+                    assert "PROJECT-GUIDANCE-SENTINEL" not in json.dumps(requests), "project guidance reached a benchmark request"
                     captured.append((requests, packets, ledgers, summary))
                 finally:
                     server.shutdown()

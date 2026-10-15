@@ -319,3 +319,22 @@ fn calculate_answers_batches_and_stays_out_of_benchmark_runs() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn project_guidance_reaches_everyday_runs_and_conversations() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/project_guidance.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_microgentic"))
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -124,6 +124,8 @@ struct View {
     /// The latest context estimate for this conversation; `None` until the
     /// first request and after a new conversation starts.
     context: Option<ContextUsage>,
+    /// Nested guidance files the model has been shown in this conversation.
+    guidance_shown: std::collections::BTreeSet<String>,
 }
 
 /// Give a key to the open panel. Returns false when no panel is open, so the
@@ -201,6 +203,7 @@ fn bar_state<'a>(view: &View, session: &'a Session) -> BarState<'a> {
             .and_then(|name| name.to_str())
             .unwrap_or("/"),
         git: session.git.as_ref(),
+        guidance: session.guidance_count(),
         context: view.context.or(window.map(|window| ContextUsage {
             used_tokens: 0,
             window_tokens: Some(window),
@@ -249,6 +252,10 @@ fn submit(view: &mut View, session: &mut Session, active: &mut Option<ActiveRun>
 /// Start a worker for one message with the session's current settings.
 fn start_reply(view: &mut View, session: &mut Session, prompt: &str) -> Result<Option<ActiveRun>> {
     let mut command = tokio::process::Command::new(std::env::current_exe()?);
+    // The worker finds the same user-level guidance beside this config file.
+    if let Some(config) = &session.config_path {
+        command.arg("--config").arg(config);
+    }
     let state = match &session.state {
         Some(state) => state,
         None => session.state.insert(create_session(&session.root)?),
@@ -402,7 +409,9 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
         std::env::current_dir()?,
         crate::preferences::load(&path)?.unwrap_or_default(),
     );
+    session.config_path = Some(path.clone());
     session.refresh_git();
+    session.refresh_guidance();
     let palette = Palette::from_no_color(std::env::var_os("NO_COLOR").as_deref());
     let _screen = Screen::enter()?;
     let leaving = Arc::new(AtomicBool::new(false));
@@ -423,6 +432,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
         status: Status::new(Phase::Ready, "Ready"),
         panel: None,
         context: None,
+        guidance_shown: Default::default(),
     };
     view.history.reset();
     let mut active: Option<ActiveRun> = None;
@@ -479,6 +489,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 view.history.end_thinking(Ending::Stopped);
                 view.history.stop_running();
                 session.refresh_git();
+                session.refresh_guidance();
                 view.scroll = 0;
             }
             if let Some(run) = &active {
@@ -497,6 +508,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
             }
             finish_model_listing(&mut view, &mut session).await;
             session.finish_git_refresh().await;
+            session.finish_guidance_refresh().await;
             // The spinner frame joins the signature only while a call runs, so
             // an idle screen does not redraw.
             let animating =
@@ -519,6 +531,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                     session.settings.model.clone(),
                     session.settings.reasoning_effort.clone(),
                     session.git.clone(),
+                    session.guidance_count(),
                     view.context,
                 ),
                 view.history.revision,
@@ -667,6 +680,9 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
         ConversationEvent::ThinkingDelta { text } => {
             view.history.think(&text);
         }
+        ConversationEvent::GuidanceInjected { path } => {
+            view.guidance_shown.insert(path);
+        }
         ConversationEvent::Content { text } => {
             view.history.push_reply(&text);
             run.streamed_text.push_str(&text);
@@ -785,6 +801,7 @@ mod tests {
             status: Status::new(Phase::Ready, "Ready"),
             panel: None,
             context: None,
+            guidance_shown: Default::default(),
         };
         view.history.reset();
         view

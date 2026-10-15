@@ -7,6 +7,7 @@ pub mod calculator;
 pub mod cli;
 pub mod contract;
 mod conversation;
+pub mod guidance;
 pub mod initial_context;
 pub mod preferences;
 pub mod profile;

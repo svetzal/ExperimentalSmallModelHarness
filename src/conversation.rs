@@ -26,6 +26,10 @@ pub(crate) enum ConversationEvent {
     ThinkingDelta {
         text: String,
     },
+    /// Nested project guidance was shown to the model.
+    GuidanceInjected {
+        path: String,
+    },
     /// A model-requested tool call, before it runs. `call_id` is empty when the
     /// provider gave none; the view then matches results by name and order.
     ToolStarted {
@@ -68,6 +72,9 @@ struct SessionState {
     preserve_reasoning: bool,
     messages: Vec<LlmMessage>,
     last_error: Option<String>,
+    /// Paths and hashes of the project guidance the last exchange used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    guidance: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -135,6 +142,7 @@ impl ConversationRun {
                 preserve_reasoning: config.preserve_reasoning,
                 messages: Vec::new(),
                 last_error: None,
+                guidance: Vec::new(),
             },
             Err(error) => return Err(error.into()),
         };
@@ -173,6 +181,20 @@ impl ConversationRun {
             omitted_exchanges,
             reply_completed: AtomicBool::new(false),
         })
+    }
+
+    /// Record this exchange's guidance, and return a notice for the model
+    /// when it differs from what the conversation used before. The first
+    /// exchange needs no notice.
+    pub(crate) fn note_guidance(&self, current: Vec<(String, String)>) -> Option<String> {
+        let mut state = self.state.lock().expect("conversation mutex poisoned");
+        let notice = if state.messages.is_empty() {
+            None
+        } else {
+            crate::guidance::change_notice(&state.guidance, &current)
+        };
+        state.guidance = current;
+        notice
     }
 
     pub(crate) fn protected_users(&self) -> usize {
@@ -267,6 +289,12 @@ impl ConversationRun {
     }
 
     pub(crate) fn observe(&self, kind: &str, payload: &Value) {
+        if kind == "context.guidance.nested_injected" {
+            self.emit(ConversationEvent::GuidanceInjected {
+                path: payload["path"].as_str().unwrap_or_default().into(),
+            });
+            return;
+        }
         let message = match kind {
             "llm.stream.thinking" => {
                 format!("Thinking · {} characters", payload["total_thinking_chars"])
@@ -550,6 +578,7 @@ mod tests {
                 preserve_reasoning: true,
                 messages: history,
                 last_error: None,
+                guidance: Vec::new(),
             }),
             prompt: "new actual prompt".into(),
             protected_users,

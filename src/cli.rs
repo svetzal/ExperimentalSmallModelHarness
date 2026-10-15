@@ -79,6 +79,11 @@ struct RunArgs {
     #[arg(long)]
     json: bool,
 
+    /// Do not read AGENTS.md or CLAUDE.md guidance from the project or from
+    /// the user configuration directory.
+    #[arg(long)]
+    no_project_guidance: bool,
+
     /// Advanced: contract/goal base directory; independent of the tool root (--dir).
     #[arg(long, help_heading = "Advanced / research")]
     experiment: Option<PathBuf>,
@@ -281,6 +286,8 @@ impl RunArgs {
             semantic_advisor_model: self.semantic_advisor_model,
             acceptance_ledger: self.acceptance_ledger,
             calculator: false,
+            project_guidance: false,
+            user_guidance_file: None,
         })
     }
 }
@@ -1082,6 +1089,9 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 }
 
 fn prepare_benchmark_run(mut run: RunArgs) -> Result<AgentRunConfig> {
+    if run.no_project_guidance {
+        bail!("benchmark mode never reads project guidance; remove --no-project-guidance");
+    }
     if run.prompt.is_some() {
         bail!(
             "benchmark mode reads task files; use --goal task.md or --contract contract.json instead of --prompt"
@@ -1214,10 +1224,18 @@ fn prepare_run_with_mode(
         *trace = absolute(trace)?;
     }
     std::env::set_current_dir(root)?;
+    let no_project_guidance = run.no_project_guidance;
     let mut config = run.into_config()?;
-    // Everyday runs and the conversation get the calculator; advanced and
-    // historical invocations keep their exact tool set.
-    config.calculator = conversational || (!legacy && !advanced);
+    // Everyday runs and the conversation get the calculator and project
+    // guidance; advanced and historical invocations keep their exact requests.
+    let everyday = conversational || (!legacy && !advanced);
+    config.calculator = everyday;
+    config.project_guidance = everyday && !no_project_guidance;
+    if config.project_guidance {
+        config.user_guidance_file = crate::preferences::config_path(config_path)?
+            .parent()
+            .map(|directory| directory.join("AGENTS.md"));
+    }
     Ok(config)
 }
 

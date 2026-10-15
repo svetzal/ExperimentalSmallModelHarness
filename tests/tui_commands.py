@@ -22,6 +22,7 @@ SGR = re.compile(rb"\x1b\[[0-9;]*m")
 def exercise(provider):
     root = base / provider / "project"
     root.mkdir(parents=True)
+    (root / "AGENTS.md").write_text("Run tests with make check.\n")
     state, config = base / provider / "state", base / provider / "config.json"
     saved_config = json.dumps(dict(schema_version="microgentic_config.v1", provider=provider,
                                    model="test-model", reasoning_effort="low"))
@@ -90,7 +91,7 @@ def exercise(provider):
         while needle not in data and time.monotonic() < deadline:
             if select.select([master], [], [], .05)[0]:
                 data = SGR.sub(b"", data + os.read(master, 65536))
-        assert needle in data, (needle, data[-6000:], errors)
+        assert needle in data, (needle, re.sub(rb"\x1b\[[0-9;]*H", b"\n", data.split(b"\x1b[2J")[-1]).replace("─".encode(), b"")[-3000:], errors)
         end = data.index(needle) + len(needle)
         pending = data[end:]
         return data[:end]
@@ -119,6 +120,10 @@ def exercise(provider):
         wait_for(b"Enter send")
         type_line("/help")
         wait_for(b"Start a new conversation")
+        type_line("/guidance")
+        wait_for(b"Project guidance, most general first:")
+        wait_for(b"  AGENTS.md  27 B  included")
+        wait_for("📜 1".encode())
         type_line("/nope")
         wait_for(b"Unknown command /nope. Type /help to see commands.")
         type_line("/effort extreme")
