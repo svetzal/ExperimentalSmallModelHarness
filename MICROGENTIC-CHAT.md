@@ -20,7 +20,8 @@ at startup. Tools remain available for requests and answers that need them.
 Each private worker uses a scoped internal contract with the message as guidance
 and no automatically inferred probes. Shell fences in discussion are not parsed
 into executor-owned checks. Public task `run` and benchmark contract resolution
-retain their existing behavior.
+retain their existing behavior. (Since 2026-10-15, everyday `run` uses this reply
+path too; see [everyday run replies](EVERYDAY-RUN-2026-10.md).)
 
 ## Reply completion and task authority
 

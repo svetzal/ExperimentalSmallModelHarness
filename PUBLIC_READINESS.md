@@ -138,14 +138,20 @@ Source seams: [preferences](src/preferences.rs), [setup](src/cli.rs),
 
 ### 3. Understand the project and the request
 
-Plain `run` still enters the historical task runtime; the TUI uses conversational
-guidance and natural reply completion. Everyday `run` and the TUI discover
+Everyday `run` and the TUI use conversational guidance and natural reply
+completion; `run` with an experiment, goal or contract keeps the task runtime.
+Everyday `run` and the TUI discover
 `AGENTS.md` guidance; benchmark runs still take guidance only from the explicit
 initial-context catalog.
 
-- [ ] Specify everyday behavior for greetings, explanations, reviews, and edits
+- [x] Specify everyday behavior for greetings, explanations, reviews, and edits
   across `run` and TUI. Keep stdin reference material distinct from instructions.
   Make any prompt or completion-policy change explicit; preserve benchmark mode.
+  Note: everyday `run` now shares the TUI's reply path (README `run` section,
+  [everyday run replies](EVERYDAY-RUN-2026-10.md)). Scripted gateway tests
+  cover greetings, a one-tool answer, an edit with a check, and a review with
+  stdin reference material; live Qwen trials covered a greeting, arithmetic
+  and an edit, not a review. Benchmark requests match v0.3.0.
 - [x] Add bounded hierarchical `AGENTS.md` discovery. The ancestor boundary is
   the Git root or `$HOME`; nested files apply below their directory and are
   delivered on first use. Traces record paths, hashes, sizes, inclusion

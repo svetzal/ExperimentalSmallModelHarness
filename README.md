@@ -230,7 +230,7 @@ Install the canonical command from this checkout:
 cargo install --path . --bin microgentic
 ```
 
-Configure defaults, open the terminal interface, or submit a plain-mode task:
+Configure defaults, open the terminal interface, or send one message with `run`:
 
 ```sh
 microgentic setup --apply
@@ -244,7 +244,24 @@ microgentic run --prompt "Fix the parser" --dir ./project --json
 
 The bare command needs terminal stdin and stdout. `run` never opens the TUI.
 Without `--prompt`, it reads stdin through EOF. With `--prompt`, piped stdin is
-labeled reference material; its shell fences do not declare validation probes.
+labeled reference material, not instructions.
+
+An everyday `run`, without `--experiment`, `--goal` or `--contract`, behaves
+like one TUI exchange. The prompt reaches the model as written, under the same
+conversational guidance, so a greeting gets a greeting and a question gets an
+answer. Tools stay available, and the run continues while the model calls
+them, so a request for work still does the work. The first visible reply
+without tool calls ends the run, after the usual checks for unvalidated source
+changes, failed validation, Git stashes and declared probes. No DONE or FAIL
+token is needed, and there is no "continue" prompt after a reply. Shell fences
+in the prompt or in stdin are discussion, not checks that Microgentic runs.
+The reply goes to stdout without surrounding blank lines, and the exit code is
+0. The streamed reply and diagnostics go to stderr.
+
+With `--experiment`, `--goal` or `--contract`, `run` keeps the task path: the
+task template, DONE/FAIL, continuation prompts and declared probes. The
+`adaptive-agent-harness` executable and `benchmark` commands always use it.
+See [everyday run trials](EVERYDAY-RUN-2026-10.md) for request counts.
 Empty prompts, duplicate `--prompt` flags, positional prompts, and invalid UTF-8
 fail before a provider call. Stdin is limited to 1 MiB.
 
@@ -797,6 +814,8 @@ Live trials of the `calculate` tool, and the tuning they led to, are recorded
 in [`CALCULATOR-TRIALS-2026-10.md`](CALCULATOR-TRIALS-2026-10.md).
 Live trials of project guidance discovery are recorded in
 [`GUIDANCE-TRIALS-2026-10.md`](GUIDANCE-TRIALS-2026-10.md).
+Everyday `run` replies, with request counts and live trials, are recorded in
+[`EVERYDAY-RUN-2026-10.md`](EVERYDAY-RUN-2026-10.md).
 
 Experiments are intentionally run from separate, scoped workspaces. Generated
 agents should see their work tree and task-relevant guidance, not experiment
