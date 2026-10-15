@@ -139,22 +139,29 @@ Source seams: [preferences](src/preferences.rs), [setup](src/cli.rs),
 ### 3. Understand the project and the request
 
 Plain `run` still enters the historical task runtime; the TUI uses conversational
-guidance and natural reply completion. Project instructions are currently supplied
-through an explicit initial-context catalog rather than automatic `AGENTS.md` discovery.
+guidance and natural reply completion. Everyday `run` and the TUI discover
+`AGENTS.md` guidance; benchmark runs still take guidance only from the explicit
+initial-context catalog.
 
 - [ ] Specify everyday behavior for greetings, explanations, reviews, and edits
   across `run` and TUI. Keep stdin reference material distinct from instructions.
   Make any prompt or completion-policy change explicit; preserve benchmark mode.
-- [ ] Add bounded hierarchical `AGENTS.md` discovery through the existing context
-  assembler. Define the ancestor boundary and nested-directory applicability.
-  Record paths, hashes, exclusions, precedence, and included text in trace evidence.
-- [ ] Treat project guidance as input. It must not silently change credential
-  destinations, grant shell permissions, or replace declared validation authority.
-  Detect changed guidance between exchanges and account for context limits.
+- [x] Add bounded hierarchical `AGENTS.md` discovery. The ancestor boundary is
+  the Git root or `$HOME`; nested files apply below their directory and are
+  delivered on first use. Traces record paths, hashes, sizes, inclusion
+  decisions, and nested deliveries. Note: discovery lives beside the system
+  prompt rather than inside the initial-context assembler, which stays the
+  catalog's; the included text itself is in the exact provider snapshot.
+- [x] Treat project guidance as input. Tools, permissions, validation, and stop
+  policy are fixed before guidance is read. Changed guidance is detected between
+  exchanges and the model is told; guidance has its own token budget.
 - [ ] Offer reviewable project checks without treating quoted shell commands or
   inferred checks as executor-owned acceptance probes. Report unchecked work honestly.
 - [ ] Test an existing dirty repository with nested guidance, ignored files,
   follow-up requests, and explicit benchmark isolation using scripted gateways.
+  Progress: scripted gateway tests cover nested guidance delivery, guidance
+  changes between follow-up requests, and benchmark isolation; unit tests
+  cover ignored files. A dirty-repository case is not tested yet.
 
 This slice changes model context. Register the hypothesis and comparison cell
 before making capability claims; preserve exact provider requests for causal review.
@@ -447,9 +454,11 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
   and avoid replaying completed tools. Refuse uncertain active-provider ownership.
   Define interruption and process-tree cleanup during planning, tools, checks,
   and recovery admission, as well as worker generation.
-- [ ] **Discover project guidance.** Add bounded hierarchical `AGENTS.md`
-  discovery through the context assembler. Document scope, precedence, trust,
-  and exclusions; trace paths, hashes, and inclusion decisions.
+- [x] **Discover project guidance.** Bounded hierarchical `AGENTS.md`
+  discovery for the TUI and everyday `run`, documented in the README (scope,
+  precedence, trust, exclusions) and traced (paths, hashes, inclusion
+  decisions). Follow-ups: `@path` imports are not expanded, and nested
+  guidance is delivered once per exchange rather than once per conversation.
 - [ ] **Support existing repositories.** Preserve dirty files and baseline
   stashes; show a diff before discard. Make test/build selection reviewable and
   distinguish inferred checks from user-declared acceptance probes.

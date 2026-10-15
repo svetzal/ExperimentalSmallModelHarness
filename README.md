@@ -412,6 +412,50 @@ The main commands are:
 
 Use `cargo run -- <command> --help` for command-specific options.
 
+### Project guidance
+
+The TUI conversation and everyday `run` read project guidance from `AGENTS.md`
+files:
+
+- From the project directory up to the Git repository root, one file per
+  directory. A directory with no `AGENTS.md` can use `CLAUDE.md` instead.
+  Discovery never goes above the repository root or `$HOME`. Outside a Git
+  repository, only the project directory counts.
+- A user-level file beside `config.json`, at
+  `$XDG_CONFIG_HOME/microgentic/AGENTS.md` or `~/.config/microgentic/AGENTS.md`.
+- Nested `AGENTS.md` files in subdirectories below the project directory.
+  Discovery skips paths ignored by `.gitignore` and symbolic links that point
+  outside the repository.
+
+The files go into the system context under "Project guidance", most general
+first: the user-level file, then the repository root, then deeper directories.
+Where files conflict, the deeper file wins, and the framing tells the model
+so. Nested files are listed there by path. Each nested file is delivered, with
+its path, the first time a tool call in an exchange works with a file in its
+directory. `@path` imports in these files are not expanded.
+
+Guidance is limited to 8,000 estimated tokens, or an eighth of a smaller
+known context window, and each file to half of that. When the limit is
+reached, the most general files are cut first, with a note that names the file
+and how much was left out. A new message in a conversation reads the files
+again; if one changed, appeared or disappeared, the model is told.
+
+Guidance is information from the repository, not authority. The runtime
+decides the tools, permissions, validation, and stop policy before it reads
+guidance, and guidance text cannot change them. Each run's trace records a
+`context.guidance.discovered` event with every candidate file's path, SHA-256,
+size, and whether it was included, truncated, left out (with the reason), or
+held as nested guidance; nested deliveries and changes are traced too.
+
+`microgentic run --no-project-guidance` reads no guidance. In the TUI,
+`/guidance` lists the files with their sizes and status, and the status bar
+shows `📜` and a count when guidance is in context. When `run` also gets an
+`--initial-context-catalog`, the catalog's guidance stays in the task message,
+where it always was, and discovered guidance is in the system context. Both
+are traced. Benchmark runs, runs with an experiment, goal or contract, and the
+`adaptive-agent-harness` compatibility executable never read guidance; the
+catalog stays their only source.
+
 ### Calculator tool
 
 Small models make arithmetic slips, so conversations and everyday `run`
@@ -704,6 +748,8 @@ workspace mutations do.
 
 Live trials of the `calculate` tool, and the tuning they led to, are recorded
 in [`CALCULATOR-TRIALS-2026-10.md`](CALCULATOR-TRIALS-2026-10.md).
+Live trials of project guidance discovery are recorded in
+[`GUIDANCE-TRIALS-2026-10.md`](GUIDANCE-TRIALS-2026-10.md).
 
 Experiments are intentionally run from separate, scoped workspaces. Generated
 agents should see their work tree and task-relevant guidance, not experiment
