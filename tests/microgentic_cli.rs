@@ -229,3 +229,20 @@ fn tui_shows_each_tool_call_as_one_live_line() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn tui_status_bar_shows_settings_git_state_and_context_fill() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tui_status.py"))
+        .arg(env!("CARGO_BIN_EXE_microgentic"))
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

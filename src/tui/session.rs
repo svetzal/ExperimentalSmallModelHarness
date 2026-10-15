@@ -2,6 +2,7 @@
 use super::View;
 use super::commands::{Command, EFFORT_CHOICES, help_text};
 use super::picker::{Panel, Picker, Purpose};
+use super::status_bar::{GitStatus, git_status};
 use super::styled::Role;
 use crate::agent::Provider;
 use crate::preferences::Preferences;
@@ -27,9 +28,38 @@ pub(super) struct Session {
     /// effort change, so the next message starts a new conversation.
     pub(super) state: Option<PathBuf>,
     pub(super) model_listing: Option<JoinHandle<Result<Vec<String>, String>>>,
+    /// The project's git state for the status bar, `None` outside a repository.
+    pub(super) git: Option<GitStatus>,
+    git_refresh: Option<JoinHandle<Option<GitStatus>>>,
 }
 
 impl Session {
+    pub(super) fn new(root: PathBuf, settings: Preferences) -> Self {
+        Self {
+            root,
+            settings,
+            state: None,
+            model_listing: None,
+            git: None,
+            git_refresh: None,
+        }
+    }
+
+    /// Ask git for the project state without blocking the view. Called at
+    /// start, after each exchange, and after `/clear`; never on a timer.
+    pub(super) fn refresh_git(&mut self) {
+        if self.git_refresh.is_none() {
+            let root = self.root.clone();
+            self.git_refresh = Some(tokio::spawn(async move { git_status(&root).await }));
+        }
+    }
+
+    pub(super) async fn finish_git_refresh(&mut self) {
+        if let Some(refresh) = self.git_refresh.take_if(|refresh| refresh.is_finished()) {
+            self.git = refresh.await.ok().flatten();
+        }
+    }
+
     /// The worker binds a conversation to its model and effort, so a change
     /// starts a new conversation. Old session files stay on disk with traces.
     fn change_settings(&mut self, change: impl FnOnce(&mut Preferences)) -> String {
@@ -48,6 +78,8 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
         Command::Help => help_text(),
         Command::Clear => {
             session.state = None;
+            view.context = None;
+            session.refresh_git();
             view.history.reset();
             view.history.start_block();
             view.history
@@ -72,6 +104,7 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
         }
         Command::SetModel(model) => {
             let note = session.change_settings(|settings| settings.model = model.clone());
+            view.context = None;
             format!("Model set to {model} for this session.{note}\n")
         }
         Command::ShowEffort => {
@@ -98,6 +131,7 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
         }
         Command::SetEffort(effort) => {
             let note = session.change_settings(|settings| settings.reasoning_effort = effort);
+            view.context = None;
             format!(
                 "Effort set to {} for this session.{note}\n",
                 effort_label(&session.settings)
@@ -174,16 +208,16 @@ mod tests {
     use super::*;
 
     fn session() -> Session {
-        Session {
-            root: PathBuf::from("/p"),
-            settings: Preferences {
+        let mut session = Session::new(
+            PathBuf::from("/p"),
+            Preferences {
                 model: "first".into(),
                 reasoning_effort: Some("low".into()),
                 ..Default::default()
             },
-            state: Some(PathBuf::from("/state/session-1/conversation.json")),
-            model_listing: None,
-        }
+        );
+        session.state = Some(PathBuf::from("/state/session-1/conversation.json"));
+        session
     }
 
     fn view() -> View {
@@ -193,6 +227,7 @@ mod tests {
             scroll: 3,
             status: Status::new(Phase::Ready, "Ready"),
             panel: None,
+            context: None,
         };
         view.history.reset();
         view
@@ -232,8 +267,8 @@ mod tests {
         assert!(history_text(&view).contains("Effort set to model default for this session."));
     }
 
-    #[test]
-    fn clear_drops_the_conversation_and_restores_the_welcome() {
+    #[tokio::test]
+    async fn clear_drops_the_conversation_and_restores_the_welcome() {
         let mut view = view();
         view.history.push(Role::Plain, "\nYou: earlier\n");
         let mut session = session();

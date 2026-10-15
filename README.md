@@ -249,6 +249,23 @@ status line each have their own style. The status line keeps a text label, such
 as `Ready` or `Stopped`, so it does not depend on colour. Set `NO_COLOR` to any
 non-empty value to turn colour off; bold and dim text remain.
 
+A status bar sits below the input, above the key hints:
+
+```text
+🤖 qwen3.8:27b-mxfp8  🧠 low  📁 microgentic  🌿 main ●3 …2 ↑1  ctx:[███░░░░░░░]31%
+```
+
+It shows the model, the reasoning effort (`default` when unset), the project
+folder, and the git branch with its changed-file count (`●`), untracked-file
+count (`…`), and commits ahead (`↑`) or behind (`↓`) its upstream. Git is read
+when the view opens, after each exchange, and after `/clear`; outside a
+repository the git segment is left out. The `ctx:` gauge is the runtime's token
+estimate for the latest model request against the model's context window: green
+below 60%, yellow up to 85%, red above. When the window size is unknown, the
+gauge shows only the estimate, such as `ctx: 12.4k`. A new conversation resets
+it. On a narrow terminal the git, folder, and effort segments drop out in that
+order, so the model and context stay visible.
+
 Each tool call is one line under the reply that requested it, and the line
 changes in place. A spinner shows while the call runs, `✓` when it succeeds,
 `✗` when it reports an error, and `– … · stopped` when the run ends before the

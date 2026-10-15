@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_MODEL: &str = "Qwen3.8-27B-MLX-8bit";
 
-fn model_context_window_tokens(model: &str) -> Option<usize> {
+pub(crate) fn model_context_window_tokens(model: &str) -> Option<usize> {
     match model {
         DEFAULT_MODEL | "qwen3.8:27b-mxfp8" => Some(262_144),
         _ => None,

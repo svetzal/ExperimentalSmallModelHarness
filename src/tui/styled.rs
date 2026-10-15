@@ -6,13 +6,16 @@ use unicode_width::UnicodeWidthChar;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Role {
     Plain,
-    Title,
     Muted,
-    Value,
     UserLabel,
     AgentLabel,
     Success,
     Failure,
+    Model,
+    Effort,
+    Folder,
+    Branch,
+    Dirty,
     Error,
     Prompt,
     System,
@@ -43,12 +46,17 @@ impl Palette {
     pub(super) fn style(self, role: Role) -> ContentStyle {
         let (colour, attribute) = match role {
             Role::Plain => (None, None),
-            Role::Value => (None, Some(Attribute::Bold)),
-            Role::Title | Role::AgentLabel => (Some(Color::DarkMagenta), Some(Attribute::Bold)),
+            Role::AgentLabel => (Some(Color::DarkMagenta), Some(Attribute::Bold)),
             Role::UserLabel | Role::Prompt => (Some(Color::DarkCyan), Some(Attribute::Bold)),
             Role::Muted => (None, Some(Attribute::Dim)),
             Role::System => (None, Some(Attribute::Italic)),
             Role::Success => (Some(Color::DarkGreen), Some(Attribute::Bold)),
+            Role::Model => (Some(Color::DarkGreen), None),
+            Role::Effort => (Some(Color::DarkYellow), None),
+            Role::Folder => (None, Some(Attribute::Bold)),
+            Role::Branch => (Some(Color::DarkCyan), None),
+            // Orange has no named ANSI colour; 208 reads on light and dark themes.
+            Role::Dirty => (Some(Color::AnsiValue(208)), None),
             Role::Failure => (Some(Color::DarkRed), Some(Attribute::Bold)),
             Role::Error => (Some(Color::DarkRed), None),
             Role::Ready => (Some(Color::DarkGreen), Some(Attribute::Bold)),
@@ -131,33 +139,6 @@ pub(super) fn first_row(text: &Styled, width: usize) -> Row {
     wrap(text, width).swap_remove(0)
 }
 
-/// Drop leading characters so one line fits `width` cells, marking the cut
-/// with "…". A long project path then gives way before the model and effort.
-pub(super) fn fit_from_end(text: &Styled, width: usize) -> Styled {
-    let cells = |run: &str| run.chars().map(|ch| ch.width().unwrap_or(0)).sum::<usize>();
-    let total: usize = text.runs.iter().map(|(_, run)| cells(run)).sum();
-    let Some((first_role, _)) = text.runs.first() else {
-        return text.clone();
-    };
-    if total <= width || width < 2 {
-        return text.clone();
-    }
-    let mut excess = total - (width - 1);
-    let mut fitted = Styled::default().with(*first_role, "…");
-    for (role, run) in &text.runs {
-        let kept: String = run
-            .chars()
-            .skip_while(|ch| {
-                let drop = excess > 0;
-                excess = excess.saturating_sub(ch.width().unwrap_or(0));
-                drop
-            })
-            .collect();
-        fitted.push(*role, &kept);
-    }
-    fitted
-}
-
 /// Row text without roles, for layout assertions in tests.
 #[cfg(test)]
 pub(super) fn rows_text(rows: &[Row]) -> Vec<String> {
@@ -211,26 +192,12 @@ mod tests {
     fn monochrome_styles_keep_attributes_without_colour() {
         let mono = Palette { colour: false };
         let colour = Palette { colour: true };
-        for role in [Role::Title, Role::UserLabel, Role::Error, Role::Ready] {
+        for role in [Role::AgentLabel, Role::UserLabel, Role::Error, Role::Ready] {
             assert!(colour.style(role).foreground_color.is_some(), "{role:?}");
             assert!(mono.style(role).foreground_color.is_none(), "{role:?}");
         }
-        assert!(mono.style(Role::Title).attributes.has(Attribute::Bold));
+        assert!(mono.style(Role::AgentLabel).attributes.has(Attribute::Bold));
         assert!(mono.style(Role::Muted).attributes.has(Attribute::Dim));
         assert_eq!(colour.style(Role::Plain), ContentStyle::new());
-    }
-
-    #[test]
-    fn long_headers_lose_the_start_of_the_path_first() {
-        let header = Styled::default()
-            .with(Role::Muted, "/a/long/project | omlx | ")
-            .with(Role::Value, "m1");
-        let fitted = fit_from_end(&header, 16);
-        assert_eq!(rows_text(&wrap(&fitted, 16)), ["…ect | omlx | m1"]);
-        assert_eq!(fitted.runs.last(), Some(&(Role::Value, "m1".to_owned())));
-        assert_eq!(fit_from_end(&header, 80), header);
-        // A wide character that straddles the cut is dropped whole.
-        let wide = Styled::default().with(Role::Muted, "界界ab");
-        assert_eq!(rows_text(&wrap(&fit_from_end(&wide, 4), 4)), ["…ab"]);
     }
 }

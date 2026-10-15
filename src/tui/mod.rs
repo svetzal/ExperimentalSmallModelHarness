@@ -3,11 +3,11 @@ mod commands;
 mod history;
 mod picker;
 mod session;
+mod status_bar;
 mod styled;
 mod tool_lines;
 
 use crate::conversation::ConversationEvent;
-use crate::preferences::Preferences;
 use anyhow::{Context, Result};
 use commands::{Command, Submission, complete, footer, parse_submission};
 use crossterm::{
@@ -23,6 +23,7 @@ use crossterm::{
 use history::History;
 use picker::{Outcome, Panel, PickerKey, Purpose};
 use session::{Session, finish_model_listing, run_command};
+use status_bar::{BarState, ContextUsage, status_bar};
 use std::io::{Write, stdout};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
@@ -31,7 +32,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use styled::{Palette, Role, Styled, first_row, fit_from_end, wrap};
+use styled::{Palette, Role, Styled, first_row, wrap};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -110,6 +111,9 @@ struct View {
     /// A loading notice or picker above the input. While open, it owns the
     /// arrow keys, Enter, and Esc.
     panel: Option<Panel>,
+    /// The latest context estimate for this conversation; `None` until the
+    /// first request and after a new conversation starts.
+    context: Option<ContextUsage>,
 }
 
 /// Give a key to the open panel. Returns false when no panel is open, so the
@@ -174,18 +178,24 @@ fn panel_rows(panel: &Panel, height: usize, frame: usize) -> Vec<Styled> {
     }
 }
 
-fn header(root: &std::path::Path, prefs: &Preferences) -> Styled {
-    Styled::default()
-        .with(
-            Role::Muted,
-            &format!("{} | {} | ", root.display(), prefs.provider.as_str()),
-        )
-        .with(Role::Value, &prefs.model)
-        .with(Role::Muted, " | effort: ")
-        .with(
-            Role::Value,
-            prefs.reasoning_effort.as_deref().unwrap_or("model default"),
-        )
+/// What the status bar shows. Before the first request, a known context
+/// window shows as an empty gauge; an unknown one shows nothing.
+fn bar_state<'a>(view: &View, session: &'a Session) -> BarState<'a> {
+    let window = crate::cli::model_context_window_tokens(&session.settings.model);
+    BarState {
+        model: &session.settings.model,
+        effort: session.settings.reasoning_effort.as_deref(),
+        folder: session
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("/"),
+        git: session.git.as_ref(),
+        context: view.context.or(window.map(|window| ContextUsage {
+            used_tokens: 0,
+            window_tokens: Some(window),
+        })),
+    }
 }
 
 /// Act on Enter. Messages wait while a reply is active; commands other than
@@ -288,7 +298,9 @@ fn start_reply(view: &mut View, session: &mut Session, prompt: &str) -> Result<O
     }))
 }
 
-fn draw(view: &View, header: &Styled, frame: usize, palette: Palette) -> Result<()> {
+/// Layout, top to bottom: history, a rule, the working/ready status line,
+/// any open panel, the input, the status bar, and the key hints.
+fn draw(view: &View, session: &Session, frame: usize, palette: Palette) -> Result<()> {
     let (columns, lines) = terminal::size()?;
     let width = usize::from(columns.saturating_sub(2)).max(1);
     let mut out = stdout();
@@ -305,53 +317,50 @@ fn draw(view: &View, header: &Styled, frame: usize, palette: Palette) -> Result<
         }
         Ok(())
     };
-    let rule = first_row(
-        &Styled::default().with(Role::Muted, &"─".repeat(width)),
-        width,
-    );
-    put(
-        0,
-        &first_row(&Styled::default().with(Role::Title, "Microgentic"), width),
-    )?;
-    put(1, &first_row(&fit_from_end(header, width), width))?;
     let input = Styled::default()
         .with(Role::Prompt, "> ")
         .with(Role::Plain, &view.input);
     let input_rows = wrap(&input, width);
-    let input_height = input_rows.len().min(4);
+    let input_height = input_rows.len().min(4) as u16;
     let panel = view
         .panel
         .as_ref()
         .map(|panel| panel_rows(panel, usize::from(lines / 2).min(9), frame))
         .unwrap_or_default();
-    let panel_height = panel.len() as u16;
-    let status_row = lines.saturating_sub(input_height as u16 + panel_height + 2);
-    // Rules frame the conversation; very short terminals drop them first.
-    let lower_rule_row = status_row.saturating_sub(1);
-    if lower_rule_row > 2 {
-        put(2, &rule)?;
-        put(lower_rule_row, &rule)?;
+    let input_top = lines.saturating_sub(input_height + 2);
+    let panel_top = input_top.saturating_sub(panel.len() as u16);
+    let status_row = panel_top.saturating_sub(1);
+    let rule_row = status_row.saturating_sub(1);
+    // Very short terminals drop the rule and the history first.
+    if rule_row > 0 {
+        put(
+            rule_row,
+            &first_row(
+                &Styled::default().with(Role::Muted, &"─".repeat(width)),
+                width,
+            ),
+        )?;
     }
-    let body_height = usize::from(lines.saturating_sub(6 + input_height as u16 + panel_height));
     let history = wrap(&view.history.render(frame), width);
     let end = history.len().saturating_sub(view.scroll.min(history.len()));
-    let start = end.saturating_sub(body_height);
+    let start = end.saturating_sub(usize::from(rule_row));
     for (index, row) in history[start..end].iter().enumerate() {
-        put(3 + index as u16, row)?;
+        put(index as u16, row)?;
     }
     put(status_row, &first_row(&view.status.line(), width))?;
     for (index, row) in panel.iter().enumerate() {
-        put(status_row + 1 + index as u16, &first_row(row, width))?;
+        put(panel_top + index as u16, &first_row(row, width))?;
     }
-    for (index, row) in input_rows[input_rows.len() - input_height..]
+    for (index, row) in input_rows[input_rows.len() - usize::from(input_height)..]
         .iter()
         .enumerate()
     {
-        put(
-            lines.saturating_sub(input_height as u16 + 1) + index as u16,
-            row,
-        )?;
+        put(input_top + index as u16, row)?;
     }
+    put(
+        lines.saturating_sub(2),
+        &first_row(&status_bar(&bar_state(view, session), width), width),
+    )?;
     put(lines.saturating_sub(1), &first_row(&hints(view), width))?;
     out.flush()?;
     Ok(())
@@ -359,12 +368,11 @@ fn draw(view: &View, header: &Styled, frame: usize, palette: Palette) -> Result<
 
 pub async fn run(config: Option<PathBuf>) -> Result<()> {
     let path = crate::preferences::config_path(config.as_deref())?;
-    let mut session = Session {
-        root: std::env::current_dir()?,
-        settings: crate::preferences::load(&path)?.unwrap_or_default(),
-        state: None,
-        model_listing: None,
-    };
+    let mut session = Session::new(
+        std::env::current_dir()?,
+        crate::preferences::load(&path)?.unwrap_or_default(),
+    );
+    session.refresh_git();
     let palette = Palette::from_no_color(std::env::var_os("NO_COLOR").as_deref());
     let _screen = Screen::enter()?;
     let leaving = Arc::new(AtomicBool::new(false));
@@ -384,6 +392,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
         scroll: 0,
         status: Status::new(Phase::Ready, "Ready"),
         panel: None,
+        context: None,
     };
     view.history.reset();
     let mut active: Option<ActiveRun> = None;
@@ -429,6 +438,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 }
                 // Calls that never reported a result must not spin on.
                 view.history.stop_running();
+                session.refresh_git();
                 view.scroll = 0;
             }
             if let Some(run) = &active {
@@ -446,7 +456,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 );
             }
             finish_model_listing(&mut view, &mut session).await;
-            let header = header(&session.root, &session.settings);
+            session.finish_git_refresh().await;
             // The spinner frame joins the signature only while a call runs, so
             // an idle screen does not redraw.
             let animating =
@@ -456,7 +466,12 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
             });
             let signature = (
                 frame,
-                header.clone(),
+                (
+                    session.settings.model.clone(),
+                    session.settings.reasoning_effort.clone(),
+                    session.git.clone(),
+                    view.context,
+                ),
                 view.history.revision,
                 view.input.clone(),
                 view.scroll,
@@ -465,7 +480,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 terminal::size()?,
             );
             if last_draw.as_ref() != Some(&signature) {
-                draw(&view, &header, frame.unwrap_or(0), palette)?;
+                draw(&view, &session, frame.unwrap_or(0), palette)?;
                 last_draw = Some(signature);
             }
             if !event::poll(Duration::from_millis(50))? {
@@ -592,6 +607,15 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             view.history.finish_tool(&call_id, &name, ok);
             run.activity = "Working".into();
         }
+        ConversationEvent::ContextUsage {
+            used_tokens,
+            window_tokens,
+        } => {
+            view.context = Some(ContextUsage {
+                used_tokens,
+                window_tokens,
+            });
+        }
         ConversationEvent::Activity { message } => {
             if message.starts_with("Context shortened") {
                 view.history.start_line();
@@ -649,19 +673,20 @@ fn interrupt(run: &mut ActiveRun) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preferences::Preferences;
     use styled::rows_text;
 
     fn session() -> Session {
-        Session {
-            root: PathBuf::from("/p"),
-            settings: Preferences {
+        let mut session = Session::new(
+            PathBuf::from("/p"),
+            Preferences {
                 model: "first".into(),
                 reasoning_effort: Some("low".into()),
                 ..Default::default()
             },
-            state: Some(PathBuf::from("/state/session-1/conversation.json")),
-            model_listing: None,
-        }
+        );
+        session.state = Some(PathBuf::from("/state/session-1/conversation.json"));
+        session
     }
 
     fn view() -> View {
@@ -671,6 +696,7 @@ mod tests {
             scroll: 3,
             status: Status::new(Phase::Ready, "Ready"),
             panel: None,
+            context: None,
         };
         view.history.reset();
         view
@@ -908,6 +934,53 @@ mod tests {
         assert!(history_text(&view).ends_with("Could not list models from omlx: refused\n"));
     }
 
+    fn bar_text(view: &View, session: &Session) -> String {
+        status_bar(&bar_state(view, session), 200)
+            .runs
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_gauge_follows_ledger_events_and_resets_with_the_conversation() {
+        let mut view = view();
+        let mut session = session();
+        session.settings.model = "qwen3.8:27b-mxfp8".into();
+        // A known window shows an empty gauge before the first request.
+        assert!(bar_text(&view, &session).ends_with("📁 p  ctx:[░░░░░░░░░░]0%"));
+        let mut run = placeholder_run();
+        apply_event(
+            &mut view,
+            &mut run,
+            ConversationEvent::ContextUsage {
+                used_tokens: 81_265,
+                window_tokens: Some(262_144),
+            },
+        );
+        assert!(bar_text(&view, &session).ends_with("ctx:[███░░░░░░░]31%"));
+        run_command(&mut view, &mut session, Command::Clear);
+        assert!(bar_text(&view, &session).ends_with("ctx:[░░░░░░░░░░]0%"));
+
+        // An unknown window shows the estimate alone, and nothing before it.
+        run_command(
+            &mut view,
+            &mut session,
+            Command::SetModel("test-model".into()),
+        );
+        assert!(bar_text(&view, &session).ends_with("📁 p"));
+        apply_event(
+            &mut view,
+            &mut run,
+            ConversationEvent::ContextUsage {
+                used_tokens: 12_400,
+                window_tokens: None,
+            },
+        );
+        assert!(bar_text(&view, &session).ends_with("ctx: 12.4k"));
+        assert!(bar_text(&view, &session).starts_with("🤖 test-model  🧠 low  📁 p"));
+    }
+
     #[tokio::test]
     async fn active_runs_refuse_commands_except_help() {
         let mut view = view();
@@ -928,25 +1001,5 @@ mod tests {
             view.input, "A drafted message",
             "a draft was consumed during a reply"
         );
-    }
-
-    #[test]
-    fn header_emphasises_model_and_effort() {
-        let prefs = crate::preferences::Preferences {
-            model: "m1".into(),
-            ..Default::default()
-        };
-        let header = header(std::path::Path::new("/p"), &prefs);
-        assert_eq!(
-            rows_text(&wrap(&header, 200)),
-            ["/p | omlx | m1 | effort: model default"]
-        );
-        let values: Vec<_> = header
-            .runs
-            .iter()
-            .filter(|(role, _)| *role == Role::Value)
-            .map(|(_, text)| text.as_str())
-            .collect();
-        assert_eq!(values, ["m1", "model default"]);
     }
 }

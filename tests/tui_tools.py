@@ -85,16 +85,17 @@ def exercise(provider):
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 160, 0, 0))
     process = subprocess.Popen([binary, "--config", str(config)], cwd=root, env=env,
                                stdin=slave, stdout=slave, stderr=slave)
-    seen = b""
+    seen, cursor = b"", 0
 
     def wait_for(needle):
-        nonlocal seen
+        nonlocal seen, cursor
         deadline = time.monotonic() + 20
-        start = len(seen)
+        start = cursor
         while needle not in seen[start:] and time.monotonic() < deadline:
             if select.select([master], [], [], .05)[0]:
                 seen = SGR.sub(b"", seen + os.read(master, 65536))
         assert needle in seen[start:], (needle, seen[-6000:], errors)
+        cursor = seen.index(needle, start) + len(needle)
 
     def frames():
         return seen.split(b"\x1b[2J")

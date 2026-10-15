@@ -461,6 +461,9 @@ gateway still needs recovery, reasoning, telemetry, and tool-history conformance
   under its action. Keep detailed context and trace accounting in secondary
   views. Review the everyday flow against the Pi-inspired small, simple, fast
   product direction.
+  Progress: a bottom status bar shows model, effort, folder, git state, and a
+  context gauge; each tool call is one line under its reply that resolves in
+  place. Expandable tool detail and secondary views remain.
 - [ ] **Make state understandable.** Label connecting, generating, inspecting,
   editing, checking, awaiting input, and stopped. Distinguish unknown progress
   from stalled generation. Refresh elapsed time without invented percentages or

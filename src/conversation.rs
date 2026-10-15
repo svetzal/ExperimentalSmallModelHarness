@@ -34,6 +34,12 @@ pub(crate) enum ConversationEvent {
         name: String,
         ok: bool,
     },
+    /// The runtime's token estimate for the next model request, and the
+    /// context window when the model table or provider gives one.
+    ContextUsage {
+        used_tokens: usize,
+        window_tokens: Option<usize>,
+    },
     Activity {
         message: String,
     },
@@ -249,10 +255,15 @@ impl ConversationRun {
             "llm.stream.thinking" => {
                 format!("Thinking · {} characters", payload["total_thinking_chars"])
             }
-            "llm.context_assembly.ledger" => format!(
-                "Requesting response · context {}",
-                payload["pressure_band"].as_str().unwrap_or("unknown")
-            ),
+            "llm.context_assembly.ledger" => {
+                if let Some(usage) = context_usage(payload) {
+                    self.emit(usage);
+                }
+                format!(
+                    "Requesting response · context {}",
+                    payload["pressure_band"].as_str().unwrap_or("unknown")
+                )
+            }
             "llm.stream.progress"
                 if payload["accumulated_tool_call_count"].as_u64().unwrap_or(0) > 0 =>
             {
@@ -295,6 +306,17 @@ impl ConversationRun {
         file.persist(path).context("saving conversation state")?;
         Ok(())
     }
+}
+
+/// The view's context gauge, from a context-assembly ledger: the runtime's
+/// token estimate and the window size, when known. Nothing is invented.
+fn context_usage(ledger: &Value) -> Option<ConversationEvent> {
+    Some(ConversationEvent::ContextUsage {
+        used_tokens: usize::try_from(ledger["estimated_tokens"].as_u64()?).ok()?,
+        window_tokens: ledger["context_window_tokens"]
+            .as_u64()
+            .and_then(|window| usize::try_from(window).ok()),
+    })
 }
 
 /// Longest string, in characters, sent to the view in tool arguments.
@@ -422,6 +444,45 @@ mod tests {
     use super::*;
     use mojentic::llm::models::LlmToolCall;
     use std::collections::HashMap;
+
+    #[test]
+    fn ledgers_report_context_use_without_inventing_a_window() {
+        let known =
+            context_usage(&json!({"estimated_tokens": 81_265, "context_window_tokens": 262_144}));
+        assert!(matches!(
+            known,
+            Some(ConversationEvent::ContextUsage {
+                used_tokens: 81_265,
+                window_tokens: Some(262_144)
+            })
+        ));
+        let unknown =
+            context_usage(&json!({"estimated_tokens": 1_200, "context_window_tokens": null}));
+        assert!(matches!(
+            unknown,
+            Some(ConversationEvent::ContextUsage {
+                used_tokens: 1_200,
+                window_tokens: None
+            })
+        ));
+        assert!(context_usage(&json!({"pressure_band": "green"})).is_none());
+    }
+
+    #[test]
+    fn view_arguments_are_shortened_but_keep_their_shape() {
+        let long = "x".repeat(VIEW_ARGUMENT_CHARS + 10);
+        let shortened = shorten_strings(&json!({"path": "a.rs", "edits": [{"new": long}], "n": 3}));
+        assert_eq!(shortened["path"], "a.rs");
+        assert_eq!(shortened["n"], 3);
+        assert_eq!(
+            shortened["edits"][0]["new"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            VIEW_ARGUMENT_CHARS
+        );
+    }
 
     fn conversation(history: Vec<LlmMessage>) -> ConversationRun {
         let protected_users = history

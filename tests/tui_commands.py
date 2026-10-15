@@ -143,9 +143,9 @@ def exercise(provider):
         type_line("/model")
         wait_for("› test-model (current)".encode())
         press(b"\x1b[B\r")  # Down to other-model, then Enter.
-        # The header row is drawn before the history in the same frame.
-        shown = wait_for(b"Model set to other-model for this session.")
-        assert b"| other-model | effort: low" in shown, "the header kept the old model"
+        wait_for(b"Model set to other-model for this session.")
+        # The status bar is drawn below the history in the same frame.
+        wait_for("🤖 other-model  🧠 low".encode())
         switched = exchange("After the model switch.")
         assert switched["model"] == "other-model"
         assert effort_control(switched) == "low"
@@ -154,8 +154,8 @@ def exercise(provider):
         type_line("/effort")
         wait_for("› low (current)".encode())
         press(b"\x1b[B\x1b[B\r")  # low -> medium -> high, then Enter.
-        shown = wait_for(b"Effort set to high for this session.")
-        assert b"| other-model | effort: high" in shown, "the header kept the old effort"
+        wait_for(b"Effort set to high for this session.")
+        wait_for("🤖 other-model  🧠 high".encode())
         raised = exchange("After the effort change.")
         assert raised["model"] == "other-model" and effort_control(raised) == "high"
         kept = exchange("Still the same settings.")
