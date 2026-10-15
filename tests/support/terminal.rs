@@ -6,6 +6,13 @@
 //! reader thread drains the terminal continuously, so the binary never
 //! blocks on a full buffer, and keeps the raw bytes and a history of rendered
 //! screens for the few tests that need them.
+//!
+//! A frame can reach the reader in several chunks, so a screen read at an
+//! arbitrary moment can show the top of a new frame over blank rows. Waits
+//! therefore return only a settled screen: no synchronized update (DEC mode
+//! 2026, which the TUI wraps around each frame) is open, and the terminal has
+//! been quiet for `SETTLE`. The frame history keeps only screens at the end of
+//! an update.
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -16,14 +23,85 @@ use std::time::{Duration, Instant};
 
 /// How long a wait lasts before the test fails with the current screen.
 pub const WAIT: Duration = Duration::from_secs(20);
+/// How long the terminal must be quiet before a wait trusts the screen.
+pub const SETTLE: Duration = Duration::from_millis(30);
 /// Most rendered screens kept in the history.
 const MAX_FRAMES: usize = 20_000;
+const BEGIN_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_UPDATE: &[u8] = b"\x1b[?2026l";
 
 struct Shared {
     raw: Vec<u8>,
     parser: vt100::Parser,
-    /// The screen's text after each chunk of output.
+    /// The screen's text after each chunk of output that leaves no
+    /// synchronized update open.
     frames: Vec<String>,
+    /// A synchronized update has begun and not yet ended.
+    in_update: bool,
+    /// When the last chunk of output arrived.
+    last_output: Instant,
+}
+
+impl Shared {
+    /// Take in one chunk of output. A chunk can hold the end of one frame
+    /// and the start of the next, so the screen is recorded at every
+    /// update's end, not only at the end of the chunk.
+    fn absorb(&mut self, chunk: &[u8]) {
+        // Markers can be split across chunks, so search from a few bytes back.
+        let carry = self.raw.len().min(BEGIN_UPDATE.len() - 1);
+        self.raw.extend_from_slice(chunk);
+        let window = &self.raw[self.raw.len() - chunk.len() - carry..];
+        let mut fed = 0;
+        for (end, opens) in update_markers(window) {
+            // `end` is just past the marker; markers that end in bytes
+            // already fed were handled with the previous chunk.
+            let Some(end) = end.checked_sub(carry).filter(|end| *end > 0) else {
+                continue;
+            };
+            self.parser.process(&chunk[fed..end]);
+            fed = end;
+            self.in_update = opens;
+            if !opens {
+                self.record_frame();
+            }
+        }
+        if fed < chunk.len() {
+            self.parser.process(&chunk[fed..]);
+            if !self.in_update {
+                self.record_frame();
+            }
+        }
+        self.last_output = Instant::now();
+    }
+
+    fn record_frame(&mut self) {
+        if self.frames.len() < MAX_FRAMES {
+            self.frames.push(self.parser.screen().contents());
+        }
+    }
+
+    /// The screen, if no frame is half drawn and output has paused.
+    fn settled(&self) -> Option<Snapshot> {
+        (!self.in_update && self.last_output.elapsed() >= SETTLE)
+            .then(|| Snapshot(self.parser.screen().clone()))
+    }
+}
+
+/// Every synchronized-update marker in `bytes`, in order, as the index just
+/// past it and whether it opens an update.
+fn update_markers(bytes: &[u8]) -> Vec<(usize, bool)> {
+    (0..bytes.len())
+        .filter_map(|start| {
+            let rest = &bytes[start..];
+            if rest.starts_with(BEGIN_UPDATE) {
+                Some((start + BEGIN_UPDATE.len(), true))
+            } else if rest.starts_with(END_UPDATE) {
+                Some((start + END_UPDATE.len(), false))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 pub struct Tui {
@@ -115,6 +193,8 @@ impl Launch {
             raw: Vec::new(),
             parser: vt100::Parser::new(self.rows, self.cols, 0),
             frames: Vec::new(),
+            in_update: false,
+            last_output: Instant::now(),
         }));
         let sink = shared.clone();
         let reader = std::thread::spawn(move || {
@@ -123,13 +203,9 @@ impl Launch {
                 if count == 0 {
                     break;
                 }
-                let mut shared = sink.lock().expect("terminal state");
-                shared.raw.extend_from_slice(&buffer[..count]);
-                shared.parser.process(&buffer[..count]);
-                let frame = shared.parser.screen().contents();
-                if shared.frames.len() < MAX_FRAMES {
-                    shared.frames.push(frame);
-                }
+                sink.lock()
+                    .expect("terminal state")
+                    .absorb(&buffer[..count]);
             }
         });
         Tui {
@@ -283,8 +359,27 @@ impl Tui {
         self.frame_cursor = self.shared.lock().expect("terminal state").frames.len();
     }
 
-    /// Wait until the current screen satisfies `test`.
+    /// Wait until a settled screen satisfies `test`, and return that screen.
     pub fn wait_for(&self, what: &str, test: impl Fn(&Snapshot) -> bool) -> Snapshot {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let settled = self.shared.lock().expect("terminal state").settled();
+            if let Some(snapshot) = settled
+                && test(&snapshot)
+            {
+                return snapshot;
+            }
+            if Instant::now() > deadline {
+                panic!("timed out waiting for {what}; screen:\n{}", self.snapshot());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Wait until the screen satisfies `test` at any moment, settled or not.
+    /// For tests that time or interrupt output while it is still arriving,
+    /// such as the launch animation.
+    pub fn wait_for_unsettled(&self, what: &str, test: impl Fn(&Snapshot) -> bool) -> Snapshot {
         let deadline = Instant::now() + WAIT;
         loop {
             let snapshot = self.snapshot();
@@ -294,7 +389,7 @@ impl Tui {
             if Instant::now() > deadline {
                 panic!("timed out waiting for {what}; screen:\n{snapshot}");
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 

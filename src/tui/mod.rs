@@ -23,8 +23,11 @@ use crossterm::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
         KeyModifiers,
     },
-    execute,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    execute, queue,
+    terminal::{
+        self, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use history::History;
 use launch::Scene;
@@ -464,8 +467,14 @@ fn draw(
         Some(elapsed) => launch::frame(&scene, elapsed),
         None => scene.rest,
     };
+    // One synchronized update per frame, so a terminal that supports it
+    // (DEC mode 2026) never shows half a frame. Others ignore the mode.
+    let mut bytes = Vec::new();
+    queue!(bytes, BeginSynchronizedUpdate)?;
+    bytes.extend_from_slice(&canvas.paint(palette)?);
+    queue!(bytes, EndSynchronizedUpdate)?;
     let mut out = stdout();
-    out.write_all(&canvas.paint(palette)?)?;
+    out.write_all(&bytes)?;
     out.flush()?;
     Ok(())
 }

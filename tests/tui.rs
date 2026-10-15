@@ -41,6 +41,20 @@ fn tui_opens_without_a_provider_and_restores_the_terminal() {
         "the default view has no colour"
     );
     tui.assert_raw_mode_active();
+    // Each frame is one synchronized update, which the harness's waits rely on.
+    let raw = String::from_utf8_lossy(&tui.raw()).into_owned();
+    let frames = raw.matches("\x1b[2J").count();
+    assert!(frames > 0, "no frame was painted");
+    assert_eq!(
+        raw.matches("\x1b[?2026h\x1b[1;1H\x1b[2J").count(),
+        frames,
+        "a frame began outside an update"
+    );
+    assert_eq!(
+        raw.matches("\x1b[?2026l").count(),
+        frames,
+        "an update did not end"
+    );
     // A small resize and Unicode input exercise layout without submitting work.
     tui.resize(5, 20);
     tui.paste("世界");
@@ -752,7 +766,13 @@ fn commands(wire: Wire) {
     );
 
     session.tui.submit("Take your time.");
-    session.tui.wait_text("Ctrl-C to cancel");
+    // The reply heading appears once the held response starts, which can be
+    // after later local output; wait for it so the history order is fixed.
+    session.tui.wait_for("the held reply to start", |screen| {
+        screen.contains("Ctrl-C to cancel")
+            && screen.contains("You: Take your time.")
+            && after_last(screen, "You: Take your time.").contains("Microgentic:")
+    });
     session.tui.submit("/model test-model");
     session
         .tui
@@ -1069,7 +1089,7 @@ fn animated_launch(
     // Time from the first painted frame: a freshly built binary can take a
     // moment to start on macOS, which is not the animation's doing.
     let painted = |tui: &Tui| String::from_utf8_lossy(&tui.raw()).contains("\x1b[2J");
-    tui.wait_for("the first frame", |_| painted(&tui));
+    tui.wait_for_unsettled("the first frame", |_| painted(&tui));
     let first_frame = std::time::Instant::now();
     if let Some(key) = key {
         tui.send(key);

@@ -10,6 +10,12 @@ The release workflow publishes each version's section as its GitHub release note
 
 ## [Unreleased]
 
+### Changed
+
+- The conversation view draws each frame as one synchronized update (DEC mode
+  2026). Terminals that support it no longer show a half-drawn frame; others
+  ignore it.
+
 ## [0.4.0] - 2026-10-15
 
 Everyday `microgentic run` now behaves like the conversation: it ends on the
