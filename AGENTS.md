@@ -52,8 +52,9 @@ cargo install --locked --path /tmp/mg-install --target-dir target/install --forc
 git worktree remove /tmp/mg-install
 ```
 
-Install from a committed revision that passed the gates, not from a working tree
-that another agent may be editing. `~/.cargo/bin` comes before Homebrew on the
+Run every gate in `.hone-gates.json` on that revision immediately before you
+install it; a local install is a deployment. Install from a committed revision,
+not from a working tree that another agent may be editing. `~/.cargo/bin` comes before Homebrew on the
 PATH here, so the Cargo build replaces the Homebrew one without an uninstall.
 
 Every push and tag starts GitHub Actions. Let those runs finish, including for
