@@ -679,13 +679,16 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     if let Some((spec, _, _)) = &acceptance_ledger {
         scope.configure_acceptance_ledger(spec.clone())?;
     }
-    let system_prompt = tool_surface.adapt_system_guidance(if conversation.is_some() {
+    let mut system_prompt = tool_surface.adapt_system_guidance(if conversation.is_some() {
         crate::conversation::system_guidance()
     } else {
         profile.system_guidance()
     });
     let mut tools = tools_for_profile(&scope, profile);
     if config.calculator {
+        // The guidance travels with the tool, so runs without it are unchanged.
+        system_prompt.push('\n');
+        system_prompt.push_str(crate::calculator::GUIDANCE);
         tools.push(Box::new(crate::calculator::CalculateTool));
     }
     let repair_tools = tools

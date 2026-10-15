@@ -423,6 +423,10 @@ log10 log2 exp`, and `pi` and `e`. It also accepts `×`, `÷`, the Unicode
 minus, `_` digit separators, scientific notation, and a trailing `=`.
 Commas separate function arguments inside a call; outside one, a comma
 followed by three digits groups thousands, so `1,474` is 1474.
+In a batch, a line such as `total = 140 + 90` names a value that later lines
+of the same call can use; names are case-sensitive and last for that call
+only. Where the tool is offered, the system guidance gains one line telling
+the model to use it for arithmetic with more than one trivial step.
 
 Decimals stay exact through `+ - * /` and integer powers, so `0.1 + 0.2` is
 `0.3`. Roots, logarithms, fractional powers, and integers beyond 128 bits use
@@ -697,6 +701,9 @@ adding another provider-visible read result. The content bound scales with the
 actual provider window and is capped, while raw read events remain unchanged in
 the trace only. Read-only shell effects do not split a file epoch, but confirmed
 workspace mutations do.
+
+Live trials of the `calculate` tool, and the tuning they led to, are recorded
+in [`CALCULATOR-TRIALS-2026-10.md`](CALCULATOR-TRIALS-2026-10.md).
 
 Experiments are intentionally run from separate, scoped workspaces. Generated
 agents should see their work tree and task-relevant guidance, not experiment

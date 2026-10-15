@@ -19,7 +19,14 @@
 //!   Outside a call, a comma followed by exactly three digits groups
 //!   thousands: `1,474` is 1474. Any other comma is an error.
 //! - A trailing `=` is ignored, so `1474 / 1.1 =` works.
+//! - In a batch, `name = expression` names a value for later lines of the
+//!   same call: `total = 140 + 90; total / 1.1`. Names are case-sensitive
+//!   and cannot reuse a function or constant name.
+use std::collections::HashMap;
 use std::fmt::Write as _;
+
+/// One line of system guidance added wherever the tool is offered.
+pub const GUIDANCE: &str = "For arithmetic with more than one trivial step, including sums, ratios, percentages and unit conversions, call calculate instead of working it out in your head, and use its results.";
 
 /// Longest input accepted in one call, in characters.
 pub const MAX_INPUT_CHARS: usize = 4_000;
@@ -31,6 +38,10 @@ const MAX_DEPTH: usize = 64;
 const MAX_EXACT_EXPONENT: i128 = 4_096;
 /// Significant digits shown for inexact results.
 const SIGNIFICANT_DIGITS: usize = 12;
+const FUNCTIONS: [&str; 11] = [
+    "sqrt", "abs", "round", "floor", "ceil", "min", "max", "ln", "log10", "log2", "exp",
+];
+const CONSTANTS: [&str; 3] = ["pi", "π", "e"];
 
 /// The outcome of one expression in a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,15 +73,52 @@ pub fn evaluate_batch(input: &str) -> Result<Vec<Line>, String> {
             expressions.len()
         ));
     }
+    let mut names = HashMap::new();
     Ok(expressions
         .into_iter()
         .map(|expression| Line {
             input: expression.to_owned(),
-            outcome: evaluate(expression)
-                .map(|(normalised, value)| format!("{normalised} = {value}"))
+            outcome: evaluate_line(expression, &mut names)
                 .map_err(|error| format!("error at column {}: {}", error.column, error.message)),
         })
         .collect())
+}
+
+/// One batch line: an expression, or `name = expression` naming its value.
+fn evaluate_line(line: &str, names: &mut HashMap<String, Value>) -> Result<String, CalcError> {
+    let Some((name, expression, offset)) = assignment(line) else {
+        let (normalised, value) = evaluate_with(line, names, 0)?;
+        return Ok(format!("{normalised} = {}", format_value(&value)?));
+    };
+    if FUNCTIONS.contains(&name.to_ascii_lowercase().as_str())
+        || CONSTANTS.contains(&name.to_ascii_lowercase().as_str())
+    {
+        return fail(
+            1,
+            format!("\"{name}\" is a built-in name; pick another name"),
+        );
+    }
+    let (normalised, value) = evaluate_with(expression, names, offset)?;
+    let shown = format_value(&value)?;
+    names.insert(name.to_owned(), value);
+    Ok(format!("{name} = {normalised} = {shown}"))
+}
+
+/// Split `name = expression`, returning the expression's column offset.
+fn assignment(line: &str) -> Option<(&str, &str, usize)> {
+    let (left, right) = line.split_once('=')?;
+    let name = left.trim();
+    let mut chars = name.chars();
+    let identifier = chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    let expression = right.trim_start();
+    if !identifier || expression.trim().is_empty() || expression.starts_with('=') {
+        return None;
+    }
+    let offset = line.chars().count() - expression.chars().count();
+    Some((name, expression, offset))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,20 +137,39 @@ fn fail<T>(column: usize, message: impl Into<String>) -> Result<T, CalcError> {
 
 /// Evaluate one expression to its normalised form and formatted value.
 pub fn evaluate(expression: &str) -> Result<(String, String), CalcError> {
+    let (normalised, value) = evaluate_with(expression, &HashMap::new(), 0)?;
+    Ok((normalised, format_value(&value)?))
+}
+
+/// `offset` shifts every reported column, for an expression that follows a
+/// name on its line.
+fn evaluate_with(
+    expression: &str,
+    names: &HashMap<String, Value>,
+    offset: usize,
+) -> Result<(String, Value), CalcError> {
+    let shift = |error: CalcError| CalcError {
+        column: error.column + offset,
+        message: error.message,
+    };
     let expression = expression.trim();
     let expression = expression
         .strip_suffix('=')
         .map(str::trim_end)
         .unwrap_or(expression);
-    let tokens = lex(expression)?;
+    let mut tokens = lex(expression).map_err(shift)?;
     if tokens.is_empty() {
         return fail(1, "no expression to calculate");
     }
+    for token in &mut tokens {
+        token.column += offset;
+    }
     let mut parser = Parser {
         tokens: &tokens,
+        names,
         position: 0,
         depth: 0,
-        end: expression.chars().count() + 1,
+        end: offset + expression.chars().count() + 1,
     };
     let value = parser.expression()?;
     if let Some(token) = parser.peek() {
@@ -112,13 +179,26 @@ pub fn evaluate(expression: &str) -> Result<(String, String), CalcError> {
                 token.column,
                 "unexpected \",\"; commas only separate function arguments or group thousands as 1,234",
             ),
+            Kind::Name(ref name)
+                if !FUNCTIONS.contains(&name.as_str())
+                    && !CONSTANTS.contains(&name.as_str())
+                    && !names.contains_key(&token.text) =>
+            {
+                fail(
+                    token.column,
+                    format!(
+                        "unexpected \"{}\" after the expression; write only arithmetic, or name the value first, such as secs = 1474 / 1000",
+                        token.text
+                    ),
+                )
+            }
             _ => fail(
                 token.column,
                 "missing operator between values; use * to multiply",
             ),
         };
     }
-    Ok((normalise(&tokens), format_value(&value)?))
+    Ok((normalise(&tokens), value))
 }
 
 // ---------------------------------------------------------------- lexing
@@ -219,7 +299,7 @@ fn lex(expression: &str) -> Result<Vec<Token>, CalcError> {
             '=' => {
                 return fail(
                     column,
-                    "\"=\" is not supported; pass only the expression to calculate",
+                    "\"=\" only names a value at the start of a line, such as total = 140 + 90",
                 );
             }
             other => return fail(column, format!("unexpected \"{other}\"")),
@@ -392,6 +472,8 @@ fn normalise(tokens: &[Token]) -> String {
 
 struct Parser<'a> {
     tokens: &'a [Token],
+    /// Values named earlier in the batch.
+    names: &'a HashMap<String, Value>,
     position: usize,
     depth: usize,
     /// The column just past the end, for "ends early" errors.
@@ -531,7 +613,7 @@ impl Parser<'_> {
                     ),
                 }
             }
-            Kind::Name(name) => self.name(&name, token.column),
+            Kind::Name(name) => self.name(&name, &token.text, token.column),
             Kind::RParen => fail(token.column, "unexpected \")\"; check the parentheses"),
             Kind::Comma => fail(token.column, "unexpected \",\"; add a number before it"),
             Kind::Modulo => fail(
@@ -545,34 +627,25 @@ impl Parser<'_> {
         }
     }
 
-    fn name(&mut self, name: &str, column: usize) -> Result<Value, CalcError> {
+    /// `name` is lowercased for built-ins; `written` is the name as typed,
+    /// which is how values named in the batch are looked up.
+    fn name(&mut self, name: &str, written: &str, column: usize) -> Result<Value, CalcError> {
         match name {
             "pi" | "π" => return Ok(Value::Float(std::f64::consts::PI)),
             "e" => return Ok(Value::Float(std::f64::consts::E)),
             _ => {}
         }
-        let known = matches!(
-            name,
-            "sqrt"
-                | "abs"
-                | "round"
-                | "floor"
-                | "ceil"
-                | "min"
-                | "max"
-                | "ln"
-                | "log10"
-                | "log2"
-                | "exp"
-        );
-        if !known {
+        if let Some(value) = self.names.get(written) {
+            return Ok(value.clone());
+        }
+        if !FUNCTIONS.contains(&name) {
             let hint = match name {
                 "log" => "\"log\" is ambiguous; use ln, log10 or log2".to_owned(),
                 "x" => "use * to multiply".to_owned(),
                 "mod" => "use % for modulo".to_owned(),
                 "pow" => "use ^ for powers, such as 2^10".to_owned(),
                 _ => format!(
-                    "unknown name \"{name}\"; calculate only evaluates numbers, so substitute the value"
+                    "unknown name \"{written}\"; name it on an earlier line of this call, such as {written} = 1474, or substitute the value"
                 ),
             };
             return fail(column, hint);
@@ -1094,6 +1167,10 @@ mod tests {
         let name = error("pace * 1.1");
         assert_eq!(name.column, 1);
         assert!(name.message.contains("substitute the value"));
+        assert!(
+            error("Pace * 2").message.contains("unknown name \"Pace\""),
+            "names keep their case"
+        );
         assert!(error("log(10)").message.contains("ln, log10 or log2"));
         assert_eq!(error("1 / 0").message, "division by zero");
         assert_eq!(error("5 % 0").message, "modulo by zero");
@@ -1103,11 +1180,17 @@ mod tests {
         assert!(error("(-8)^0.5").message.contains("fractional power"));
         assert!(error("10^400 * 10^400").message.contains("too large"));
         assert!(error("2 3").message.contains("use * to multiply"));
+        assert!(error("2 pi").message.contains("use * to multiply"));
+        assert!(
+            error("(1480/1.1/1000) as secs")
+                .message
+                .contains("unexpected \"as\" after the expression")
+        );
         assert!(error("2(3)").message.contains("use * to multiply"));
         assert!(error("1 +").message.contains("ends early"));
         assert!(error("10%").message.contains("percentage"));
         assert!(error("1,23").message.contains("use . for decimals"));
-        assert!(error("2 = 3").message.contains("\"=\" is not supported"));
+        assert!(error("2 = 3").message.contains("only names a value"));
         assert_eq!(error("3 $ 4").column, 3);
         assert!(error("round(1, 2, 3)").message.contains("1 or 2 arguments"));
         assert!(error("sqrt 4").message.contains("parentheses"));
@@ -1142,6 +1225,54 @@ mod tests {
             evaluate_batch(&"1;".repeat(51))
                 .unwrap_err()
                 .contains("limit is 50")
+        );
+    }
+
+    #[test]
+    fn batches_can_name_values_for_later_lines() {
+        let lines = evaluate_batch(
+            "A = 2500 * (1 + 0.045/12)^(12*7); A - 2500\ntotal = 140+90+70\ntotal / 1.1\nTotal",
+        )
+        .unwrap();
+        let outcomes: Vec<_> = lines.iter().map(|line| line.outcome.clone()).collect();
+        assert_eq!(
+            outcomes[0],
+            Ok("A = 2500 * (1 + 0.045 / 12)^(12 * 7) = 3423.63064228".into())
+        );
+        assert_eq!(outcomes[1], Ok("A - 2500 = 923.630642285".into()));
+        assert_eq!(outcomes[2], Ok("total = 140 + 90 + 70 = 300".into()));
+        assert_eq!(outcomes[3], Ok("total / 1.1 = 272.727272727".into()));
+        assert!(
+            outcomes[4]
+                .as_ref()
+                .unwrap_err()
+                .contains("unknown name \"Total\"")
+        );
+        // A name never leaks into another call.
+        assert!(evaluate_batch("total").unwrap()[0].outcome.is_err());
+        // Errors in a named expression point at the column in the whole line.
+        let bad = evaluate_batch("x2 = 4 * (2").unwrap();
+        assert_eq!(
+            bad[0].outcome,
+            Err("error at column 12: missing \")\"; the \"(\" at column 10 is never closed".into())
+        );
+        assert!(
+            evaluate_batch("pi = 3").unwrap()[0]
+                .outcome
+                .as_ref()
+                .unwrap_err()
+                .contains("built-in")
+        );
+        assert!(
+            evaluate_batch("max = 3").unwrap()[0]
+                .outcome
+                .as_ref()
+                .unwrap_err()
+                .contains("built-in")
+        );
+        assert_eq!(
+            evaluate_batch("1474 / 1.1 =").unwrap()[0].outcome,
+            Ok("1474 / 1.1 = 1340".into())
         );
     }
 
@@ -1211,7 +1342,9 @@ impl mojentic::llm::tools::LlmTool for CalculateTool {
                 Err(error) => format!("{}  ->  {error}", line.input),
             })
             .collect();
-        if lines.iter().all(|line| line.outcome.is_ok()) {
+        // A batch with some good lines still answers; the failing lines say
+        // why. Only a call with no usable result is a tool error.
+        if lines.iter().any(|line| line.outcome.is_ok()) {
             Ok(serde_json::json!({ "results": rendered }))
         } else {
             Err(tool_error(rendered.join("\n")))
@@ -1223,7 +1356,7 @@ impl mojentic::llm::tools::LlmTool for CalculateTool {
             r#type: "function".to_string(),
             function: mojentic::llm::tools::FunctionDescriptor {
                 name: "calculate".to_string(),
-                description: "Evaluate arithmetic exactly. Use it for any arithmetic with more than one trivial step instead of computing in your head. Pass one expression, or several separated by newlines or \";\". Supports + - * / // % ^ and parentheses, sqrt abs round floor ceil min max ln log10 log2 exp, and pi e. Only numbers: substitute values for names. Example: {\"expression\": \"140+90+70\\n1474/1.1\"} returns \"140 + 90 + 70 = 300\" and \"1474 / 1.1 = 1340\".".to_string(),
+                description: "Exact arithmetic. Do sums, ratios, percentages and conversions here instead of in your head; models make arithmetic slips. Pass one expression, or several separated by newlines or \";\"; a line such as \"total = 140+90\" names a value for later lines. Supports + - * / // % ^ and parentheses, sqrt abs round floor ceil min max ln log10 log2 exp, and pi e. Other names must be defined that way first. Example: {\"expression\": \"140+90+70\\n1474/1.1\"} returns \"140 + 90 + 70 = 300\" and \"1474 / 1.1 = 1340\".".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

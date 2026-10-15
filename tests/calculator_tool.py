@@ -65,6 +65,7 @@ for provider in ("omlx", "ollama"):
     server, requests = serve(provider, [
         ("", ("calculate", {"expression": "140+90+70+120+350+60+60+154+60+280+90\n1474/1.1"})),
         ("", ("calculate", {"expression": "1354 / (1.1"})),
+        ("", ("calculate", {"expression": "total = 140 + 90\ntotal / 1.1\n(total / 1000) as secs"})),
         ("The total is 1474 ms and the new length is 1340 ms.", None),
     ])
     host = f"http://127.0.0.1:{server.server_port}"
@@ -83,11 +84,15 @@ for provider in ("omlx", "ollama"):
         ]}, batch
         error = json.loads(tool_message(requests[2]))
         assert "error at column" in error["error"] and "never closed" in error["error"], error
+        # A batch with some good lines still answers; the bad line says why.
+        mixed = json.loads(tool_message(requests[3]))["results"]
+        assert mixed[:2] == ["total = 140 + 90 = 230", "total / 1.1 = 209.090909091"], mixed
+        assert "unexpected \"as\" after the expression" in mixed[2], mixed
         trace = json.loads(output.stdout)["trace_file"]
         results = [json.loads(line)["payload"] for line in Path(trace).read_text().splitlines()
                    if json.loads(line)["kind"] == "llm.context_assembly.appended"
                    and json.loads(line)["payload"].get("component") == "tool_result"]
-        assert [r["ok"] for r in results] == [True, False], results
+        assert [r["ok"] for r in results] == [True, False, True], results
     finally:
         server.shutdown()
         server.server_close()

@@ -45,9 +45,9 @@ enum Stage {
     Lines,
 }
 
-/// Playback speed against the prototype's timeline. 1.0 plays it in about
-/// 1480 ms; raise it to play faster, lower it to play slower. At 1.1 it
-/// takes about 1340 ms, 10% quicker than the prototype.
+/// Playback speed against the prototype's timeline, whose holds sum to
+/// 1474 ms at 1.0; raise it to play faster, lower it to play slower. At 1.1
+/// it takes 1340 ms, 10% quicker than the prototype.
 const PACE: f64 = 1.1;
 
 /// Each stage and how long it holds in the prototype at speed 1, in
