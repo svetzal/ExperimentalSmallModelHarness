@@ -1187,6 +1187,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ordinary_noop_stream_is_preserved_without_a_dummy_credential() {
+        let deltas: Vec<(bool, String)> = serde_json::from_str(include_str!(
+            "../fixtures/recovery/ordinary_noop_stream.json"
+        ))
+        .unwrap();
+        let expected = |reasoning| {
+            deltas
+                .iter()
+                .filter(|(channel, _)| *channel == reasoning)
+                .map(|(_, text)| text.as_str())
+                .collect::<String>()
+        };
+        assert!(expected(true).contains("`true` noop"));
+        for secrets in [Vec::new(), vec!["private-example-token".to_owned()]] {
+            let mut filter = SemanticFilter::default();
+            let mut output = Vec::new();
+            for (reasoning, text) in &deltas {
+                output.extend(filter.push(*reasoning, text.clone(), &secrets).unwrap());
+            }
+            output.extend(filter.release(usize::MAX));
+            for reasoning in [false, true] {
+                let actual = output
+                    .iter()
+                    .filter_map(|chunk| match (reasoning, chunk) {
+                        (true, StreamChunk::Thinking(text))
+                        | (false, StreamChunk::Content(text)) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                assert_eq!(actual, expected(reasoning));
+            }
+            for provider in ["ollama", "omlx"] {
+                let raw = deltas
+                    .iter()
+                    .map(|(reasoning, text)| {
+                        if provider == "ollama" {
+                            json!({"message": if *reasoning {
+                                json!({"thinking": text, "content": ""})
+                            } else { json!({"content": text}) }})
+                            .to_string()
+                        } else {
+                            let field = if *reasoning {
+                                "reasoning_content"
+                            } else {
+                                "content"
+                            };
+                            format!("data: {}", json!({"choices": [{"delta": {(field): text}}]}))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(!encoded_credential(raw.as_bytes(), &secrets));
+                assert!(encoded_credential(raw.as_bytes(), &["noop".to_owned()]));
+            }
+        }
+        // A caller that explicitly supplies this value still gets protection.
+        // Fix the benchmark configuration instead of exempting a magic string.
+        let mut filter = SemanticFilter::default();
+        let secrets = vec!["noop".to_owned()];
+        let rejected = deltas
+            .iter()
+            .position(|(reasoning, text)| filter.push(*reasoning, text.clone(), &secrets).is_err())
+            .unwrap();
+        assert_eq!(deltas[rejected], (true, " noop".to_owned()));
+    }
+
+    #[test]
     fn empty_content_does_not_retain_a_disproved_reasoning_prefix() {
         let secrets = vec!["noop".to_owned()];
         for provider in ["ollama", "omlx"] {
