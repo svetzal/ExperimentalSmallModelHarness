@@ -336,6 +336,55 @@ fn project_guidance(wire: Wire) {
         1,
         "the nested file was injected once"
     );
+    // Residency: root guidance at the start, nested guidance on delivery,
+    // and the second read under sub/ references it.
+    let activated: Vec<(String, String)> = trace_payloads(&trace, "context.residency.activated")
+        .iter()
+        .map(|event| {
+            (
+                event["item"].as_str().unwrap().to_owned(),
+                event["kind"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        activated,
+        [
+            (
+                format!("guidance:{}", user_guidance.display()),
+                "root_guidance".to_owned()
+            ),
+            ("guidance:AGENTS.md".to_owned(), "root_guidance".to_owned()),
+            (
+                "guidance:sub/AGENTS.md".to_owned(),
+                "nested_guidance".to_owned()
+            ),
+        ]
+    );
+    let referenced = trace_payloads(&trace, "context.residency.referenced");
+    assert_eq!(referenced.len(), 1, "{referenced:?}");
+    assert_eq!(referenced[0]["item"], "guidance:sub/AGENTS.md");
+    assert_eq!(referenced[0]["via"], "tool_call");
+    assert_eq!(referenced[0]["path"], "sub/notes.txt");
+    let ledgers = trace_payloads(&trace, "llm.context_assembly.ledger");
+    let last = ledgers.last().unwrap();
+    let item = |id: &str| {
+        last["residency"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from {}", last["residency"]))
+            .clone()
+    };
+    // Tool results continue the same turn at a deeper call.
+    assert_eq!(item("guidance:sub/AGENTS.md")["last_referenced_turn"], 1);
+    assert_eq!(item("guidance:AGENTS.md")["pinned"], true);
+    assert_eq!(item("tool:read_file")["kind"], "tool_descriptor");
+    assert_eq!(item("tool:read_file")["pinned"], true);
+    assert_eq!(item("prompt")["inclusion_reason"], "current_user_prompt");
+    assert_eq!(last["standing_context"]["items"], 3);
+    assert_eq!(last["standing_context"]["enforced"], false);
 
     // Guidance never changes the tools; the flag removes it entirely.
     let plain = MockProvider::replying(wire, vec![content("Done.")]);

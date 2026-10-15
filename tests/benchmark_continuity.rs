@@ -299,6 +299,20 @@ fn capture(
             .is_some_and(|kind| kind.starts_with("session."))),
         "{label}: a benchmark trace recorded session events"
     );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("context.residency")
+                    || kind == "context.window.resolved")),
+        "{label}: a benchmark trace recorded residency or a discovered window"
+    );
+    assert!(
+        ledgers.iter().all(|ledger| ledger.get("residency").is_none()
+            && ledger.get("known_window").is_none()),
+        "{label}: a benchmark ledger carries residency fields"
+    );
     let requests = provider.requests();
     assert_eq!(
         requests.len(),

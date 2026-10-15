@@ -22,6 +22,16 @@ The release workflow publishes each version's section as its GitHub release note
   keeps the answer for later exchanges. A discovered window is used for
   accounting only: Ollama's `num_ctx` and the run policies that read the
   window are unchanged. Benchmark mode makes no discovery request.
+- Everyday `run` and the conversation record context residency in the
+  trace: each ledger lists every item in the request (base prompt, tool
+  descriptors, guidance, conversation turns, tool results, file observations)
+  with its kind, owner, reason, tokens, position, activation turn, last
+  reference, and whether it is pinned or demoted, plus standing guidance
+  tokens against the 15% standing-context limit. `context.residency.*`
+  events mark guidance activation, nested guidance references, and each
+  existing compaction as a demotion. This is measurement only: nothing sent
+  to the model changes, no limit is enforced, and benchmark traces are
+  unchanged.
 - Each `llm.context_assembly.response` trace event records the request's time
   to first token, the kind of that token (content, thinking, or tool call),
   and its total duration, in every mode.

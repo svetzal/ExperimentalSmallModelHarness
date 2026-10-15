@@ -126,6 +126,56 @@ call within that turn. Tool results normally increase depth without advancing
 the turn; a harness follow-up normally advances the turn and resets depth to
 zero.
 
+## Context window and residency
+
+Everyday `run` and the conversation record these; benchmark runs do not, so
+their traces are unchanged.
+
+`context.window.resolved` follows `run.started`. It holds `tokens`, `source`
+(`explicit`, `provider`, `fallback_table`, or `unknown`), the provider `field`
+when the provider gave the window, `discovery_error` when discovery was tried
+and failed, `discovery_ms`, and `cached` when the conversation reused a window
+from an earlier exchange.
+
+Each `llm.context_assembly.ledger` then gains:
+
+- `known_window`: `tokens`, `source`, `utilization`, and `pressure_band`
+  against the resolved window. The ledger's own `context_window_tokens`,
+  `utilization`, and `pressure_band` stay on the configured window, because
+  run policies read them.
+- `residency`: one record per item in the request. Each has `id`, `kind`
+  (`base_prompt`, `tool_descriptor`, `root_guidance`, `nested_guidance`,
+  `conversation_turn`, `harness_instruction`, `tool_result`, or
+  `file_observation`), `owner`, `inclusion_reason`, `estimated_tokens`,
+  `position` (`stable_prefix` or `volatile_tail`), `activated_turn`,
+  `last_referenced_turn`, `pinned`, `demoted`, and `component_index`, the
+  ledger component that carries it (`null` for tool descriptors). The system
+  message holds several items: the base prompt, one per guidance file, and
+  `guidance:framing` for the section's own text.
+- `standing_context`: guidance tokens in this request against the combined
+  standing-context limit: `estimated_tokens`, `items`, `limit_tokens`,
+  `limit_fraction`, `window_tokens`, `window_assumed` (32,000 when the window
+  is unknown), `headroom_tokens`, `over_limit`, and `enforced` (always
+  `false` until ejection exists).
+- `residency_settings`: the effective `standing_context_limit` and
+  `guidance_fraction`.
+
+Discrete residency events carry `item`, `kind`, and `turn`:
+
+- `context.residency.activated`: root, ancestor, and user guidance at the
+  start of each run, and nested guidance when it is delivered. Nested
+  guidance is delivered once per run, so once per conversation exchange.
+- `context.residency.referenced`: delivered nested guidance, `via`
+  `tool_call` when a tool call's `path`, `cwd`, or change path is inside its
+  directory, or `visible_output` when the model's reply names the guidance
+  file's path.
+- `context.residency.demoted`: a tool result summarized by
+  `tool_result_compaction` or `repair_packet_compaction`, or file
+  observations merged by `file_observation_coalescing` or dropped by
+  `superseded_file_observation_removal`.
+
+Nothing is ejected or reactivated yet, so there are no such events.
+
 ## Performance assessment
 
 Before attributing a failure to model capability:

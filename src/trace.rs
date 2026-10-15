@@ -71,12 +71,20 @@ impl TraceRecorder {
             credential_redacted: credential_redacted.then_some(true),
             exact: credential_redacted.then_some(false),
         };
-        let mut file = self.file.lock().expect("trace mutex poisoned");
-        serde_json::to_writer(&mut *file, &record)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
+        {
+            let mut file = self.file.lock().expect("trace mutex poisoned");
+            serde_json::to_writer(&mut *file, &record)?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+        }
         if let Some(conversation) = &self.conversation {
             conversation.observe(kind, &record.payload);
+        }
+        // Today's compaction passes, seen as residency demotions.
+        if let Some(residency) = &self.residency {
+            for (kind, payload) in residency.observe(kind, &record.payload) {
+                self.value_event(kind, payload)?;
+            }
         }
         Ok(())
     }

@@ -557,7 +557,7 @@ impl NestedGuidance {
 }
 
 /// Paths a tool call names: `path`, `cwd`, and each change's `path`.
-fn touched_paths(arguments: &std::collections::HashMap<String, Value>) -> Vec<String> {
+pub(crate) fn touched_paths(arguments: &std::collections::HashMap<String, Value>) -> Vec<String> {
     let mut paths: Vec<String> = ["path", "cwd"]
         .iter()
         .filter_map(|key| {
@@ -578,7 +578,7 @@ fn touched_paths(arguments: &std::collections::HashMap<String, Value>) -> Vec<St
 }
 
 /// Whether a project-relative path is the directory or inside it.
-fn applies(directory: &str, path: &str) -> bool {
+pub(crate) fn applies(directory: &str, path: &str) -> bool {
     let path = path.trim_start_matches("./").trim_end_matches('/');
     path == directory || path.starts_with(&format!("{directory}/"))
 }

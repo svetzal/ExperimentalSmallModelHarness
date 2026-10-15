@@ -479,7 +479,10 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     let trace =
         TraceRecorder::create_for_conversation(&trace_dir, conversation.clone(), conversational)?;
     let trace = Arc::new(match &config.context_window {
-        Some(window) => trace.with_residency(crate::residency::Residency::new(window.clone())),
+        Some(window) => trace.with_residency(crate::residency::Residency::new(
+            window.clone(),
+            crate::residency::Settings::default(),
+        )),
         None => trace,
     });
     // Accounting uses the known window; `num_ctx` and run policies keep
@@ -741,6 +744,9 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         if let Some(section) = crate::guidance::system_section(&discovery) {
             system_prompt.push_str(&section);
         }
+        if let Some(residency) = trace.residency() {
+            residency.activate_guidance(&trace, &discovery)?;
+        }
         if let Some(session) = &conversation {
             guidance_notice = session.note_guidance(crate::guidance::fingerprints(&discovery));
             if let Some(notice) = &guidance_notice {
@@ -841,6 +847,9 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     let protected_users = conversation
         .as_ref()
         .map_or(1, |session| session.protected_users());
+    if let Some(residency) = trace.residency() {
+        residency.set_protected_users(protected_users);
+    }
     let worker_message = match guidance_notice {
         Some(notice) => format!("{worker_message}\n\n{notice}"),
         None => worker_message,
@@ -2379,7 +2388,7 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         previous_call_total_chars = ledger.total_chars();
         let mut ledger_record = serde_json::to_value(&ledger)?;
         if let Some(residency) = trace.residency() {
-            residency.annotate_ledger(&mut ledger_record);
+            residency.annotate_ledger(&mut ledger_record, &current_messages, active_tools, turn);
         }
         trace.value_event("llm.context_assembly.ledger", ledger_record)?;
         if let Some(decision) = repair_depth_decision(validation_repair_active, &ledger) {
@@ -2900,6 +2909,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
         }
         drop(stream);
         let timing = first_token.finish();
+        if let Some(residency) = trace.residency() {
+            residency.reference_text(trace, &call_content, turn)?;
+        }
 
         trace.event(
             "llm.context_assembly.response",
@@ -3114,6 +3126,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                 .iter()
                 .map(|call| &call.arguments)
                 .collect();
+            if let Some(residency) = trace.residency() {
+                residency.reference_tool_calls(trace, &arguments, turn)?;
+            }
             for file in nested.take_for(&arguments) {
                 let message = crate::guidance::nested_message(&file);
                 trace.event(
@@ -3130,6 +3145,9 @@ async fn stream_response<G: LlmGateway + ?Sized>(
                         "chars": message.chars().count(),
                     }),
                 )?;
+                if let Some(residency) = trace.residency() {
+                    residency.activate_nested(trace, &file, &message, turn)?;
+                }
                 current_messages.push(LlmMessage::user(message));
             }
         }
@@ -5395,7 +5413,7 @@ pub(crate) fn pressure_band(utilization: Option<f64>) -> &'static str {
     }
 }
 
-fn message_chars(message: &LlmMessage) -> usize {
+pub(crate) fn message_chars(message: &LlmMessage) -> usize {
     message.content.as_deref().unwrap_or_default().len()
         + message
             .reasoning_content
