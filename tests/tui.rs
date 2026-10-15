@@ -1601,7 +1601,14 @@ fn discovered_window_and_residency(wire: Wire) {
         "a known window shows a percentage: {bar}"
     );
     let rows = panel_rows(&screen);
-    panel_row(&rows, "of 100.0k tokens");
+    // Ollama's num_ctx (Mojentic's default here) bounds the advertised window.
+    panel_row(
+        &rows,
+        match wire {
+            Wire::Omlx => "of 100.0k tokens",
+            Wire::Ollama => "of 32.8k tokens",
+        },
+    );
     for line in [
         "base system prompt · pinned · since turn 1",
         "project guidance discovered · pinned · since turn 1",

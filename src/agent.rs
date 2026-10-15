@@ -486,7 +486,16 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         crate::residency::Settings::with(config.standing_context_limit, config.guidance_fraction);
     let trace =
         TraceRecorder::create_for_conversation(&trace_dir, conversation.clone(), conversational)?;
-    let trace = Arc::new(match &config.context_window {
+    // Ollama runs each request with the num_ctx it is sent, so that bounds
+    // the window Microgentic accounts against.
+    let context_window = config
+        .context_window
+        .clone()
+        .map(|window| match config.provider {
+            Provider::Ollama => window.within_num_ctx(completion_config.num_ctx),
+            Provider::Omlx => window,
+        });
+    let trace = Arc::new(match &context_window {
         Some(window) => trace.with_residency(crate::residency::Residency::new(
             window.clone(),
             residency_settings,
@@ -495,8 +504,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     });
     // Accounting uses the known window; `num_ctx` and run policies keep
     // `context_window_tokens`.
-    let accounting_window_tokens = config
-        .context_window
+    let accounting_window_tokens = context_window
         .as_ref()
         .map_or(config.context_window_tokens, |window| window.tokens);
     if let Some(session) = &conversation {
@@ -561,7 +569,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         }),
     )?;
 
-    if let Some(window) = &config.context_window {
+    if let Some(window) = &context_window {
         trace.event("context.window.resolved", window)?;
     }
     // Explicit settings are recorded in every mode; benchmark runs have no
@@ -9270,6 +9278,7 @@ mod tests {
             discovery_error: None,
             discovery_ms: Some(1),
             cached: false,
+            advertised_tokens: None,
         };
         let mut requests = Vec::new();
         for (configured, known) in [
@@ -9294,15 +9303,17 @@ mod tests {
                 ledger["context_window_tokens"],
                 serde_json::json!(configured)
             );
+            let num_ctx = request["completion"]["num_ctx"].as_u64().unwrap();
             match &known {
-                Some(window) => {
-                    assert_eq!(ledger["known_window"]["tokens"], 262_144);
+                Some(_) => {
+                    // Ollama runs with the num_ctx it is sent, which bounds
+                    // the advertised window for accounting.
+                    assert_eq!(ledger["known_window"]["tokens"], num_ctx);
                     assert_eq!(ledger["known_window"]["source"], "provider");
-                    assert_eq!(ledger["known_window"]["pressure_band"], "green");
-                    assert_eq!(
-                        trace_payloads(&trace, "context.window.resolved"),
-                        vec![serde_json::to_value(window).unwrap()]
-                    );
+                    let resolved = trace_payloads(&trace, "context.window.resolved").remove(0);
+                    assert_eq!(resolved["tokens"], num_ctx);
+                    assert_eq!(resolved["advertised_tokens"], 262_144);
+                    assert_eq!(resolved["source"], "provider");
                 }
                 None => {
                     assert!(ledger.get("known_window").is_none());

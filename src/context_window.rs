@@ -43,6 +43,10 @@ pub struct ContextWindow {
     /// Reused from an earlier exchange of the same conversation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cached: bool,
+    /// The larger window the source gave, when the `num_ctx` that Ollama
+    /// receives is smaller and so sets the real limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_tokens: Option<usize>,
 }
 
 impl ContextWindow {
@@ -60,6 +64,21 @@ impl ContextWindow {
             discovery_error: None,
             discovery_ms: None,
             cached: false,
+            advertised_tokens: None,
+        }
+    }
+
+    /// Ollama runs a request with the `num_ctx` it sends, so a larger
+    /// advertised window is not usable. Keep the advertised size for the
+    /// record and account against `num_ctx`.
+    pub fn within_num_ctx(self, num_ctx: usize) -> Self {
+        match self.tokens {
+            Some(tokens) if num_ctx > 0 && tokens > num_ctx => Self {
+                tokens: Some(num_ctx),
+                advertised_tokens: Some(tokens),
+                ..self
+            },
+            _ => self,
         }
     }
 
@@ -91,6 +110,7 @@ impl ContextWindow {
                 discovery_error: None,
                 discovery_ms,
                 cached: false,
+                advertised_tokens: None,
             },
             Ok(Ok(None)) => Self {
                 discovery_error: Some(
@@ -192,6 +212,22 @@ mod tests {
             (None, WindowSource::Unknown)
         );
         assert_eq!(unknown.discovery_error.as_deref(), Some("HTTP 404"));
+    }
+
+    #[test]
+    fn ollama_accounts_against_the_num_ctx_it_sends() {
+        let advertised = ContextWindow {
+            tokens: Some(262_144),
+            source: WindowSource::Provider,
+            ..ContextWindow::configured(None, None)
+        };
+        let capped = advertised.clone().within_num_ctx(32_768);
+        assert_eq!(capped.tokens, Some(32_768));
+        assert_eq!(capped.advertised_tokens, Some(262_144));
+        assert_eq!(capped.source, WindowSource::Provider);
+        assert_eq!(advertised.clone().within_num_ctx(524_288), advertised);
+        let unknown = ContextWindow::configured(None, None);
+        assert_eq!(unknown.clone().within_num_ctx(32_768), unknown);
     }
 
     #[tokio::test]

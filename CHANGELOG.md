@@ -21,7 +21,9 @@ The release workflow publishes each version's section as its GitHub release note
   with utilization and pressure against it. The conversation asks once and
   keeps the answer for later exchanges. A discovered window is used for
   accounting only: Ollama's `num_ctx` and the run policies that read the
-  window are unchanged. Benchmark mode makes no discovery request.
+  window are unchanged. On Ollama the accounting window is at most the
+  `num_ctx` each request already sends, because Ollama runs the model with
+  it. Benchmark mode makes no discovery request.
 - Everyday `run` and the conversation record context residency in the
   trace: each ledger lists every item in the request (base prompt, tool
   descriptors, guidance, conversation turns, tool results, file observations)

@@ -135,7 +135,9 @@ their traces are unchanged.
 (`explicit`, `provider`, `fallback_table`, or `unknown`), the provider `field`
 when the provider gave the window, `discovery_error` when discovery was tried
 and failed, `discovery_ms`, and `cached` when the conversation reused a window
-from an earlier exchange.
+from an earlier exchange. Ollama runs each request with the `num_ctx` it is
+sent, so on Ollama `tokens` is at most that value; `advertised_tokens` then
+keeps the larger size the source gave.
 
 Each `llm.context_assembly.ledger` then gains:
 

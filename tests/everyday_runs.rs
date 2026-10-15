@@ -738,7 +738,17 @@ fn discovered_window(wire: Wire) {
             .expect("the window is traced")
     };
     let window = resolved(&after);
-    assert_eq!(window["tokens"], 262_144);
+    // Ollama runs with the num_ctx it is sent (Mojentic's default here), so
+    // that bounds the advertised window; oMLX uses the advertised window.
+    let known_tokens = match wire {
+        Wire::Omlx => 262_144,
+        Wire::Ollama => 32_768,
+    };
+    assert_eq!(window["tokens"], known_tokens);
+    assert_eq!(
+        window.get("advertised_tokens").cloned(),
+        (wire == Wire::Ollama).then(|| json!(262_144))
+    );
     assert_eq!(window["source"], "provider");
     assert_eq!(
         window["field"],
@@ -758,7 +768,7 @@ fn discovered_window(wire: Wire) {
         "{fallback}"
     );
     let ledger = trace_payloads(&trace_of(&after), "llm.context_assembly.ledger").remove(0);
-    assert_eq!(ledger["known_window"]["tokens"], 262_144);
+    assert_eq!(ledger["known_window"]["tokens"], known_tokens);
     assert_eq!(ledger["known_window"]["pressure_band"], "green");
     assert!(
         ledger["context_window_tokens"].is_null(),

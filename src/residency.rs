@@ -710,6 +710,7 @@ mod tests {
             discovery_error: None,
             discovery_ms: None,
             cached: false,
+            advertised_tokens: None,
         }
     }
 
