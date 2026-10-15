@@ -30,9 +30,5 @@ jobs:
         run: |
           sha256sum dist/microgentic-*.tar.gz > dist/SHA256SUMS
           sed -i 's|  dist/|  |' dist/SHA256SUMS
-          notes="docs/releases/$RELEASE_TAG.md"
-          if [ -f "$notes" ]; then
-            gh release create "$RELEASE_TAG" --verify-tag --title "Microgentic $RELEASE_TAG" --notes-file "$notes" dist/*
-          else
-            gh release create "$RELEASE_TAG" --verify-tag --title "Microgentic $RELEASE_TAG" --generate-notes dist/*
-          fi
+          python3 scripts/release-notes.py "$RELEASE_TAG" > release-notes.md
+          gh release create "$RELEASE_TAG" --verify-tag --title "Microgentic $RELEASE_TAG" --notes-file release-notes.md dist/*

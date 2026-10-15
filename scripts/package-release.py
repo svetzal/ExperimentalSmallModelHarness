@@ -13,6 +13,7 @@ root = Path(__file__).resolve().parents[1]
 tag, platform, revision = sys.argv[1:4]
 version = tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
 assert tag == "v" + version, "release tag must match Cargo.toml"
+subprocess.run([sys.executable, str(root / "scripts" / "release-notes.py"), tag], check=True, stdout=subprocess.DEVNULL)
 assert platform in ("darwin-arm64", "darwin-x64", "linux-x64")
 assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip() == revision
 assert not subprocess.check_output(["git", "status", "--porcelain"], cwd=root), "release checkout must be clean"

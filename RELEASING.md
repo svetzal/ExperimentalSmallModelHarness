@@ -23,7 +23,9 @@ Publishing needs user authorization. A direct request to publish supplies it.
 
 1. Update the version in `Cargo.toml`.
 2. Update `Cargo.lock` with Cargo.
-3. Add release notes in `docs/releases/vVERSION.md`.
+3. Move the `Unreleased` entries in `CHANGELOG.md` under a new `[VERSION] - DATE`
+   section and update the comparison links. Packaging fails without that
+   section, and the release workflow publishes it as the GitHub release notes.
 4. Run the checks in `AGENTS.md`.
 5. Commit the release preparation.
 6. Push the commit to `main`, and create and push an annotated `vVERSION` tag
