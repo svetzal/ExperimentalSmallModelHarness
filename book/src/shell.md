@@ -22,8 +22,8 @@ git diff --no-ext-diff | microgentic run --prompt 'Review this diff' > review.md
 microgentic run --prompt 'Explain this build failure' < build.log
 ```
 
-Commands in reference material are text for the model to read. They do not
-become validation probes.
+Commands in the prompt and in reference material are text for the model to
+read. They do not become validation probes.
 
 These inputs fail before any provider call:
 
@@ -33,10 +33,29 @@ These inputs fail before any provider call:
 - stdin that is not valid UTF-8, or that is larger than 1 MiB
 - no `--prompt` when stdin is a terminal
 
+## How a run ends
+
+A run is one exchange, like one message in the conversation view. The prompt
+reaches the model as you wrote it. A greeting gets a greeting, and a question
+gets an answer.
+
+The model can use its tools, and the run continues while it does. When you ask
+for a change, it can read files, edit them, and run a check before it replies.
+The first reply that has text and no tool calls ends the run. Before it ends,
+the runtime still asks the model to check unvalidated source changes and to fix
+a failed check.
+
+The model does not have to end with DONE or FAIL, and the run does not ask it
+to continue after it replies.
+
+`run --experiment`, `--goal` or `--contract` starts a task run instead. Task
+runs keep the task instructions, the DONE/FAIL ending, and declared probes.
+See [Benchmark mode](benchmark.md).
+
 ## Get the result
 
-The reply goes to stdout. Progress and diagnostics go to stderr. Redirect them
-separately:
+The reply goes to stdout, without blank lines before or after it. The streamed
+reply, progress, and diagnostics go to stderr. Redirect them separately:
 
 ```sh
 microgentic run < task.txt > result.txt 2> diagnostics.log
