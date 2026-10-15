@@ -293,6 +293,16 @@ how much the model has thought and for how long. Whitespace the model sends
 before tool calls no longer opens blank rows, so tool groups from successive
 model turns read as one block.
 
+Text wraps at word boundaries and reflows when the terminal is resized. No row
+starts with the space where a line broke. Indented lines, such as code, keep
+their indentation, and list items wrap under their text. A word wider than the
+row, such as a long URL, is split after `/`, `-`, `_`, `.` or `,` when two rows
+hold it; otherwise it is shortened in the middle with `…`, so its start and end
+stay visible. The `Evidence:` path is never shortened: it shows `~` for your
+home directory and wraps at `/` so it can be copied whole. Reply text that
+follows tool or thinking lines has one blank row above it. Markdown such as
+`**bold**` and backticks is shown as typed.
+
 Type a command that starts with `/` in the input. Commands run in the TUI and
 are never sent to the model:
 

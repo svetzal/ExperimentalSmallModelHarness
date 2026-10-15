@@ -145,6 +145,7 @@ def exercise(provider):
             "  ✓ list_tree . depth 2",
             "  ∴ The constant is likely in notes.txt.",
             "  ✓ read_file notes.txt",
+            "",
             "The pace is set by PACE.",
         ], exchange
         screen = "\n".join(rows.values())

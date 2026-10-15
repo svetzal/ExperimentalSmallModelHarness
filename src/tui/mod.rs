@@ -9,6 +9,7 @@ mod status_bar;
 mod styled;
 mod thinking;
 mod tool_lines;
+mod wrap;
 
 use crate::conversation::ConversationEvent;
 use anyhow::{Context, Result};
@@ -36,12 +37,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use styled::{Palette, Role, Styled, first_row, wrap};
+use styled::{Palette, Role, Styled, wrap_chars};
 use thinking::Ending;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
 use tool_lines::{SPINNER_FRAME, ToolLine, spinner};
+use wrap::{first_row, wrap};
 
 /// About 30 frames a second while the launch animation plays.
 const LAUNCH_FRAME: Duration = Duration::from_millis(33);
@@ -315,7 +317,7 @@ fn compose(view: &View, session: &Session, frame: usize, columns: u16, lines: u1
     let input = Styled::default()
         .with(Role::Prompt, "> ")
         .with(Role::Plain, &view.input);
-    let input_rows = wrap(&input, width);
+    let input_rows = wrap_chars(&input, width);
     let input_height = input_rows.len().min(4) as u16;
     let panel = view
         .panel
@@ -626,6 +628,16 @@ fn stopped() -> Status {
     Status::new(Phase::Stopped, "Stopped. You can follow up or Esc to quit.")
 }
 
+/// Show a path under the home directory as `~/…`, so the evidence footer
+/// fits more often. Other paths are unchanged.
+fn home_relative(path: &str, home: Option<&std::ffi::OsStr>) -> String {
+    let home = home.and_then(|home| home.to_str()).unwrap_or_default();
+    match path.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_owned(),
+    }
+}
+
 /// The runtime runs a batch in order, so the oldest running call is the
 /// one executing; later calls in the batch are still waiting.
 fn tool_activity(history: &History) -> String {
@@ -703,12 +715,11 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             // wording or tool history retained from an earlier prompt.
             if run.used_project_tools {
                 view.history.start_line();
+                let trace = summary["trace_file"].as_str().unwrap_or("unknown");
+                let home = std::env::var_os("HOME");
                 view.history.push(
-                    Role::Muted,
-                    &format!(
-                        "Evidence: {}\n",
-                        summary["trace_file"].as_str().unwrap_or("unknown")
-                    ),
+                    Role::Evidence,
+                    &format!("Evidence: {}\n", home_relative(trace, home.as_deref())),
                 );
             }
             view.status = ready_for_next();
@@ -866,7 +877,7 @@ mod tests {
         let text = history_text(&view);
         assert!(
             text.ends_with(
-                "Microgentic: Checking.\n  ✓ read_file notes.txt:1-2\n  ✗ shell_command sleep 1\nDone.\nEvidence: t.jsonl\n"
+                "Microgentic: Checking.\n  ✓ read_file notes.txt:1-2\n  ✗ shell_command sleep 1\n\nDone.\nEvidence: t.jsonl\n"
             ),
             "{text}"
         );
@@ -958,9 +969,29 @@ mod tests {
         let exchange = &text[text.find("Microgentic:").unwrap()..];
         assert_eq!(
             exchange,
-            "Microgentic: \n  ✓ shell_command grep -rniE \"pacing\" src | head\n  ✓ shell_command ls src/tui\n  ✓ list_tree . depth 3\n  ✓ read_file src/tui/launch.rs\n  ✓ shell_command grep -rn \"PACE\" src/tui\n  ✓ read_file src/tui/mod.rs:460-540\nFound it. The pace is set by `PACE`.\n\n```rust\nconst PACE: f64 = 2.0;\n```"
+            "Microgentic: \n  ✓ shell_command grep -rniE \"pacing\" src | head\n  ✓ shell_command ls src/tui\n  ✓ list_tree . depth 3\n  ✓ read_file src/tui/launch.rs\n  ✓ shell_command grep -rn \"PACE\" src/tui\n  ✓ read_file src/tui/mod.rs:460-540\n\nFound it. The pace is set by `PACE`.\n\n```rust\nconst PACE: f64 = 2.0;\n```"
         );
         assert!(!text.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn evidence_paths_under_home_start_with_a_tilde() {
+        use std::ffi::OsStr;
+        let home = Some(OsStr::new("/Users/svetzal"));
+        assert_eq!(
+            home_relative("/Users/svetzal/.local/state/run/t.jsonl", home),
+            "~/.local/state/run/t.jsonl"
+        );
+        assert_eq!(
+            home_relative("/Users/svetzalx/t.jsonl", home),
+            "/Users/svetzalx/t.jsonl"
+        );
+        assert_eq!(home_relative("/tmp/t.jsonl", home), "/tmp/t.jsonl");
+        assert_eq!(home_relative("/tmp/t.jsonl", None), "/tmp/t.jsonl");
+        assert_eq!(
+            home_relative("/tmp/t.jsonl", Some(OsStr::new(""))),
+            "/tmp/t.jsonl"
+        );
     }
 
     #[tokio::test]

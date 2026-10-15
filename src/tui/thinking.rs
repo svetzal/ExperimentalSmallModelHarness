@@ -5,7 +5,8 @@
 //! scrolling away. When thinking leads to tool calls it collapses to its last
 //! line above them; when it leads to a reply it is removed, because the reply
 //! speaks for itself.
-use super::styled::{Role, Styled, wrap};
+use super::styled::{Role, Styled};
+use super::wrap::wrap;
 use unicode_width::UnicodeWidthChar;
 
 /// Wrapped rows of live thinking kept on screen.

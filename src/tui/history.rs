@@ -117,6 +117,14 @@ impl History {
             visible.as_str()
         } else {
             self.reply_visible = true;
+            // Reply text after tool or thinking lines gets one blank row
+            // above it; on the heading line it needs none.
+            if matches!(
+                self.entries.last(),
+                Some(Entry::Tool(_) | Entry::Thinking(_))
+            ) {
+                self.push(Role::Plain, "\n");
+            }
             visible.trim_start()
         };
         self.push(Role::Plain, &clamp_blank_lines(visible));
@@ -339,8 +347,30 @@ mod tests {
         history.push_reply("\n\nThe pace is set by `PACE`.");
         assert_eq!(
             text(&history),
-            "Microgentic: \n  ∴ I'll search first.\n  ✓ shell_command\n  ∴ The constant is likely in launch.rs.\n  ✓ read_file src/tui/launch.rs\nThe pace is set by `PACE`."
+            "Microgentic: \n  ∴ I'll search first.\n  ✓ shell_command\n  ∴ The constant is likely in launch.rs.\n  ✓ read_file src/tui/launch.rs\n\nThe pace is set by `PACE`."
         );
+    }
+
+    #[test]
+    fn reply_text_after_tools_has_one_blank_row_and_tools_after_text_none() {
+        let mut history = History::default();
+        history.push(Role::AgentLabel, "Microgentic: ");
+        history.begin_reply();
+        history.push_reply("Checking the file.");
+        history.start_tool(call("c1", "read_file", "a.rs"));
+        history.finish_tool("c1", "read_file", true);
+        history.begin_reply();
+        history.push_reply("\n\nIt needs one change.");
+        history.start_tool(call("c2", "edit_file", "a.rs"));
+        history.finish_tool("c2", "edit_file", true);
+        think(&mut history, &["Done; summarise."]);
+        history.begin_reply();
+        history.push_reply("\nUpdated a.rs.");
+        assert_eq!(
+            text(&history),
+            "Microgentic: Checking the file.\n  ✓ read_file a.rs\n\nIt needs one change.\n  ✓ edit_file a.rs\n\nUpdated a.rs."
+        );
+        assert!(!text(&history).contains("\n\n\n"));
     }
 
     #[test]

@@ -175,7 +175,8 @@ pub(super) fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::styled::{rows_text, wrap};
+    use super::super::styled::rows_text;
+    use super::super::wrap::wrap;
     use super::*;
 
     fn command(input: &str) -> Command {

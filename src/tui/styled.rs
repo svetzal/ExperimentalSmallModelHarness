@@ -23,6 +23,8 @@ pub(super) enum Role {
     /// A letter about to land, before it takes the wordmark colour.
     Flash,
     Thinking,
+    /// A path to copy, such as the evidence trace: wrapped, never shortened.
+    Evidence,
     Error,
     Prompt,
     System,
@@ -59,7 +61,7 @@ impl Palette {
             // Bold default foreground: bright on dark themes, dark on light ones.
             Role::Flash => (None, &[Attribute::Bold]),
             Role::UserLabel | Role::Prompt => (Some(Color::DarkCyan), &[Attribute::Bold]),
-            Role::Muted => (None, &[Attribute::Dim]),
+            Role::Muted | Role::Evidence => (None, &[Attribute::Dim]),
             Role::System => (None, &[Attribute::Italic]),
             // The model's thinking: dim and italic, so it reads apart from replies
             // with or without colour.
@@ -115,10 +117,12 @@ impl Styled {
 /// One screen row of styled runs.
 pub(super) type Row = Vec<(Role, String)>;
 
-/// Split styled text into rows of at most `width` terminal cells. Newlines end
+/// Split styled text into rows of at most `width` terminal cells, breaking
+/// anywhere. The input line uses this, so every typed character stays
+/// visible; conversation text uses the word wrapping in `wrap`. Newlines end
 /// rows, other control characters are removed, and roles stay attached to
 /// their characters across row breaks.
-pub(super) fn wrap(text: &Styled, width: usize) -> Vec<Row> {
+pub(super) fn wrap_chars(text: &Styled, width: usize) -> Vec<Row> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut row = Row::new();
@@ -149,10 +153,6 @@ pub(super) fn wrap(text: &Styled, width: usize) -> Vec<Row> {
     rows
 }
 
-pub(super) fn first_row(text: &Styled, width: usize) -> Row {
-    wrap(text, width).swap_remove(0)
-}
-
 /// Row text without roles, for layout assertions in tests.
 #[cfg(test)]
 pub(super) fn rows_text(rows: &[Row]) -> Vec<String> {
@@ -167,22 +167,25 @@ mod tests {
 
     /// Row text without roles, for layout assertions.
     fn wrapped(text: &str, width: usize) -> Vec<String> {
-        rows_text(&wrap(&Styled::default().with(Role::Plain, text), width))
+        rows_text(&wrap_chars(
+            &Styled::default().with(Role::Plain, text),
+            width,
+        ))
     }
 
     #[test]
-    fn wrapping_tracks_terminal_cells_and_removes_control_sequences() {
+    fn input_wrapping_breaks_anywhere_by_cells_and_removes_control_sequences() {
         assert_eq!(wrapped("界a界", 3), ["界a", "界"]);
         assert_eq!(wrapped("abc\ndef", 2), ["ab", "c", "de", "f"]);
         assert!(!wrapped("\u{1b}[2J", 10)[0].contains('\u{1b}'));
     }
 
     #[test]
-    fn wrapping_counts_cells_across_runs_and_keeps_each_role() {
+    fn input_wrapping_counts_cells_across_runs_and_keeps_each_role() {
         let text = Styled::default()
             .with(Role::UserLabel, "You:")
             .with(Role::Plain, " 界界\nok");
-        let rows = wrap(&text, 7);
+        let rows = wrap_chars(&text, 7);
         assert_eq!(rows_text(&rows), ["You: 界", "界", "ok"]);
         assert_eq!(
             rows[0],
