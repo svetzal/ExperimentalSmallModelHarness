@@ -69,8 +69,10 @@ with tempfile.TemporaryDirectory(prefix="microgentic-installed-") as temporary:
         assert len(requests) == 1
         assert not (base / "state").exists()
         if os.name == "posix":
-            subprocess.run([sys.executable, str(source / "tests/tui_smoke.py"), str(installed), str(base / "tui")],
-                           env=env, check=True, timeout=30)
+            subprocess.run(["cargo", "test", "--locked", "--all-features", "--test", "tui", "--", "--exact",
+                            "tui_opens_without_a_provider_and_restores_the_terminal"],
+                           cwd=source, env=dict(env, MICROGENTIC_TEST_BINARY=str(installed)),
+                           check=True, timeout=900)
         print(json.dumps(dict(version=version.strip(), revision=revision, installed_binary_smoke="passed")))
     finally:
         server.shutdown()
