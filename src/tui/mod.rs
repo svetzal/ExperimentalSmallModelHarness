@@ -574,6 +574,15 @@ fn stopped() -> Status {
     Status::new(Phase::Stopped, "Stopped. You can follow up or Esc to quit.")
 }
 
+/// The runtime runs a batch in order, so the oldest running call is the
+/// one executing; later calls in the batch are still waiting.
+fn tool_activity(history: &History) -> String {
+    match history.oldest_running() {
+        Some(name) => format!("Using {name}"),
+        None => "Working".into(),
+    }
+}
+
 fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
     match event {
         ConversationEvent::ReplyStarted => {
@@ -599,13 +608,13 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             arguments,
         } => {
             run.used_project_tools = true;
-            run.activity = format!("Using {name}");
             view.history
                 .start_tool(ToolLine::started(&call_id, &name, &arguments));
+            run.activity = tool_activity(&view.history);
         }
         ConversationEvent::ToolFinished { call_id, name, ok } => {
             view.history.finish_tool(&call_id, &name, ok);
-            run.activity = "Working".into();
+            run.activity = tool_activity(&view.history);
         }
         ConversationEvent::ContextUsage {
             used_tokens,
@@ -761,7 +770,8 @@ mod tests {
         for event in events {
             apply_event(&mut view, &mut run, event);
         }
-        assert_eq!(run.activity, "Using shell_command");
+        // read_file started first, so it is the call executing.
+        assert_eq!(run.activity, "Using read_file");
         assert!(view.history.has_running());
         apply_event(
             &mut view,
@@ -772,6 +782,7 @@ mod tests {
                 ok: false,
             },
         );
+        assert_eq!(run.activity, "Using read_file");
         apply_event(
             &mut view,
             &mut run,

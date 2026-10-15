@@ -109,6 +109,14 @@ impl History {
         }
     }
 
+    /// The name of the oldest call still running, which is the one executing.
+    pub(super) fn oldest_running(&self) -> Option<&str> {
+        self.entries.iter().find_map(|entry| match entry {
+            Entry::Tool(line) if line.state == CallState::Running => Some(line.name.as_str()),
+            _ => None,
+        })
+    }
+
     pub(super) fn has_running(&self) -> bool {
         self.entries
             .iter()
@@ -210,6 +218,23 @@ mod tests {
         history.finish_tool("zz", "other", true);
         assert_eq!(history.revision, revision);
         assert_eq!(text(&history), "  ✓ read_file a.rs\n  ✗ list_tree src\n");
+    }
+
+    #[test]
+    fn the_oldest_running_call_is_the_one_executing() {
+        let mut history = History::default();
+        assert_eq!(history.oldest_running(), None);
+        history.start_tool(call("c1", "shell_command", "x"));
+        history.start_tool(call("c2", "read_file", "a.rs"));
+        history.start_tool(call("c3", "list_tree", "src"));
+        assert_eq!(history.oldest_running(), Some("shell_command"));
+        history.finish_tool("c1", "shell_command", true);
+        assert_eq!(history.oldest_running(), Some("read_file"));
+        // A later call finishing first does not change which call is executing.
+        history.finish_tool("c3", "list_tree", true);
+        assert_eq!(history.oldest_running(), Some("read_file"));
+        history.finish_tool("c2", "read_file", false);
+        assert_eq!(history.oldest_running(), None);
     }
 
     #[test]
