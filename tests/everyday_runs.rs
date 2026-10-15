@@ -450,7 +450,8 @@ fn plain_question(wire: Wire) {
         (&["--prompt", "Hello! What is a crate?"][..], &b""[..]),
         (&[][..], &b"Hello! What is a crate?"[..]),
     ] {
-        let provider = MockProvider::replying(wire, vec![content(reply)]);
+        // Replies often open with blank lines; stdout holds the reply alone.
+        let provider = MockProvider::replying(wire, vec![content("\n\n"), content(reply)]);
         let output = everyday(&provider, &workspace, args, stdin);
         assert_eq!(stdout(&output), format!("{reply}\n"));
         let requests = provider.requests();

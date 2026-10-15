@@ -298,6 +298,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plain_replies_drop_surrounding_blank_lines_but_keep_indentation() {
+        assert_eq!(plain_reply("\n\n\nHello.\n\n"), "Hello.");
+        assert_eq!(
+            plain_reply("\r\n    indented\nnext  \n"),
+            "    indented\nnext"
+        );
+        assert_eq!(plain_reply("DONE"), "DONE");
+    }
+
+    #[test]
     fn benchmark_grammar_preserves_file_intake_and_runtime_defaults() {
         assert!(
             command_definition()
@@ -834,7 +844,9 @@ async fn dispatch(legacy: bool) -> Result<()> {
             let output = if json {
                 serde_json::to_string_pretty(&summary)?
             } else {
-                summary.final_summary
+                // Models often open a reply with blank lines after thinking or
+                // tool calls; stdout carries the reply itself.
+                plain_reply(&summary.final_summary).to_owned()
             };
             writeln!(std::io::stdout().lock(), "{output}")?;
         }
@@ -1009,6 +1021,12 @@ async fn dispatch(legacy: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The reply without surrounding blank lines or trailing whitespace. Leading
+/// spaces on the first line are kept, so an indented block stays intact.
+fn plain_reply(reply: &str) -> &str {
+    reply.trim_start_matches(['\n', '\r']).trim_end()
 }
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
