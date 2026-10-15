@@ -14,7 +14,9 @@
 //!
 //! `MICROGENTIC_CONTINUITY_MODE=conversation` runs the narrower conversation
 //! isolation check (contract runs through `run --prompt` on both binaries)
-//! instead of the default benchmark mode.
+//! instead of the default benchmark mode. `MICROGENTIC_CONTINUITY_CURRENT`
+//! replaces the current side, for example with this build's
+//! `adaptive-agent-harness` to compare it with an older one.
 mod support;
 
 use serde_json::{Value, json};
@@ -458,7 +460,10 @@ fn continuity_against_a_baseline_binary() {
             panic!("MICROGENTIC_CONTINUITY_MODE must be benchmark or conversation, not {other}")
         }
     };
-    let current = current_binary().canonicalize().expect("current binary");
+    let current = std::env::var_os("MICROGENTIC_CONTINUITY_CURRENT")
+        .map_or_else(current_binary, PathBuf::from)
+        .canonicalize()
+        .expect("current binary");
     let cases: &[Case] = match mode {
         Mode::Benchmark => &[Case::Contract, Case::Goal, Case::Sequential],
         Mode::Conversation => &[Case::Contract],

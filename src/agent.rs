@@ -120,6 +120,12 @@ pub struct AgentRunConfig {
     /// Generate and retain a proposal-derived acceptance coverage ledger before
     /// the worker loop. Coverage is advisory and never replaces declared probes.
     pub acceptance_ledger: bool,
+    /// Deliver the prompt literally under conversational guidance and finish on
+    /// a visible reply, after the effect, repair and declared-probe checks.
+    /// Everyday `run` sets it; the TUI conversation always replies this way.
+    /// Task, benchmark and historical runs leave it off and keep the task
+    /// template, terminal tokens and continuation prompts.
+    pub conversational: bool,
     /// Offer the `calculate` tool. Everyday `run` and the TUI conversation set
     /// it; benchmark and historical runs leave it off so their provider
     /// requests stay identical.
@@ -460,9 +466,12 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         .trace_dir
         .clone()
         .unwrap_or_else(|| experiment_dir.join("traces"));
+    // Everyday runs reply like the conversation without keeping its session.
+    let conversational = config.conversational || conversation.is_some();
     let trace = Arc::new(TraceRecorder::create_for_conversation(
         &trace_dir,
         conversation.clone(),
+        conversational,
     )?);
     if let Some(session) = &conversation {
         trace.event(
@@ -571,7 +580,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             gateway,
             advisor_model,
             &resolved_contract.guidance,
-            if conversation.is_some() {
+            if conversational {
                 resolved_contract.guidance.clone()
             } else {
                 profile.run_guidance(&resolved_contract.guidance)
@@ -684,7 +693,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     if let Some((spec, _, _)) = &acceptance_ledger {
         scope.configure_acceptance_ledger(spec.clone())?;
     }
-    let mut system_prompt = tool_surface.adapt_system_guidance(if conversation.is_some() {
+    let mut system_prompt = tool_surface.adapt_system_guidance(if conversational {
         crate::conversation::system_guidance()
     } else {
         profile.system_guidance()
@@ -766,8 +775,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     );
     let worker_message =
         worker_message_with_declared_probes(&worker_message, &resolved_contract.probes);
-    let worker_message = match conversation
-        .is_none()
+    let worker_message = match (!conversational)
         .then(|| crate::stash::entry_prompt(&stash_baseline))
         .flatten()
     {
@@ -1000,7 +1008,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             }
         }
         messages = turn_result.messages;
-        let consumed_reasoning_checkpoints = if conversation.is_some() {
+        let consumed_reasoning_checkpoints = if conversational {
             remove_prior_reasoning_checkpoints_preserving(&mut messages, protected_users)
         } else {
             remove_prior_reasoning_checkpoints(&mut messages)
@@ -1327,7 +1335,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
                     )?;
                     pending_reasoning_checkpoint_delivery = Some(metadata);
                 }
-                messages.push(LlmMessage::user(if conversation.is_some() {
+                messages.push(LlmMessage::user(if conversational {
                     "Your previous response contained thinking but no visible reply. Respond naturally to the user's message. Use tools only if the conversation calls for them, and explain any concrete blocker.".to_string()
                 } else { hidden_only_no_action_prompt(
                     consecutive_hidden_only_no_action_turns,
@@ -1362,7 +1370,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
                     )));
                     continue;
                 }
-                messages.push(LlmMessage::user(if conversation.is_some() {
+                messages.push(LlmMessage::user(if conversational {
                     "You used tools but produced no visible reply. Respond to the user's message using the observations; do additional work only when the conversation calls for it."
                 } else { "You used tools but produced no final text. Continue from the current project state. \
                      If validation passed, reply exactly DONE. If validation failed, fix the cause and validate again."
@@ -1374,7 +1382,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
                     turn_decision,
                     crate::runtime::RuntimeDecision::HardStopEmptyResponse
                 ),
-                prompt: if conversation.is_some() {
+                prompt: if conversational {
                     "Your last response was empty. Answer the user's message naturally or explain what information you need. Tools and engineering work are not required for ordinary conversation.".into()
                 } else {
                     empty_response_prompt(consecutive_empty_responses)
@@ -1425,8 +1433,8 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
             continue;
         }
         final_summary = response.clone();
-        let conversational_reply = conversation.is_some() && !response.trim().is_empty();
-        if (conversation.is_none() && is_done_response(&final_summary))
+        let conversational_reply = conversational && !response.trim().is_empty();
+        if (!conversational && is_done_response(&final_summary))
             || (conversational_reply && policy.total_tool_calls > 0)
         {
             let current = crate::stash::capture(&tool_root).await;
@@ -1990,7 +1998,7 @@ fn successful_validation_reply_prompt(
     validation: &SuccessfulValidationSnapshot,
     trace: &TraceRecorder,
 ) -> String {
-    if !trace.is_conversation() {
+    if !trace.natural_replies() {
         return successful_validation_done_prompt(validation);
     }
     format!(
@@ -9108,6 +9116,7 @@ mod tests {
             initial_context_catalog_file: None,
             semantic_advisor_model: None,
             acceptance_ledger: false,
+            conversational: false,
             calculator: false,
             project_guidance: false,
             user_guidance_file: None,
@@ -10723,6 +10732,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: true,
+                    conversational: false,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10767,6 +10777,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    conversational: false,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10811,6 +10822,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    conversational: false,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10880,6 +10892,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    conversational: false,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10923,6 +10936,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    conversational: false,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -10966,6 +10980,7 @@ mod tests {
                     initial_context_catalog_file: None,
                     semantic_advisor_model: None,
                     acceptance_ledger: false,
+                    conversational: false,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,
@@ -11005,6 +11020,7 @@ mod tests {
                     initial_context_catalog_file: Some(PathBuf::from("context-catalog.json")),
                     semantic_advisor_model: Some("context-curator-model".to_string()),
                     acceptance_ledger: false,
+                    conversational: false,
                     calculator: false,
                     project_guidance: false,
                     user_guidance_file: None,

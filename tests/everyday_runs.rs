@@ -1,5 +1,6 @@
-//! Everyday runs against a mock provider: the calculate tool and project
-//! guidance, on both providers. No terminal and no model.
+//! Everyday runs against a mock provider, on both providers: natural reply
+//! completion, the calculate tool and project guidance. No terminal and no
+//! model.
 mod support;
 
 use serde_json::{Value, json};
@@ -24,6 +25,25 @@ fn trace_of(summary: &Value) -> std::path::PathBuf {
         .as_str()
         .expect("the summary names its trace")
         .into()
+}
+
+/// Everyday requests carry the literal prompt, never the task template or
+/// task continuation prompts.
+fn assert_everyday(requests: &[Value]) {
+    for (number, request) in requests.iter().enumerate() {
+        let text = request["messages"].to_string();
+        for task_text in [
+            "benchmark task",
+            "Continue from the current experiment state",
+            "reply exactly DONE",
+        ] {
+            assert!(
+                !text.contains(task_text),
+                "request {} contains {task_text:?}: {text}",
+                number + 1
+            );
+        }
+    }
 }
 
 fn tool_json(request: &Value) -> Value {
@@ -86,8 +106,13 @@ fn calculate(wire: Wire) {
         ],
     );
     let requests = provider.requests();
-    // The run keeps asking after a plain reply, so only the first four matter.
-    assert!(requests.len() >= 4, "{} requests", requests.len());
+    // Three calculations, then the reply ends the run.
+    assert_eq!(requests.len(), 4, "one request per turn");
+    assert_everyday(&requests);
+    assert_eq!(
+        summary["final_summary"],
+        "The total is 1474 ms and the new length is 1340 ms."
+    );
     assert!(
         tool_names(&requests[0]).contains(&"calculate".to_owned()),
         "{:?}",
@@ -242,7 +267,8 @@ fn project_guidance(wire: Wire) {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let summary = run_json(&provider, root, &env, &args);
     let requests = provider.requests();
-    assert!(requests.len() >= 3, "{} requests", requests.len());
+    assert_eq!(requests.len(), 3, "two reads, then the reply ends the run");
+    assert_everyday(&requests);
     let prompt = system_message(&requests[0]);
     assert!(prompt.contains("# Project guidance"), "{prompt}");
     let user_header = format!("## {} (user guidance)", user_guidance.display());
@@ -317,6 +343,7 @@ fn project_guidance(wire: Wire) {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let summary = run_json(&plain, root, &env, &args);
     let plain_requests = plain.requests();
+    assert_eq!(plain_requests.len(), 1, "a plain reply ends the run");
     assert!(!plain_requests[0].to_string().contains("Project guidance"));
     assert_eq!(tool_names(&plain_requests[0]), tool_names(&requests[0]));
     assert!(!trace_records(&trace_of(&summary)).iter().any(|record| {
@@ -375,4 +402,223 @@ fn project_guidance(wire: Wire) {
             .contains("project guidance was updated since the last message (AGENTS.md changed)"),
         "{second:?}"
     );
+}
+
+// ---------------------------------------------------------------- replies
+
+/// Run an everyday `microgentic run` and require a clean exit.
+fn everyday(
+    provider: &MockProvider,
+    workspace: &Workspace,
+    args: &[&str],
+    stdin: &[u8],
+) -> std::process::Output {
+    let mut env = provider.env();
+    env.push(("XDG_STATE_HOME", workspace.state.display().to_string()));
+    env.push((
+        "XDG_CONFIG_HOME",
+        workspace.base.join("config").display().to_string(),
+    ));
+    let mut full = vec![
+        "run",
+        "--provider",
+        provider.wire().name(),
+        "--model",
+        "test-model",
+    ];
+    full.extend_from_slice(args);
+    let output = run_binary(microgentic(), &full, &workspace.project, &env, stdin);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn stdout(output: &std::process::Output) -> String {
+    String::from_utf8(output.stdout.clone()).expect("stdout is UTF-8")
+}
+
+/// A plain question takes one request, through `--prompt` or stdin, and
+/// stdout holds only the reply.
+fn plain_question(wire: Wire) {
+    let workspace = Workspace::new();
+    let reply = "Hello! A crate is a compilation unit in Rust.";
+    for (args, stdin) in [
+        (&["--prompt", "Hello! What is a crate?"][..], &b""[..]),
+        (&[][..], &b"Hello! What is a crate?"[..]),
+    ] {
+        let provider = MockProvider::replying(wire, vec![content(reply)]);
+        let output = everyday(&provider, &workspace, args, stdin);
+        assert_eq!(stdout(&output), format!("{reply}\n"));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "a natural reply was forced to continue");
+        assert_everyday(&requests);
+        assert_eq!(
+            user_messages(&requests[0]),
+            ["Hello! What is a crate?"],
+            "the prompt is delivered literally"
+        );
+        assert!(system_message(&requests[0]).contains("No engineering task is assumed"));
+        assert!(
+            tool_names(&requests[0]).contains(&"read_file".to_owned()),
+            "tools stay available"
+        );
+    }
+}
+
+#[test]
+fn a_plain_question_takes_one_request_omlx() {
+    plain_question(Wire::Omlx);
+}
+
+#[test]
+fn a_plain_question_takes_one_request_ollama() {
+    plain_question(Wire::Ollama);
+}
+
+/// A question that needs one tool takes two requests: the call, then the reply.
+fn one_tool_question(wire: Wire) {
+    let workspace = Workspace::new();
+    workspace.write("notes.txt", "PACE = 1.1\n");
+    let reply = "The pace is 1.1.";
+    let provider = MockProvider::turns(
+        wire,
+        vec![
+            vec![tool("read_file", json!({"path": "notes.txt"}))],
+            vec![content(reply)],
+        ],
+    );
+    let output = everyday(
+        &provider,
+        &workspace,
+        &["--prompt", "What is the pace in notes.txt?"],
+        b"",
+    );
+    assert_eq!(stdout(&output), format!("{reply}\n"));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "the tool call, then the reply");
+    assert_everyday(&requests);
+    assert!(last_tool_result(&requests[1]).contains("PACE = 1.1"));
+}
+
+#[test]
+fn a_question_needing_one_tool_takes_two_requests_omlx() {
+    one_tool_question(Wire::Omlx);
+}
+
+#[test]
+fn a_question_needing_one_tool_takes_two_requests_ollama() {
+    one_tool_question(Wire::Ollama);
+}
+
+/// A request for work still does the work, checks it, and reports naturally.
+fn edit_and_check(wire: Wire) {
+    let workspace = Workspace::new();
+    workspace.write("greeting.txt", "Hi there\n");
+    let reply = "Changed the greeting to Hello there, and grep found it.";
+    let provider = MockProvider::turns(
+        wire,
+        vec![
+            vec![tool(
+                "edit_file",
+                json!({"path": "greeting.txt", "edits": [{"kind": "replace_exact", "old": "Hi there", "new": "Hello there"}]}),
+            )],
+            vec![tool(
+                "shell_command",
+                json!({"command": "grep -c 'Hello there' greeting.txt", "timeout_secs": 30}),
+            )],
+            vec![content(reply)],
+        ],
+    );
+    let output = everyday(
+        &provider,
+        &workspace,
+        &[
+            "--prompt",
+            "Change the greeting in greeting.txt to Hello there, then check it.",
+        ],
+        b"",
+    );
+    assert_eq!(stdout(&output), format!("{reply}\n"));
+    assert_eq!(workspace.read("greeting.txt"), "Hello there\n");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3, "the edit, the check, then the reply");
+    assert_everyday(&requests);
+    assert!(
+        last_tool_result(&requests[2]).contains('1'),
+        "{}",
+        last_tool_result(&requests[2])
+    );
+}
+
+#[test]
+fn a_work_request_edits_checks_and_reports_naturally_omlx() {
+    edit_and_check(Wire::Omlx);
+}
+
+#[test]
+fn a_work_request_edits_checks_and_reports_naturally_ollama() {
+    edit_and_check(Wire::Ollama);
+}
+
+// ---------------------------------------------------------------- task path
+
+/// The historical executable keeps the task path for a plain prompt: the task
+/// template, and a continuation prompt after a reply without DONE or FAIL.
+fn legacy_prompt_keeps_the_task_path(wire: Wire) {
+    let workspace = Workspace::new();
+    let provider = MockProvider::replying(wire, vec![content("Hello.")]);
+    let mut env = provider.env();
+    env.push(("XDG_STATE_HOME", workspace.state.display().to_string()));
+    let output = run_binary(
+        legacy_binary(),
+        &[
+            "run",
+            "--prompt",
+            "Hello!",
+            "--provider",
+            wire.name(),
+            "--model",
+            "test-model",
+            "--max-iterations",
+            "2",
+        ],
+        &workspace.project,
+        &env,
+        b"",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "one request per allowed iteration");
+    assert!(
+        user_messages(&requests[0])[0].starts_with("Complete this benchmark task"),
+        "{:?}",
+        user_messages(&requests[0])
+    );
+    assert!(
+        user_messages(&requests[1])
+            .last()
+            .unwrap()
+            .starts_with("Continue from the current experiment state"),
+        "{:?}",
+        user_messages(&requests[1])
+    );
+    assert!(!tool_names(&requests[0]).contains(&"calculate".to_owned()));
+}
+
+#[test]
+fn the_legacy_binary_keeps_the_task_path_for_a_plain_prompt_omlx() {
+    legacy_prompt_keeps_the_task_path(Wire::Omlx);
+}
+
+#[test]
+fn the_legacy_binary_keeps_the_task_path_for_a_plain_prompt_ollama() {
+    legacy_prompt_keeps_the_task_path(Wire::Ollama);
 }

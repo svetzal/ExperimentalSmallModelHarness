@@ -12,16 +12,20 @@ pub struct TraceRecorder {
     path: PathBuf,
     file: Mutex<File>,
     conversation: Option<Arc<crate::conversation::ConversationRun>>,
+    /// Ask for natural replies instead of DONE/FAIL tokens. True for the TUI
+    /// conversation and everyday `run`.
+    natural_replies: bool,
 }
 
 impl TraceRecorder {
     pub fn create(dir: &Path) -> Result<Self> {
-        Self::create_for_conversation(dir, None)
+        Self::create_for_conversation(dir, None, false)
     }
 
     pub(crate) fn create_for_conversation(
         dir: &Path,
         conversation: Option<Arc<crate::conversation::ConversationRun>>,
+        natural_replies: bool,
     ) -> Result<Self> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating trace directory {}", dir.display()))?;
@@ -36,6 +40,7 @@ impl TraceRecorder {
             path,
             file: Mutex::new(file),
             conversation,
+            natural_replies,
         })
     }
 
@@ -108,8 +113,8 @@ impl TraceRecorder {
         }
     }
 
-    pub(crate) fn is_conversation(&self) -> bool {
-        self.conversation.is_some()
+    pub(crate) fn natural_replies(&self) -> bool {
+        self.natural_replies
     }
 
     pub(crate) fn reply_started(&self) {

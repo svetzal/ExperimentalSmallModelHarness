@@ -285,6 +285,7 @@ impl RunArgs {
             initial_context_catalog_file: self.initial_context_catalog,
             semantic_advisor_model: self.semantic_advisor_model,
             acceptance_ledger: self.acceptance_ledger,
+            conversational: false,
             calculator: false,
             project_guidance: false,
             user_guidance_file: None,
@@ -1133,6 +1134,10 @@ fn prepare_run_with_mode(
         bail!("--dir must name a project directory");
     }
     let advanced = run.experiment.is_some() || run.goal.is_some() || run.contract.is_some();
+    // Everyday runs and the conversation reply naturally, with the calculator
+    // and project guidance; advanced and historical invocations keep their
+    // exact task requests.
+    let everyday = conversational || (!legacy && !advanced);
     // Benchmark and historical invocations must not inherit personal defaults.
     if !legacy && !advanced {
         let path = crate::preferences::config_path(config_path)?;
@@ -1181,7 +1186,9 @@ fn prepare_run_with_mode(
             }
         }
     } else if !advanced || run.prompt.is_some() {
-        let (prompt, suffix) = if conversational {
+        // Everyday prompts are delivered literally, like a conversation
+        // message: shell fences in them are discussion, not declared probes.
+        let (prompt, suffix) = if everyday {
             (
                 crate::conversation::message_document(prompt_text(run.prompt.take(), input)?),
                 ".json",
@@ -1226,9 +1233,7 @@ fn prepare_run_with_mode(
     std::env::set_current_dir(root)?;
     let no_project_guidance = run.no_project_guidance;
     let mut config = run.into_config()?;
-    // Everyday runs and the conversation get the calculator and project
-    // guidance; advanced and historical invocations keep their exact requests.
-    let everyday = conversational || (!legacy && !advanced);
+    config.conversational = everyday;
     config.calculator = everyday;
     config.project_guidance = everyday && !no_project_guidance;
     if config.project_guidance {
