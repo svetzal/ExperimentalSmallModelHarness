@@ -79,6 +79,13 @@ impl TraceRecorder {
         }
     }
 
+    /// Report a requested tool call to an open conversation view.
+    pub(crate) fn tool_requested(&self, call: &mojentic::llm::models::LlmToolCall) {
+        if let Some(conversation) = &self.conversation {
+            conversation.tool_requested(call);
+        }
+    }
+
     pub(crate) fn is_conversation(&self) -> bool {
         self.conversation.is_some()
     }

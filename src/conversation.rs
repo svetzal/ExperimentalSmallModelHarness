@@ -19,11 +19,30 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub(crate) enum ConversationEvent {
     ReplyStarted,
-    Content { text: String },
-    ToolStarted { name: String },
-    Activity { message: String },
-    Finished { summary: Value },
-    Failed { message: String },
+    Content {
+        text: String,
+    },
+    /// A model-requested tool call, before it runs. `call_id` is empty when the
+    /// provider gave none; the view then matches results by name and order.
+    ToolStarted {
+        call_id: String,
+        name: String,
+        arguments: Value,
+    },
+    ToolFinished {
+        call_id: String,
+        name: String,
+        ok: bool,
+    },
+    Activity {
+        message: String,
+    },
+    Finished {
+        summary: Value,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -197,13 +216,32 @@ impl ConversationRun {
         let _ = self.events.send(event);
     }
 
+    /// Tell the view about a requested call. The arguments are the model's
+    /// own, credential-redacted like traces and with long strings shortened,
+    /// because the view only needs enough to summarize the call.
+    pub(crate) fn tool_requested(&self, call: &mojentic::llm::models::LlmToolCall) {
+        let mut arguments = call
+            .arguments
+            .iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(key, value)| (key.clone(), shorten_strings(value)))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        crate::recovery::redact_value(&mut arguments, &crate::recovery::credentials());
+        self.emit(ConversationEvent::ToolStarted {
+            call_id: call.id.clone().unwrap_or_default(),
+            name: call.name.clone(),
+            arguments,
+        });
+    }
+
     pub(crate) fn observe(&self, kind: &str, payload: &Value) {
-        if kind == "llm.response.tool_call.normalized" {
-            self.emit(ConversationEvent::ToolStarted {
-                name: payload["tool_name"]
-                    .as_str()
-                    .unwrap_or("project tool")
-                    .into(),
+        if kind == "llm.context_assembly.appended" && payload["component"] == "tool_result" {
+            self.emit(ConversationEvent::ToolFinished {
+                call_id: payload["tool_call_id"].as_str().unwrap_or_default().into(),
+                name: payload["tool_name"].as_str().unwrap_or("tool").into(),
+                ok: payload["ok"] == true,
             });
             return;
         }
@@ -211,15 +249,6 @@ impl ConversationRun {
             "llm.stream.thinking" => {
                 format!("Thinking · {} characters", payload["total_thinking_chars"])
             }
-            "llm.context_assembly.appended" if payload["component"] == "tool_result" => format!(
-                "{} {}",
-                payload["tool_name"].as_str().unwrap_or("Tool"),
-                if payload["ok"] == true {
-                    "finished"
-                } else {
-                    "reported an error"
-                }
-            ),
             "llm.context_assembly.ledger" => format!(
                 "Requesting response · context {}",
                 payload["pressure_band"].as_str().unwrap_or("unknown")
@@ -265,6 +294,25 @@ impl ConversationRun {
         file.as_file().sync_all()?;
         file.persist(path).context("saving conversation state")?;
         Ok(())
+    }
+}
+
+/// Longest string, in characters, sent to the view in tool arguments.
+const VIEW_ARGUMENT_CHARS: usize = 2_000;
+
+fn shorten_strings(value: &Value) -> Value {
+    match value {
+        Value::String(text) if text.chars().count() > VIEW_ARGUMENT_CHARS => {
+            Value::String(text.chars().take(VIEW_ARGUMENT_CHARS).collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(shorten_strings).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), shorten_strings(value)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 

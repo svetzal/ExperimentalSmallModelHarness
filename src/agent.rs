@@ -5702,6 +5702,7 @@ fn trace_response_tool_calls(
                 "arguments_sha256": sha256_hex(arguments_json.as_bytes()),
             }),
         )?;
+        trace.tool_requested(call);
     }
     Ok(())
 }

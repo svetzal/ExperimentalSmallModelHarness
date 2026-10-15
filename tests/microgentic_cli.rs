@@ -212,3 +212,20 @@ fn tui_slash_commands_stay_local_and_change_later_requests() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn tui_shows_each_tool_call_as_one_live_line() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tui_tools.py"))
+        .arg(env!("CARGO_BIN_EXE_microgentic"))
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -48,8 +48,9 @@ pub(super) fn run_command(view: &mut View, session: &mut Session, command: Comma
         Command::Clear => {
             session.state = None;
             view.history.reset();
+            view.history.start_block();
             view.history
-                .push(Role::System, "\nStarted a new conversation.\n");
+                .push(Role::System, "Started a new conversation.\n");
             return;
         }
         Command::ShowModel => {
@@ -103,12 +104,13 @@ pub(super) async fn finish_model_listing(view: &mut View, session: &mut Session)
         return;
     };
     let provider = session.settings.provider.as_str();
+    view.history.start_line();
     match listing.await.map_err(|error| error.to_string()).flatten() {
         Ok(models) if models.is_empty() => view
             .history
-            .push(Role::System, &format!("\n{provider} reported no models.\n")),
+            .push(Role::System, &format!("{provider} reported no models.\n")),
         Ok(models) => {
-            let mut text = format!("\nAvailable models from {provider}:\n");
+            let mut text = format!("Available models from {provider}:\n");
             for model in models {
                 let current = if model == session.settings.model {
                     " (current)"
@@ -121,7 +123,7 @@ pub(super) async fn finish_model_listing(view: &mut View, session: &mut Session)
         }
         Err(error) => view.history.push(
             Role::Error,
-            &format!("\nCould not list models from {provider}: {error}\n"),
+            &format!("Could not list models from {provider}: {error}\n"),
         ),
     }
 }
@@ -178,7 +180,7 @@ mod tests {
 
     fn history_text(view: &View) -> String {
         view.history
-            .text
+            .render(0)
             .runs
             .iter()
             .map(|(_, text)| text.as_str())
@@ -194,7 +196,7 @@ mod tests {
         assert!(session.state.is_none());
         assert!(history_text(&view).contains("next message starts a new conversation"));
         assert!(history_text(&view).contains("microgentic setup"));
-        assert_eq!(view.history.text.runs.last().unwrap().0, Role::System);
+        assert_eq!(view.history.render(0).runs.last().unwrap().0, Role::System);
 
         session.state = Some(PathBuf::from("/state/session-2/conversation.json"));
         run_command(&mut view, &mut session, Command::SetModel("second".into()));

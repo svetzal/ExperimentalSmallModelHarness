@@ -63,6 +63,13 @@ results from existing events. The view updates as events arrive, without parsing
 stderr or polling truncated trace previews. Native traces and exact provider
 snapshots remain authoritative evidence.
 
+A requested tool call reaches the view as `tool-started` with the call ID, tool
+name, and arguments, taken from the runtime's tool call through the trace
+recorder's conversation hook. The arguments are credential-redacted like traces,
+and strings longer than 2,000 characters are shortened, because the view only
+summarizes them. `tool-finished` carries the call ID, name, and success flag
+from the existing `tool_result` context event. Trace records are unchanged.
+
 Enter submits when idle; Alt-Enter adds a newline. Drafting, paste, and scrolling
 remain available during generation. Ctrl-C forwards cancellation to the owned
 worker. The worker retains completed responses/tool batches and records why the

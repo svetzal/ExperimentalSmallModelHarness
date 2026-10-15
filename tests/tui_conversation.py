@@ -145,7 +145,7 @@ def exercise(provider):
         assert b"FIRST-LIVE-" in live and b"x" * 150 in live, "stream used truncated previews"
         release_first.set()
         completed = wait_for(master, b"Ready for your next message")
-        assert b"read_file finished" in completed, "tool activity missing"
+        assert "✓ read_file memo.txt".encode() in completed, "tool activity missing"
         assert b"Evidence:" in completed, "read-only project inspection lost its trace footer"
         send_prompt(master, "What codename and Unicode did you see? Do not reread the file.")
         wait_for(master, b"FOLLOWUP-LIVE")

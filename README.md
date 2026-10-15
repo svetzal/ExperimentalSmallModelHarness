@@ -249,6 +249,15 @@ status line each have their own style. The status line keeps a text label, such
 as `Ready` or `Stopped`, so it does not depend on colour. Set `NO_COLOR` to any
 non-empty value to turn colour off; bold and dim text remain.
 
+Each tool call is one line under the reply that requested it, and the line
+changes in place. A spinner shows while the call runs, `✓` when it succeeds,
+`✗` when it reports an error, and `– … · stopped` when the run ends before the
+call reports. Calls from one model turn appear together as a list. Each line
+names the tool and its main argument: the file and line range for a read, the
+directory and depth for a tree listing, the file for a write or edit, and the
+command for a shell call. Long paths keep their end, and long commands keep
+their start.
+
 Type a command that starts with `/` in the input. Commands run in the TUI and
 are never sent to the model:
 

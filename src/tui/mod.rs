@@ -3,6 +3,7 @@ mod commands;
 mod history;
 mod session;
 mod styled;
+mod tool_lines;
 
 use crate::conversation::ConversationEvent;
 use crate::preferences::Preferences;
@@ -32,6 +33,7 @@ use styled::{Palette, Role, Styled, first_row, fit_from_end, wrap};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
+use tool_lines::{SPINNER_FRAME, ToolLine};
 
 struct Screen;
 impl Screen {
@@ -57,6 +59,8 @@ struct ActiveRun {
     events: UnboundedReceiver<ConversationEvent>,
     activity: String,
     streamed_text: String,
+    /// The "Microgentic:" heading appears once per exchange, not per model turn.
+    replied: bool,
     used_project_tools: bool,
     terminal_reported: bool,
 }
@@ -129,14 +133,15 @@ fn submit(view: &mut View, session: &mut Session, active: &mut Option<ActiveRun>
     view.scroll = 0;
     match submission {
         Submission::Message(prompt) => {
-            view.history.push(Role::Plain, "\n");
+            view.history.start_block();
             view.history.push(Role::UserLabel, "You:");
             view.history.push(Role::Plain, &format!(" {prompt}\n"));
             *active = start_reply(view, session, &prompt)?;
         }
         Submission::Command(command) => {
+            view.history.start_block();
             view.history
-                .push(Role::Muted, &format!("\n{}\n", typed.trim()));
+                .push(Role::Muted, &format!("{}\n", typed.trim()));
             if active.is_some() && command != Command::Help {
                 let name = typed.split_whitespace().next().unwrap_or_default();
                 view.history.push(Role::Error, &format!("{name} is unavailable while Microgentic is replying. Wait for the reply or press Ctrl-C to cancel it, then try again.\n"));
@@ -145,8 +150,9 @@ fn submit(view: &mut View, session: &mut Session, active: &mut Option<ActiveRun>
             }
         }
         Submission::Invalid(message) => {
+            view.history.start_block();
             view.history
-                .push(Role::Muted, &format!("\n{}\n", typed.trim()));
+                .push(Role::Muted, &format!("{}\n", typed.trim()));
             view.history.push(Role::Error, &format!("{message}\n"));
         }
     }
@@ -180,8 +186,9 @@ fn start_reply(view: &mut View, session: &mut Session, prompt: &str) -> Result<O
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            view.history.start_line();
             view.history
-                .push(Role::Error, &format!("\nCould not start run: {error}\n"));
+                .push(Role::Error, &format!("Could not start run: {error}\n"));
             return Ok(None);
         }
     };
@@ -208,12 +215,13 @@ fn start_reply(view: &mut View, session: &mut Session, prompt: &str) -> Result<O
         events,
         activity: "Working".into(),
         streamed_text: String::new(),
+        replied: false,
         used_project_tools: false,
         terminal_reported: false,
     }))
 }
 
-fn draw(view: &View, header: &Styled, palette: Palette) -> Result<()> {
+fn draw(view: &View, header: &Styled, frame: usize, palette: Palette) -> Result<()> {
     let (columns, lines) = terminal::size()?;
     let width = usize::from(columns.saturating_sub(2)).max(1);
     let mut out = stdout();
@@ -252,7 +260,7 @@ fn draw(view: &View, header: &Styled, palette: Palette) -> Result<()> {
         put(lower_rule_row, &rule)?;
     }
     let body_height = usize::from(lines.saturating_sub(6 + input_height as u16));
-    let history = wrap(&view.history.text, width);
+    let history = wrap(&view.history.render(frame), width);
     let end = history.len().saturating_sub(view.scroll.min(history.len()));
     let start = end.saturating_sub(body_height);
     for (index, row) in history[start..end].iter().enumerate() {
@@ -306,6 +314,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
     view.history.reset();
     let mut active: Option<ActiveRun> = None;
     let mut last_draw = None;
+    let spinner_epoch = Instant::now();
     let outcome: Result<()> = async {
         loop {
             if leaving.load(Ordering::Relaxed) {
@@ -330,18 +339,22 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                     }
                     Ok(output) => {
                         if !run.terminal_reported {
+                            view.history.start_line();
                             view.history.push(Role::Error, &format!(
-                                "\n[Request stopped; any unfinished reply is incomplete]\nRun error: {}\n",
+                                "[Request stopped; any unfinished reply is incomplete]\nRun error: {}\n",
                                 String::from_utf8_lossy(&output.stderr)
                             ));
                         }
                         view.status = stopped();
                     }
                     Err(error) => {
-                        view.history.push(Role::Error, &format!("\nRun error: {error}\n"));
+                        view.history.start_line();
+                        view.history.push(Role::Error, &format!("Run error: {error}\n"));
                         view.status = Status::new(Phase::Stopped, "Run could not start.");
                     }
                 }
+                // Calls that never reported a result must not spin on.
+                view.history.stop_running();
                 view.scroll = 0;
             }
             if let Some(run) = &active {
@@ -360,7 +373,13 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
             }
             finish_model_listing(&mut view, &mut session).await;
             let header = header(&session.root, &session.settings);
+            // The spinner frame joins the signature only while a call runs, so
+            // an idle screen does not redraw.
+            let frame = view.history.has_running().then(|| {
+                (spinner_epoch.elapsed().as_millis() / SPINNER_FRAME.as_millis()) as usize
+            });
             let signature = (
+                frame,
                 header.clone(),
                 view.history.revision,
                 view.input.clone(),
@@ -369,7 +388,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 terminal::size()?,
             );
             if last_draw.as_ref() != Some(&signature) {
-                draw(&view, &header, palette)?;
+                draw(&view, &header, frame.unwrap_or(0), palette)?;
                 last_draw = Some(signature);
             }
             if !event::poll(Duration::from_millis(50))? {
@@ -463,9 +482,12 @@ fn stopped() -> Status {
 fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
     match event {
         ConversationEvent::ReplyStarted => {
-            view.history.push(Role::Plain, "\n");
-            view.history.push(Role::AgentLabel, "Microgentic:");
-            view.history.push(Role::Plain, " ");
+            view.history.start_line();
+            if !run.replied {
+                view.history.push(Role::AgentLabel, "Microgentic:");
+                view.history.push(Role::Plain, " ");
+                run.replied = true;
+            }
             if !run.streamed_text.is_empty() && !run.streamed_text.ends_with('\n') {
                 run.streamed_text.push('\n');
             }
@@ -476,34 +498,43 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             run.streamed_text.push_str(&text);
             run.activity = "Replying".into();
         }
-        ConversationEvent::ToolStarted { name } => {
+        ConversationEvent::ToolStarted {
+            call_id,
+            name,
+            arguments,
+        } => {
             run.used_project_tools = true;
             run.activity = format!("Using {name}");
             view.history
-                .push(Role::Muted, &format!("\n  {}\n", run.activity));
+                .start_tool(ToolLine::started(&call_id, &name, &arguments));
+        }
+        ConversationEvent::ToolFinished { call_id, name, ok } => {
+            view.history.finish_tool(&call_id, &name, ok);
+            run.activity = "Working".into();
         }
         ConversationEvent::Activity { message } => {
-            if message.ends_with("reported an error") {
-                view.history
-                    .push(Role::Warning, &format!("\n  {message}\n"));
-            } else if message.ends_with("finished") || message.starts_with("Context shortened") {
-                view.history.push(Role::Muted, &format!("\n  {message}\n"));
+            if message.starts_with("Context shortened") {
+                view.history.start_line();
+                view.history.push(Role::Muted, &format!("  {message}\n"));
             }
             run.activity = message;
         }
         ConversationEvent::Finished { summary } => {
+            view.history.stop_running();
             let final_summary = summary["final_summary"].as_str().unwrap_or("No summary");
             if run.streamed_text.is_empty() || !run.streamed_text.contains(final_summary) {
+                view.history.start_line();
                 view.history
-                    .push(Role::Plain, &format!("\nResult: {final_summary}\n"));
+                    .push(Role::Plain, &format!("Result: {final_summary}\n"));
             }
             // Trace visibility follows this exchange's actual work, never its
             // wording or tool history retained from an earlier prompt.
             if run.used_project_tools {
+                view.history.start_line();
                 view.history.push(
                     Role::Muted,
                     &format!(
-                        "\nEvidence: {}\n",
+                        "Evidence: {}\n",
                         summary["trace_file"].as_str().unwrap_or("unknown")
                     ),
                 );
@@ -512,9 +543,11 @@ fn apply_event(view: &mut View, run: &mut ActiveRun, event: ConversationEvent) {
             run.terminal_reported = true;
         }
         ConversationEvent::Failed { message } => {
+            view.history.stop_running();
+            view.history.start_line();
             view.history.push(
                 Role::Error,
-                &format!("\n[Request stopped; unfinished reply is incomplete]\n{message}\n"),
+                &format!("[Request stopped; unfinished reply is incomplete]\n{message}\n"),
             );
             view.status = stopped();
             run.terminal_reported = true;
@@ -564,7 +597,7 @@ mod tests {
 
     fn history_text(view: &View) -> String {
         view.history
-            .text
+            .render(0)
             .runs
             .iter()
             .map(|(_, text)| text.as_str())
@@ -581,13 +614,10 @@ mod tests {
         assert_eq!(line.runs[0].0, Role::Stopped);
     }
 
-    #[tokio::test]
-    async fn active_runs_refuse_commands_except_help() {
-        let mut view = view();
-        let mut session = session();
-        // A finished placeholder run stands in for an active reply.
+    /// A finished placeholder run that stands in for an active reply.
+    fn placeholder_run() -> ActiveRun {
         let (_sender, events) = unbounded_channel();
-        let mut active = Some(ActiveRun {
+        ActiveRun {
             pid: None,
             started: Instant::now(),
             cancelled: false,
@@ -595,9 +625,108 @@ mod tests {
             events,
             activity: String::new(),
             streamed_text: String::new(),
+            replied: false,
             used_project_tools: false,
             terminal_reported: false,
-        });
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_calls_render_as_one_line_each_under_the_reply() {
+        let mut view = view();
+        let mut run = placeholder_run();
+        let events = [
+            ConversationEvent::ReplyStarted,
+            ConversationEvent::Content {
+                text: "Checking.".into(),
+            },
+            ConversationEvent::ToolStarted {
+                call_id: "a".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "notes.txt", "line_start": 1, "line_end": 2}),
+            },
+            ConversationEvent::ToolStarted {
+                call_id: "b".into(),
+                name: "shell_command".into(),
+                arguments: serde_json::json!({"command": "sleep 1"}),
+            },
+        ];
+        for event in events {
+            apply_event(&mut view, &mut run, event);
+        }
+        assert_eq!(run.activity, "Using shell_command");
+        assert!(view.history.has_running());
+        apply_event(
+            &mut view,
+            &mut run,
+            ConversationEvent::ToolFinished {
+                call_id: "b".into(),
+                name: "shell_command".into(),
+                ok: false,
+            },
+        );
+        apply_event(
+            &mut view,
+            &mut run,
+            ConversationEvent::ToolFinished {
+                call_id: "a".into(),
+                name: "read_file".into(),
+                ok: true,
+            },
+        );
+        for event in [
+            ConversationEvent::ReplyStarted,
+            ConversationEvent::Content {
+                text: "Done.".into(),
+            },
+            ConversationEvent::Finished {
+                summary: serde_json::json!({"final_summary": "Done.", "trace_file": "t.jsonl"}),
+            },
+        ] {
+            apply_event(&mut view, &mut run, event);
+        }
+        let text = history_text(&view);
+        assert!(
+            text.ends_with(
+                "Microgentic: Checking.\n  ✓ read_file notes.txt:1-2\n  ✗ shell_command sleep 1\nDone.\nEvidence: t.jsonl\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Using") && !text.contains("finished"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_stops_calls_that_were_still_running() {
+        let mut view = view();
+        let mut run = placeholder_run();
+        apply_event(&mut view, &mut run, ConversationEvent::ReplyStarted);
+        apply_event(
+            &mut view,
+            &mut run,
+            ConversationEvent::ToolStarted {
+                call_id: "a".into(),
+                name: "list_tree".into(),
+                arguments: serde_json::json!({"path": "src", "max_depth": 2}),
+            },
+        );
+        apply_event(
+            &mut view,
+            &mut run,
+            ConversationEvent::Failed {
+                message: "cancelled".into(),
+            },
+        );
+        assert!(!view.history.has_running());
+        assert!(
+            history_text(&view).contains("  – list_tree src depth 2 · stopped\n[Request stopped")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_runs_refuse_commands_except_help() {
+        let mut view = view();
+        let mut session = session();
+        let mut active = Some(placeholder_run());
         view.input = "/model other".into();
         submit(&mut view, &mut session, &mut active).unwrap();
         assert_eq!(session.settings.model, "first");
