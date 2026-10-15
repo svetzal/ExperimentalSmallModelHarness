@@ -43,8 +43,10 @@ a pseudo-terminal driver with a rendered screen, one mock server for oMLX and
 Ollama, and workspace fixtures. Do not add Python test scripts under `tests/`.
 To compare benchmark requests with an older binary, run
 `MICROGENTIC_CONTINUITY_BASELINE=<old binary> cargo test --test benchmark_continuity -- --ignored --nocapture`.
-The recovery tests still call the Python harness in `fixtures/recovery/`,
-because experiment runs outside this repository use it.
+The recovery tests call the Python harness in `fixtures/recovery/` and
+`fixtures/progress/`. Stacey decided on 2026-10-15 that this harness stays in
+Python, because Sandbox2 experiments run it and hash-register it. Do not port
+it unless she revisits that decision.
 
 Provider fixtures use mock HTTP servers. Do not start local models for routine
 checks. Preserve model patience and let the runtime own stop policy during live
