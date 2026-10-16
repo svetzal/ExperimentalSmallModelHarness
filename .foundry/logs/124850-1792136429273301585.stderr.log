@@ -1,0 +1,4 @@
+    Checking reqwest v0.13.5
+   Compiling microgentic v0.4.0 (/home/svetzal/Work/Projects/Personal/microgentic)
+    Checking mojentic v2.1.0 (https://github.com/svetzal/mojentic-ru.git?rev=4ca1ed279c02eab37827a1ed07c30e961155ecf3#4ca1ed27)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.41s

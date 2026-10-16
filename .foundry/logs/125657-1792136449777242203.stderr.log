@@ -1,0 +1,16 @@
+   Compiling reqwest v0.13.5
+   Compiling microgentic v0.4.0 (/home/svetzal/Work/Projects/Personal/microgentic)
+   Compiling mojentic v2.1.0 (https://github.com/svetzal/mojentic-ru.git?rev=4ca1ed279c02eab37827a1ed07c30e961155ecf3#4ca1ed27)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.67s
+     Running unittests src/lib.rs (target/debug/deps/adaptive_agent_harness-0c3812f641b7fd61)
+     Running unittests src/bin/legacy.rs (target/debug/deps/adaptive_agent_harness-0e6c20fcd0f418ec)
+     Running unittests src/main.rs (target/debug/deps/microgentic-ade07ef4171e74ca)
+     Running tests/benchmark_continuity.rs (target/debug/deps/benchmark_continuity-20537e87cda9bb4b)
+     Running tests/everyday_runs.rs (target/debug/deps/everyday_runs-dd4c3e0e3667445c)
+     Running tests/microgentic_cli.rs (target/debug/deps/microgentic_cli-7ad064cc18e67377)
+     Running tests/omlx_gateway.rs (target/debug/deps/omlx_gateway-24cf2b777f46edc2)
+     Running tests/recovery_prerequisites.rs (target/debug/deps/recovery_prerequisites-48fc97230ff1da6f)
+     Running tests/recovery_worker.rs (target/debug/deps/recovery_worker-a5421b69eee6b0eb)
+     Running tests/structural_coupling.rs (target/debug/deps/structural_coupling-4d22c112ea4fbd8b)
+     Running tests/tui.rs (target/debug/deps/tui-6220a6e86c9abe73)
+     Running unittests examples/provider_benchmark.rs (target/debug/examples/provider_benchmark-231400e44362a119)
