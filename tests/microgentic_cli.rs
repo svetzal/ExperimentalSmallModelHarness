@@ -115,3 +115,24 @@ fn prompt_must_match_an_authoritative_contract_before_a_run_is_created() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("must exactly match"));
     assert!(!traces.exists());
 }
+
+/// Without a terminal there is no conversation to hold: the binary says so,
+/// points at `run`, and exits instead of waiting on input that cannot come.
+#[test]
+fn interactive_mode_without_a_terminal_exits_at_once_and_points_at_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let output = worker()
+        .arg("--config")
+        .arg(temp.path().join("config.json"))
+        .env("OMLX_HOST", "http://127.0.0.1:1")
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the binary waited on a terminal it does not have"
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("microgentic run"), "{stderr}");
+}

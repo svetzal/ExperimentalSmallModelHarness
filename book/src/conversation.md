@@ -25,6 +25,8 @@ and tool results.
 You can type your next message while a reply streams. Enter sends it when the
 current reply is complete.
 
+The conversation also ends when its terminal closes.
+
 ## Slash commands
 
 Commands that start with `/` run in the view. They are never sent to the model.

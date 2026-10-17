@@ -221,6 +221,75 @@ impl Launch {
     }
 }
 
+impl Launch {
+    /// Start the binary, wait until its output contains `needle`, then close
+    /// every handle on the terminal's controlling side, as a terminal
+    /// emulator does when it quits or a parent process that owns the
+    /// pseudo-terminal exits. Returns the exit status if the binary ends
+    /// within `patience`, and `None` if it is still running.
+    #[cfg(unix)]
+    pub fn spawn_and_hang_up(
+        self,
+        needle: &str,
+        patience: Duration,
+    ) -> Option<portable_pty::ExitStatus> {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: self.rows,
+                cols: self.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("opening a pseudo-terminal");
+        let mut child = pair
+            .slave
+            .spawn_command(self.command)
+            .expect("starting the binary on the pseudo-terminal");
+        drop(pair.slave);
+        // Reads happen only after poll(2) reports bytes, so no reader thread
+        // holds a handle on the terminal when it is time to close it.
+        let fd = pair.master.as_raw_fd().expect("the terminal's descriptor");
+        let mut reader = pair.master.try_clone_reader().expect("terminal reader");
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + WAIT;
+        while !String::from_utf8_lossy(&seen).contains(needle) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "{needle:?} never appeared:\n{}",
+                String::from_utf8_lossy(&seen)
+            );
+            let mut fds = [libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            // SAFETY: `fds` is one initialised pollfd that outlives the call.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, left.as_millis() as libc::c_int) };
+            if ready <= 0 {
+                continue;
+            }
+            let mut buffer = [0u8; 4096];
+            let count = reader.read(&mut buffer).expect("reading the terminal");
+            seen.extend_from_slice(&buffer[..count]);
+        }
+        drop(reader);
+        drop(pair.master);
+        let deadline = Instant::now() + patience;
+        loop {
+            if let Some(status) = child.try_wait().expect("polling the binary") {
+                return Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 #[cfg(unix)]
 fn modes(master: &dyn MasterPty) -> Option<[libc::tcflag_t; 3]> {
     let fd = master.as_raw_fd()?;

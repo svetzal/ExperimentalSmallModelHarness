@@ -3,6 +3,7 @@ mod canvas;
 mod commands;
 mod context_panel;
 mod history;
+mod input;
 mod launch;
 mod picker;
 mod session;
@@ -52,6 +53,10 @@ use wrap::{first_row, wrap};
 
 /// About 30 frames a second while the launch animation plays.
 const LAUNCH_FRAME: Duration = Duration::from_millis(33);
+/// How long the loop waits for input while a run or a spinner needs turns.
+const BUSY_WAIT: Duration = Duration::from_millis(50);
+/// How long the loop waits for input while nothing on the screen changes.
+const IDLE_WAIT: Duration = Duration::from_millis(200);
 
 struct Screen;
 impl Screen {
@@ -632,8 +637,25 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
                 draw(&view, &session, frame.unwrap_or(0), launch, palette)?;
                 last_draw = Some(signature);
             }
-            let wait = if launch.is_some() { LAUNCH_FRAME } else { Duration::from_millis(50) };
-            if !event::poll(wait)? {
+            // The loop sleeps here. A run or an animation needs frequent
+            // turns; an idle screen needs only its signal flag checked.
+            let wait = if launch.is_some() {
+                LAUNCH_FRAME
+            } else if active.is_some() || animating {
+                BUSY_WAIT
+            } else {
+                IDLE_WAIT
+            };
+            if input::wait(wait)? == input::Wait::Closed {
+                anyhow::bail!("the terminal closed; the conversation ended");
+            }
+            // A signal that arrived during the wait is handled at the top of
+            // the loop, before crossterm touches a terminal that may be gone.
+            if leaving.load(Ordering::Relaxed) {
+                continue;
+            }
+            // crossterm reads only what the wait found.
+            if !event::poll(Duration::ZERO)? {
                 tokio::task::yield_now().await;
                 continue;
             }

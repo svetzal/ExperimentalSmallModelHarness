@@ -3,6 +3,7 @@
 
 mod support;
 
+use std::time::Duration;
 use support::*;
 
 /// The resting screen with no provider: animation off, an unreachable host.
@@ -1641,4 +1642,30 @@ fn tui_shows_the_discovered_window_and_residency_omlx() {
 #[test]
 fn tui_shows_the_discovered_window_and_residency_ollama() {
     discovered_window_and_residency(Wire::Ollama);
+}
+
+// ---------------------------------------------------------------- ending
+
+/// The terminal's other end closes, as when its emulator quits or a parent
+/// that owned the pseudo-terminal exits. The loop must notice and end,
+/// rather than spin on a descriptor that reads nothing.
+#[test]
+fn tui_ends_when_its_terminal_hangs_up() {
+    let workspace = Workspace::new();
+    let status = Launch::new(microgentic())
+        .arg("--config")
+        .arg(&workspace.config)
+        .cwd(&workspace.project)
+        .size(24, 90)
+        .env("OMLX_HOST", "http://127.0.0.1:1")
+        .env("MICROGENTIC_NO_ANIMATION", "1")
+        .spawn_and_hang_up("Enter send", Duration::from_secs(5))
+        .expect("the conversation did not end after its terminal closed");
+    // The loop notices the hang-up and reports it; the forced exit after
+    // SIGHUP (status 129) would mean it was spinning until then.
+    assert_eq!(
+        status.exit_code(),
+        1,
+        "a lost terminal is an error the loop reports itself"
+    );
 }

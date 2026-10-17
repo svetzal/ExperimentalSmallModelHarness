@@ -55,6 +55,15 @@ The release workflow publishes each version's section as its GitHub release note
   2026). Terminals that support it no longer show a half-drawn frame; others
   ignore it.
 
+### Fixed
+
+- The conversation view ends when its terminal goes away. crossterm's input
+  reader never returns once standard input is at end of file or in error, so
+  a conversation whose terminal emulator quit, or whose parent process exited,
+  spun on one core until it was killed. The event loop now waits for input
+  with `poll(2)`, which reports the hang-up without reading, and exits with an
+  error. An idle screen also wakes five times a second instead of twenty.
+
 ## [0.4.0] - 2026-10-15
 
 Everyday `microgentic run` now behaves like the conversation: it ends on the
