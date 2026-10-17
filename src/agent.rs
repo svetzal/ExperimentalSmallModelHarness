@@ -19,11 +19,13 @@ use mojentic::llm::{CompletionConfig, LlmGateway};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const CONTEXT_INSTRUMENTATION_VERSION: &str = "generation4.context_ledger.v1";
@@ -335,18 +337,24 @@ async fn run_agent_entry(
     let evidence = crate::recovery::evidence(&config.recovery);
     let call = mojentic::llm::recovery::RecoveryCall::default();
     let cancellation = call.cancellation.clone();
-    #[cfg(unix)]
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("registering terminal request cancellation")?;
-    let signal = tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-        }
-        #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
-        cancellation.cancel();
-    });
+    // A termination signal cancels the model request and any project command
+    // through this one token. Work that does not notice within the grace
+    // period is ended anyway, with the signal's conventional status.
+    let requested = cancellation.clone();
+    let signal = crate::signals::on_termination(
+        crate::signals::GRACE,
+        move || requested.cancel(),
+        |signal| {
+            // Standard error may be gone with the parent, so a failed write
+            // must not panic this task before the exit below.
+            let _ = writeln!(
+                std::io::stderr(),
+                "microgentic: {} ended the run before its work could stop",
+                crate::signals::name(signal)
+            );
+            std::process::exit(crate::signals::exit_status(signal));
+        },
+    )?;
     let gateway: Box<dyn LlmGateway> = match config.provider {
         Provider::Omlx => Box::new(crate::recovery::WorkerGateway::new(
             OmlxGateway::new(),
@@ -367,6 +375,7 @@ async fn run_agent_entry(
         tool_root,
         Some(evidence.clone()),
         conversation,
+        cancellation,
     )
     .await;
     let settled = evidence.settle().await;
@@ -409,7 +418,15 @@ async fn run_agent_with_gateway<G: LlmGateway + ?Sized>(
     gateway: &G,
     tool_root: PathBuf,
 ) -> Result<AgentRunSummary> {
-    run_agent_with_gateway_inner(config, gateway, tool_root, None, None).await
+    run_agent_with_gateway_inner(
+        config,
+        gateway,
+        tool_root,
+        None,
+        None,
+        CancellationToken::new(),
+    )
+    .await
 }
 
 async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
@@ -418,6 +435,7 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
     tool_root: PathBuf,
     recovery_evidence: Option<Arc<crate::recovery::Evidence>>,
     conversation: Option<Arc<crate::conversation::ConversationRun>>,
+    cancellation: CancellationToken,
 ) -> Result<AgentRunSummary> {
     let mut completion_config = agent_completion_config(
         config.max_model_interactions,
@@ -723,7 +741,8 @@ async fn run_agent_with_gateway_inner<G: LlmGateway + ?Sized>(
         resolved_contract.profile.clone(),
         scope_rules(&resolved_contract.read_scope),
         scope_rules(&resolved_contract.write_scope),
-    )?;
+    )?
+    .with_cancellation(cancellation.clone());
     scope.configure_tool_surface(tool_surface);
     let requested_probe_ids_by_command = resolved_contract
         .probes

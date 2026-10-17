@@ -1669,3 +1669,50 @@ fn tui_ends_when_its_terminal_hangs_up() {
         "a lost terminal is an error the loop reports itself"
     );
 }
+
+/// `kill` on an idle conversation ends it cleanly, with the terminal's
+/// modes restored.
+#[test]
+fn tui_ends_on_a_termination_signal_and_restores_the_terminal() {
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        let (_workspace, mut tui) = open_idle(None);
+        tui.wait_text("Enter send");
+        tui.signal(signal);
+        let status = tui.exit_within(Duration::from_secs(3)).unwrap_or_else(|| {
+            panic!(
+                "signal {signal} did not end the conversation; screen:\n{}",
+                tui.snapshot()
+            )
+        });
+        assert!(status.success(), "signal {signal} ended with an error");
+        tui.assert_terminal_restored();
+    }
+}
+
+/// `kill` while a reply streams interrupts the worker, waits for it, and
+/// then ends the conversation.
+#[test]
+fn tui_ends_on_sigterm_while_a_reply_streams() {
+    let hold = Gate::default();
+    let provider = MockProvider::replying(
+        Wire::Omlx,
+        vec![content("UNFINISHED-REPLY"), Step::Hold(hold.clone())],
+    );
+    let mut session = open_session(microgentic(), Workspace::new(), provider, 24, 90);
+    session
+        .tui
+        .submit("Start a request that will be interrupted.");
+    session.tui.wait_text("UNFINISHED-REPLY");
+    session.tui.signal(libc::SIGTERM);
+    session
+        .tui
+        .exit_within(Duration::from_secs(5))
+        .unwrap_or_else(|| {
+            panic!(
+                "SIGTERM did not end the conversation; screen:\n{}",
+                session.tui.snapshot()
+            )
+        });
+    session.tui.assert_terminal_restored();
+    hold.open();
+}

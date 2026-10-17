@@ -25,6 +25,7 @@ use std::time::UNIX_EPOCH;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
 
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 20_000;
 const DEFAULT_READ_MAX_BYTES: usize = 20_000;
@@ -145,6 +146,8 @@ pub struct ToolScope {
     probes: Arc<Mutex<BTreeMap<String, Probe>>>,
     acceptance_ledger: Arc<Mutex<AcceptanceLedgerState>>,
     tool_surface: Arc<Mutex<ToolSurface>>,
+    /// Cancelled when the run is asked to stop; a running command is killed.
+    cancellation: CancellationToken,
 }
 
 #[derive(Debug, Default)]
@@ -342,7 +345,15 @@ impl ToolScope {
             probes: Arc::new(Mutex::new(BTreeMap::new())),
             acceptance_ledger: Arc::new(Mutex::new(AcceptanceLedgerState::default())),
             tool_surface: Arc::new(Mutex::new(ToolSurface::Control)),
+            cancellation: CancellationToken::new(),
         })
+    }
+
+    /// Share the run's cancellation with the tools, so a project command
+    /// that is still running when the run is cancelled is killed.
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     pub fn configure_tool_surface(&self, surface: ToolSurface) {
@@ -3770,17 +3781,21 @@ impl ShellCommandTool {
             .spawn()
             .with_context(|| format!("spawning command {command:?}"))?;
         let child_pid = child.id();
-        let output =
-            match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
-                Ok(result) => result.with_context(|| format!("running command {command:?}"))?,
-                Err(_) => {
-                    #[cfg(unix)]
-                    if let Some(pid) = child_pid {
-                        kill_process_group(pid);
-                    }
-                    bail!("command timed out after {timeout_secs}s");
-                }
-            };
+        let waited = tokio::select! {
+            result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()) => Some(result),
+            _ = self.scope.cancellation.cancelled() => None,
+        };
+        let output = match waited {
+            Some(Ok(result)) => result.with_context(|| format!("running command {command:?}"))?,
+            Some(Err(_elapsed)) => {
+                end_process_group(child_pid);
+                bail!("command timed out after {timeout_secs}s");
+            }
+            None => {
+                end_process_group(child_pid);
+                bail!("command cancelled");
+            }
+        };
         let stdout = capture_output(&output.stdout);
         let stderr = capture_output(&output.stderr);
         self.scope
@@ -4346,6 +4361,17 @@ impl PathRule {
 }
 
 #[cfg(unix)]
+/// End what a shell command started once its wait has been dropped: the
+/// drop killed the shell, and its process group holds the rest.
+fn end_process_group(child_pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        kill_process_group(pid);
+    }
+    #[cfg(not(unix))]
+    let _ = child_pid;
+}
+
 fn kill_process_group(pid: u32) {
     if let Ok(process_group) = i32::try_from(pid) {
         // SAFETY: the child was started in a new process group whose id is its

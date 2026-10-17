@@ -25,7 +25,9 @@ and tool results.
 You can type your next message while a reply streams. Enter sends it when the
 current reply is complete.
 
-The conversation also ends when its terminal closes.
+The conversation also ends when its terminal closes, or when the process gets
+SIGTERM or SIGHUP. A running reply is cancelled first, and the terminal's modes
+are restored.
 
 ## Slash commands
 

@@ -63,6 +63,16 @@ The release workflow publishes each version's section as its GitHub release note
   spun on one core until it was killed. The event loop now waits for input
   with `poll(2)`, which reports the hang-up without reading, and exits with an
   error. An idle screen also wakes five times a second instead of twenty.
+- `kill` ends the conversation view and `microgentic run`. Both caught SIGINT
+  and SIGTERM to cancel their work, which removed the signal's default effect,
+  so a process whose work did not notice the cancellation (the conversation
+  view stuck in the reader above, or a run inside a project command) lived on.
+  SIGINT, SIGTERM and SIGHUP now cancel the model request and kill a running
+  project command with its process group. If the process is still alive two
+  seconds later, or a second signal arrives, it restores the terminal and
+  exits with the signal's conventional status; recovery evidence is not
+  settled on that path. A run started with SIGHUP ignored, as under `nohup`,
+  keeps ignoring it.
 
 ## [0.4.0] - 2026-10-15
 

@@ -79,7 +79,7 @@ struct Cli {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  echo 'Hello!' | microgentic run\n  microgentic run --prompt 'Fix the parser' --dir .\n  microgentic run --prompt 'Review this diff' < changes.diff\n\nRun can edit files and execute project commands under the existing runtime policy. Research controls retain their previous meanings. Wire recovery is disabled by default; SIGINT/SIGTERM persist terminal request evidence."
+    after_help = "Examples:\n  echo 'Hello!' | microgentic run\n  microgentic run --prompt 'Fix the parser' --dir .\n  microgentic run --prompt 'Review this diff' < changes.diff\n\nRun can edit files and execute project commands under the existing runtime policy. Research controls retain their previous meanings. Wire recovery is disabled by default. SIGINT, SIGTERM and SIGHUP cancel the run and persist terminal request evidence; a run that has not stopped two seconds later ends without it."
 )]
 struct RunArgs {
     /// Prompt. When omitted, read from piped or redirected stdin.

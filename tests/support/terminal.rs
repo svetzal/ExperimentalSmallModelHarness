@@ -538,16 +538,38 @@ impl Tui {
 
     /// Wait for the binary to exit, and return whether it succeeded.
     pub fn wait_exit(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        match self.exit_within(Duration::from_secs(10)) {
+            Some(status) => status.success(),
+            None => panic!("the binary did not exit; screen:\n{}", self.snapshot()),
+        }
+    }
+
+    /// The binary's exit status, if it ends within `patience`.
+    pub fn exit_within(&mut self, patience: Duration) -> Option<portable_pty::ExitStatus> {
+        let deadline = Instant::now() + patience;
         loop {
             if let Some(status) = self.child.try_wait().expect("polling the binary") {
-                return status.success();
+                return Some(status);
             }
             if Instant::now() > deadline {
-                panic!("the binary did not exit; screen:\n{}", self.snapshot());
+                return None;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Send the binary a signal, as `kill` would.
+    #[cfg(unix)]
+    pub fn signal(&self, signal: i32) {
+        let pid = self.child.process_id().expect("the binary's process id");
+        // SAFETY: kill(2) takes a pid and a signal number and touches no memory.
+        let sent = unsafe { libc::kill(pid as libc::pid_t, signal) };
+        assert_eq!(
+            sent,
+            0,
+            "signalling the binary: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     /// Press Esc on an idle screen and require a clean exit that restores

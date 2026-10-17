@@ -48,6 +48,12 @@ a failed check.
 The model does not have to end with DONE or FAIL, and the run does not ask it
 to continue after it replies.
 
+A termination signal also ends the run: SIGINT from Ctrl-C, SIGTERM from
+`kill`, or SIGHUP when the terminal closes. The model request is cancelled, a
+project command that is still running is killed, and the run exits with an
+error. If the work has not stopped two seconds later, or a second signal
+arrives, the process exits at once with the signal's conventional status.
+
 `run --experiment`, `--goal` or `--contract` starts a task run instead. Task
 runs keep the task instructions, the DONE/FAIL ending, and declared probes.
 See [Benchmark mode](benchmark.md).

@@ -67,10 +67,17 @@ impl Screen {
         Ok(screen)
     }
 }
-impl Drop for Screen {
-    fn drop(&mut self) {
+impl Screen {
+    /// Give the terminal back. Safe to repeat, and safe from any thread, so a
+    /// forced exit can call it while the event loop is elsewhere.
+    fn restore() {
         let _ = execute!(stdout(), DisableBracketedPaste, Show, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
+    }
+}
+impl Drop for Screen {
+    fn drop(&mut self) {
+        Self::restore();
     }
 }
 
@@ -501,15 +508,26 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
     let _screen = Screen::enter()?;
     let leaving = Arc::new(AtomicBool::new(false));
     let requested_exit = leaving.clone();
-    #[cfg(unix)]
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let signal = tokio::spawn(async move {
-        #[cfg(unix)]
-        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-        #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
-        requested_exit.store(true, Ordering::Relaxed);
-    });
+    // A termination signal asks the loop to leave, which interrupts any run
+    // and waits for its worker. If that takes too long, the terminal is
+    // restored and the process ends anyway.
+    // The worker gets the standard grace from its own SIGINT, so the
+    // conversation allows it a little longer before giving up on it.
+    let signal = crate::signals::on_termination(
+        crate::signals::GRACE + Duration::from_secs(1),
+        move || requested_exit.store(true, Ordering::Relaxed),
+        |signal| {
+            Screen::restore();
+            // The terminal may already be gone, so a failed write must not
+            // panic this task before the exit below.
+            let _ = writeln!(
+                std::io::stderr(),
+                "microgentic: {} ended the conversation before its run could stop",
+                crate::signals::name(signal)
+            );
+            std::process::exit(crate::signals::exit_status(signal));
+        },
+    )?;
     let mut view = View {
         history: History::default(),
         input: String::new(),
@@ -654,7 +672,9 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
             if leaving.load(Ordering::Relaxed) {
                 continue;
             }
-            // crossterm reads only what the wait found.
+            // crossterm reads only what the wait found. The terminal can still
+            // close between the wait and this poll; the forced exit after a
+            // hang-up's SIGHUP bounds that case.
             if !event::poll(Duration::ZERO)? {
                 tokio::task::yield_now().await;
                 continue;
