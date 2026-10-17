@@ -1,0 +1,54 @@
+   Compiling libc v0.2.191
+   Compiling aws-lc-sys v0.45.0
+   Compiling aws-lc-rs v1.18.1
+   Compiling errno v0.3.14
+   Compiling parking_lot_core v0.9.12
+   Compiling mio v1.2.1
+   Compiling socket2 v0.6.4
+   Compiling getrandom v0.4.2
+   Compiling openssl-sys v0.9.116
+   Compiling signal-hook-registry v1.4.8
+   Compiling serial2 v0.2.38
+   Compiling parking_lot v0.12.5
+   Compiling rand v0.10.2
+   Compiling signal-hook v0.3.18
+   Compiling uuid v1.23.2
+   Compiling tokio v1.53.3
+   Compiling openssl v0.10.80
+   Compiling tempfile v3.27.0
+   Compiling rustls-webpki v0.103.15
+   Compiling signal-hook-mio v0.2.5
+   Compiling crossterm v0.29.0
+   Compiling filedescriptor v0.8.3
+   Compiling nix v0.28.0
+   Compiling rustls v0.23.46
+   Compiling portable-pty v0.9.0
+   Compiling native-tls v0.2.18
+   Compiling tungstenite v0.30.0
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling tokio-util v0.7.18
+   Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.4
+   Compiling tokio-native-tls v0.3.1
+   Compiling tokio-tungstenite v0.30.0
+   Compiling tower-http v0.6.11
+   Compiling h2 v0.4.20
+   Compiling hyper v1.10.1
+   Compiling hyper-util v0.1.20
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.5
+   Compiling mojentic v2.1.0 (https://github.com/svetzal/mojentic-ru.git?rev=4ca1ed279c02eab37827a1ed07c30e961155ecf3#4ca1ed27)
+   Compiling microgentic v0.4.0 (/home/svetzal/Work/Projects/Personal/microgentic)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 39s
+     Running unittests src/lib.rs (target/debug/deps/adaptive_agent_harness-bfea9b7e77d9c815)
+     Running unittests src/bin/legacy.rs (target/debug/deps/adaptive_agent_harness-12182c72baf122d6)
+     Running unittests src/main.rs (target/debug/deps/microgentic-32b2a4c2616e4e7e)
+     Running tests/benchmark_continuity.rs (target/debug/deps/benchmark_continuity-fb0799b9feb9ea6d)
+     Running tests/everyday_runs.rs (target/debug/deps/everyday_runs-d9eccdec95a4b033)
+     Running tests/microgentic_cli.rs (target/debug/deps/microgentic_cli-614374a7e7815220)
+     Running tests/omlx_gateway.rs (target/debug/deps/omlx_gateway-a4e7dc718733673c)
+     Running tests/recovery_prerequisites.rs (target/debug/deps/recovery_prerequisites-72cf12c92caa6bf8)
+     Running tests/recovery_worker.rs (target/debug/deps/recovery_worker-5e310729b6a975eb)
+     Running tests/structural_coupling.rs (target/debug/deps/structural_coupling-043c8b8b06809875)
+     Running tests/tui.rs (target/debug/deps/tui-d9dc8f4f462f76c7)
+     Running unittests examples/provider_benchmark.rs (target/debug/examples/provider_benchmark-04015b735ad42461)
